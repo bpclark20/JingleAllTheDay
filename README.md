@@ -1,6 +1,6 @@
 # JingleAllTheDay
 
-Desktop jingle browser for quickly categorizing and finding samples in your GoXLR sample folder.
+Desktop jingle browser for quickly categorizing and finding samples in a selected sample folder.
 
 ## Features
 
