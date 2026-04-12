@@ -1,5 +1,6 @@
 param(
-    [string]$SourceDir = (Join-Path $PSScriptRoot "dist"),
+    [string]$OutRoot = "$env:LOCALAPPDATA\JingleAllTheDay\pyinstaller",
+    [string]$SourceDir = "",
     [string]$ScriptPath = (Join-Path $PSScriptRoot "installer.iss"),
     [string]$AppVersion = "",
     [string]$OutputDir = (Join-Path $PSScriptRoot "installer")
@@ -7,12 +8,20 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+if ([string]::IsNullOrWhiteSpace($SourceDir)) {
+    $SourceDir = Join-Path $OutRoot "dist"
+}
+
 if (-not (Test-Path $ScriptPath)) {
     throw "Installer script not found: $ScriptPath"
 }
 
 if (-not (Test-Path $SourceDir)) {
-    throw "Source directory not found: $SourceDir"
+    throw @"
+Source directory not found: $SourceDir
+
+Tip: Run .\build_exe.ps1 first, or pass -SourceDir explicitly.
+"@
 }
 
 $mainExe = Join-Path $SourceDir "JingleAllTheDay.exe"
