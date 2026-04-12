@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+.venv/
+
+# PyInstaller build artifacts
+build/
+dist/
+
+# Inno Setup installer output
+installer/*.exe
+
+# Runtime user data (stored outside project in %APPDATA%)
+*.ini
+*.json
+
+# IDE / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
