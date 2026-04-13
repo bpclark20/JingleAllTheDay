@@ -34,6 +34,12 @@ class MainWindowMenuMixin:
 
         edit_menu = menu_bar.addMenu("Edit")
 
+        edit_jingle_action = QAction("Edit Jingle", self)
+        edit_jingle_action.triggered.connect(self._on_edit_jingle)
+        edit_menu.addAction(edit_jingle_action)
+
+        edit_menu.addSeparator()
+
         rename_action = QAction("Rename", self)
         rename_action.triggered.connect(self._on_edit_rename)
         edit_menu.addAction(rename_action)

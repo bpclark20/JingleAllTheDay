@@ -4,6 +4,7 @@ import json
 import shutil
 from pathlib import Path
 
+from jingle_edit_dialog import JingleEditDialog
 from PyQt6.QtWidgets import QFileDialog, QInputDialog, QMessageBox
 
 
@@ -190,6 +191,47 @@ class MainWindowFileEditMixin:
             self._apply_filters()
             self._status.showMessage(f"Renamed to {destination_path.name}")
             return
+
+    def _on_edit_jingle(self) -> None:
+        record_index = self._selected_single_record_index()
+        if record_index is None:
+            return
+
+        record = self._records[record_index]
+        if not record.path.exists():
+            self._status.showMessage("Selected file no longer exists.")
+            return
+
+        dialog = JingleEditDialog(
+            file_path=record.path,
+            duration_seconds=record.duration_seconds,
+            start_seconds=record.clip_start_seconds,
+            stop_seconds=record.clip_stop_seconds,
+            live_output_device=self._output_device,
+            preview_output_device=self._preview_output_device,
+            live_volume_percent=self._live_volume_percent,
+            preview_volume_percent=self._preview_volume_percent,
+            parent=self,
+        )
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            self._status.showMessage("Edit Jingle cancelled.")
+            return
+
+        start_seconds, stop_seconds = dialog.selected_clip_points()
+        if (
+            abs(start_seconds - record.clip_start_seconds) < 0.0005
+            and abs(stop_seconds - record.clip_stop_seconds) < 0.0005
+        ):
+            self._status.showMessage("No jingle trim changes to save.")
+            return
+
+        self._store.set_clip_points(record.path, start_seconds, stop_seconds)
+        self._store.save()
+
+        refreshed_start, refreshed_stop = self._store.get_clip_points(record.path, record.duration_seconds)
+        record.clip_start_seconds = refreshed_start
+        record.clip_stop_seconds = refreshed_stop
+        self._status.showMessage(f"Saved trim range for {record.path.name}.")
 
     def _on_edit_delete(self) -> None:
         selected_indices = self._selected_record_indices()

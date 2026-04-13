@@ -15,6 +15,8 @@ class JingleRecord:
     categories: list[str]
     size_bytes: int = 0
     duration_seconds: float = 0.0
+    clip_start_seconds: float = 0.0
+    clip_stop_seconds: float = 0.0
 
     @property
     def name(self) -> str:
@@ -90,17 +92,30 @@ class LibraryStore:
                 except (TypeError, ValueError):
                     pass
 
+                clip_start_raw = info.get("clip_start_seconds")
+                clip_stop_raw = info.get("clip_stop_seconds")
+                try:
+                    if clip_start_raw is not None:
+                        entry["clip_start_seconds"] = max(0.0, float(clip_start_raw))
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    if clip_stop_raw is not None:
+                        entry["clip_stop_seconds"] = max(0.0, float(clip_stop_raw))
+                except (TypeError, ValueError):
+                    pass
+
                 entries[path_key] = entry
         return entries
 
     def save(self) -> None:
         self._json_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"version": 4, "items": self._entries}
+        payload = {"version": 5, "items": self._entries}
         self._json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def export_to(self, destination: Path) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"version": 4, "items": self._entries}
+        payload = {"version": 5, "items": self._entries}
         destination.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def import_from(self, source: Path) -> None:
@@ -149,6 +164,70 @@ class LibraryStore:
         entry["size_bytes"] = max(0, int(size_bytes))
         entry["duration_seconds"] = max(0.0, float(duration_seconds))
         entry["mtime_ns"] = max(0, int(mtime_ns))
+        self._entries[key] = entry
+
+    def get_clip_points(self, path: Path, duration_seconds: float) -> tuple[float, float]:
+        info = self._entries.get(str(path), {})
+        try:
+            start = float(info.get("clip_start_seconds", 0.0))
+        except (TypeError, ValueError):
+            start = 0.0
+
+        fallback_stop = max(0.0, float(duration_seconds))
+        try:
+            stop = float(info.get("clip_stop_seconds", fallback_stop))
+        except (TypeError, ValueError):
+            stop = fallback_stop
+
+        if start < 0.0:
+            start = 0.0
+        if stop < 0.0:
+            stop = 0.0
+
+        if duration_seconds > 0.0:
+            start = min(start, duration_seconds)
+            stop = min(stop, duration_seconds)
+            if stop <= start:
+                start = 0.0
+                stop = duration_seconds
+        else:
+            if stop < start:
+                start, stop = stop, start
+
+        return start, stop
+
+    def set_clip_points(self, path: Path, start_seconds: float, stop_seconds: float) -> None:
+        key = str(path)
+        entry = dict(self._entries.get(key, {}))
+
+        duration_seconds = 0.0
+        try:
+            duration_seconds = max(0.0, float(entry.get("duration_seconds", 0.0)))
+        except (TypeError, ValueError):
+            duration_seconds = 0.0
+
+        start = max(0.0, float(start_seconds))
+        stop = max(0.0, float(stop_seconds))
+
+        if duration_seconds > 0.0:
+            start = min(start, duration_seconds)
+            stop = min(stop, duration_seconds)
+            if stop <= start:
+                start = 0.0
+                stop = duration_seconds
+            is_default = abs(start - 0.0) < 0.0005 and abs(stop - duration_seconds) < 0.0005
+        else:
+            if stop < start:
+                start, stop = stop, start
+            is_default = abs(start - 0.0) < 0.0005 and abs(stop - 0.0) < 0.0005
+
+        if is_default:
+            entry.pop("clip_start_seconds", None)
+            entry.pop("clip_stop_seconds", None)
+        else:
+            entry["clip_start_seconds"] = round(start, 4)
+            entry["clip_stop_seconds"] = round(stop, 4)
+
         self._entries[key] = entry
 
     def iter_entries(self) -> Iterator[tuple[str, dict[str, Any]]]:

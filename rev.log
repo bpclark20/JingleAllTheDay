@@ -1,3 +1,7 @@
+## v1.1.2.041226
+- Added Edit Jingle feature to the context menu of the jingle list.
+- Added Edit Jingle dialog window which allows users to edit the start and stop locations of a jingle, as well as preview the jingle including looping behavior.
+
 ## v1.1.1.041226
 - Modularization of the codebase.
 

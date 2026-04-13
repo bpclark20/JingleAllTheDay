@@ -84,7 +84,7 @@ except ModuleNotFoundError:
 
 ORG_NAME = "JingleAllTheDay"
 APP_NAME = "JingleAllTheDay"
-APP_VERSION = "1.1.1.041226"
+APP_VERSION = "1.2.0.041226"
 
 DEFAULT_KEYBOARD_SHORTCUTS: dict[str, str] = {
     "rename": "F2",
@@ -192,6 +192,11 @@ class MainWindow(
         self._continuous_queue: list[int] = []
         self._continuous_queue_position = -1
         self._current_playing_name = ""
+        self._current_clip_start_ms = 0
+        self._current_clip_stop_ms = -1
+        self._clip_start_seek_pending = False
+        self._clip_seek_muted_temporarily = False
+        self._clip_boundary_handling = False
         self._is_preview_mode = False
         self._loop_breath_effect: QGraphicsOpacityEffect | None = None
         self._loop_breath_anim: QPropertyAnimation | None = None
@@ -544,7 +549,10 @@ class MainWindow(
     def _set_muted(self, muted: bool) -> None:
         self._is_muted = muted
         if self._audio_output is not None:
-            self._audio_output.setMuted(muted)
+            if self._clip_seek_muted_temporarily and not muted:
+                self._audio_output.setMuted(True)
+            else:
+                self._audio_output.setMuted(muted)
         self._refresh_mute_button_state()
 
     def _on_mute_clicked(self) -> None:
@@ -1004,6 +1012,12 @@ class MainWindow(
         selected_count = len(self._selected_record_indices())
 
         menu = QMenu(self)
+        edit_jingle_action = menu.addAction("Edit Jingle")
+        edit_jingle_action.setEnabled(selected_count == 1)
+        edit_jingle_action.triggered.connect(self._on_edit_jingle)
+
+        menu.addSeparator()
+
         rename_action = menu.addAction("Rename")
         rename_action.setEnabled(selected_count == 1)
         rename_action.triggered.connect(self._on_edit_rename)
@@ -1053,6 +1067,47 @@ class MainWindow(
         self._continuous_queue = []
         self._continuous_queue_position = -1
 
+    def _reset_clip_playback_window(self) -> None:
+        self._current_clip_start_ms = 0
+        self._current_clip_stop_ms = -1
+        self._clip_start_seek_pending = False
+        self._clip_seek_muted_temporarily = False
+        self._clip_boundary_handling = False
+
+    def _prepare_clip_start_seek(self, temporary_mute_for_seek: bool) -> int:
+        start_ms = max(0, int(self._current_clip_start_ms))
+        self._clip_boundary_handling = False
+        self._clip_start_seek_pending = start_ms > 0
+        if self._audio_output is not None:
+            if temporary_mute_for_seek and self._clip_start_seek_pending and not self._is_muted:
+                self._clip_seek_muted_temporarily = True
+                self._audio_output.setMuted(True)
+            else:
+                self._clip_seek_muted_temporarily = False
+                self._audio_output.setMuted(self._is_muted)
+        return start_ms
+
+    def _restart_current_clip_from_start(self, temporary_mute_for_seek: bool) -> None:
+        if self._player is None:
+            return
+        start_ms = self._prepare_clip_start_seek(temporary_mute_for_seek)
+        self._player.setPosition(start_ms)
+        self._player.play()
+
+    def _clip_window_for_record(self, record: JingleRecord) -> tuple[int, int]:
+        duration_ms = max(0, int(round(record.duration_seconds * 1000.0)))
+        start_ms = max(0, int(round(record.clip_start_seconds * 1000.0)))
+        stop_ms = max(0, int(round(record.clip_stop_seconds * 1000.0)))
+
+        if duration_ms > 0:
+            start_ms = min(start_ms, duration_ms)
+            stop_ms = min(stop_ms, duration_ms)
+            if stop_ms <= start_ms:
+                start_ms = 0
+                stop_ms = duration_ms
+
+        return start_ms, stop_ms
+
     def _play_record(self, record_index: int) -> bool:
         if self._player is None:
             return False
@@ -1065,8 +1120,14 @@ class MainWindow(
 
         self._apply_output_device()
         self._apply_player_loop_mode()
+        clip_start_ms, clip_stop_ms = self._clip_window_for_record(record)
+        self._current_clip_start_ms = clip_start_ms
+        self._current_clip_stop_ms = clip_stop_ms
+        start_ms = self._prepare_clip_start_seek(temporary_mute_for_seek=True)
         self._player.setSource(QUrl.fromLocalFile(str(record.path)))
         self._player.play()
+        if start_ms > 0:
+            self._player.setPosition(start_ms)
         self._current_playing_name = record.path.name
         self._select_record_row(record_index)
 
@@ -1171,8 +1232,11 @@ class MainWindow(
             QMediaPlayer.PlaybackState.PausedState,
         ):
             self._player.stop()
-            self._player.setPosition(0)
+            self._player.setPosition(self._current_clip_start_ms)
             self._reset_continuous_queue()
+            self._reset_clip_playback_window()
+            if self._audio_output is not None:
+                self._audio_output.setMuted(self._is_muted)
             self._current_playing_name = ""
             self._status.showMessage("Playback stopped.")
 
@@ -1189,6 +1253,49 @@ class MainWindow(
         self._update_time_label(self._player.position() if self._player is not None else 0, duration_ms)
 
     def _on_position_changed(self, position_ms: int) -> None:
+        if self._player is not None:
+            if self._clip_start_seek_pending:
+                if position_ms + 120 < self._current_clip_start_ms:
+                    self._player.setPosition(self._current_clip_start_ms)
+                    return
+                self._clip_start_seek_pending = False
+                if self._clip_seek_muted_temporarily:
+                    self._clip_seek_muted_temporarily = False
+                    if self._audio_output is not None:
+                        self._audio_output.setMuted(self._is_muted)
+
+            clip_stop_ms = self._current_clip_stop_ms
+            if (
+                clip_stop_ms > self._current_clip_start_ms
+                and position_ms >= clip_stop_ms
+                and self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+            ):
+                if self._clip_boundary_handling:
+                    return
+                self._clip_boundary_handling = True
+                if self._playback_mode == "loop":
+                    self._restart_current_clip_from_start(temporary_mute_for_seek=False)
+                    return
+
+                if self._continuous_queue and self._play_next_continuous_record():
+                    self._clip_boundary_handling = False
+                    return
+
+                self._player.stop()
+                self._player.setPosition(self._current_clip_start_ms)
+                ended_name = self._current_playing_name
+                self._reset_continuous_queue()
+                self._reset_clip_playback_window()
+                if self._audio_output is not None:
+                    self._audio_output.setMuted(self._is_muted)
+                self._current_playing_name = ""
+                self._clip_boundary_handling = False
+                if ended_name:
+                    self._status.showMessage(f"Playback finished: {ended_name}")
+                else:
+                    self._status.showMessage("Playback finished.")
+                return
+
         if not self._slider_pressed:
             self._position_slider.setValue(position_ms)
         duration = self._player.duration() if self._player is not None else 0
@@ -1203,6 +1310,10 @@ class MainWindow(
         is_stopped = self._player.playbackState() == QMediaPlayer.PlaybackState.StoppedState
         if is_stopped:
             self._position_slider.setValue(0)
+            if self._clip_seek_muted_temporarily:
+                self._clip_seek_muted_temporarily = False
+                if self._audio_output is not None:
+                    self._audio_output.setMuted(self._is_muted)
         # Make stop button breathe when playing or paused
         is_active = self._player.playbackState() in (
             QMediaPlayer.PlaybackState.PlayingState,
@@ -1214,10 +1325,16 @@ class MainWindow(
         if self._player is None:
             return
         if status == QMediaPlayer.MediaStatus.EndOfMedia:
+            if self._playback_mode == "loop":
+                self._restart_current_clip_from_start(temporary_mute_for_seek=False)
+                return
             ended_name = self._current_playing_name
             if self._play_next_continuous_record():
                 return
             self._reset_continuous_queue()
+            self._reset_clip_playback_window()
+            if self._audio_output is not None:
+                self._audio_output.setMuted(self._is_muted)
             self._current_playing_name = ""
             if ended_name:
                 self._status.showMessage(f"Playback finished: {ended_name}")
@@ -1279,8 +1396,8 @@ class MainWindow(
     def _apply_player_loop_mode(self) -> None:
         if self._player is None:
             return
-        # Native backend looping avoids manual restart gaps between iterations.
-        self._player.setLoops(-1 if self._playback_mode == "loop" else 1)
+        # Manual loop control keeps clip offsets consistent across backends.
+        self._player.setLoops(1)
 
     def _set_loop_breathing(self, enabled: bool) -> None:
         if not enabled:
