@@ -30,15 +30,15 @@ if (-not (Test-Path $mainExe)) {
 }
 
 if ([string]::IsNullOrWhiteSpace($AppVersion)) {
-    $guiPath = Join-Path $PSScriptRoot "gui.py"
-    if (-not (Test-Path $guiPath)) {
-        throw "Cannot infer app version because gui.py was not found. Provide -AppVersion explicitly."
+    $appPath = Join-Path $PSScriptRoot "app.py"
+    if (-not (Test-Path $appPath)) {
+        throw "Cannot infer app version because app.py was not found. Provide -AppVersion explicitly."
     }
 
-    $guiText = Get-Content -Raw -Path $guiPath
-    $versionMatch = [regex]::Match($guiText, 'APP_VERSION\s*=\s*"([^"]+)"')
+    $appText = Get-Content -Raw -Path $appPath
+    $versionMatch = [regex]::Match($appText, 'APP_VERSION\\s*=\\s*"([^"]+)"')
     if (-not $versionMatch.Success) {
-        throw "Unable to parse APP_VERSION from gui.py. Provide -AppVersion explicitly."
+        throw "Unable to parse APP_VERSION from app.py. Provide -AppVersion explicitly."
     }
     $AppVersion = $versionMatch.Groups[1].Value
 }
