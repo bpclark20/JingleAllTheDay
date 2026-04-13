@@ -4,24 +4,30 @@ import math
 import subprocess
 import wave
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from app_helpers import format_duration_hms as _format_duration_hms
 from app_helpers import probe_duration_seconds as _probe_duration_seconds
 from app_helpers import coerce_volume_percent as _coerce_volume_percent
-from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QColor, QMouseEvent, QPaintEvent, QPainter, QPen
+from waveform_cache import load_waveform_peaks as _load_waveform_peaks_cached
+from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import QColor, QCursor, QMouseEvent, QPaintEvent, QPainter, QPen
 from PyQt6.QtWidgets import (
+    QApplication,
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
+    QGraphicsOpacityEffect,
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
 )
+
+_WAVEFORM_CACHE: dict[tuple[str, int, int, int], list[float]] = {}
 
 _has_qt_multimedia = False
 try:
@@ -198,6 +204,142 @@ class WaveformWidget(QWidget):
             painter.drawLine(playhead_x, 0, playhead_x, height)
 
 
+class WaveformTimelineWidget(QWidget):
+    # Candidate intervals in seconds from finest to coarsest.
+    _NICE_INTERVALS: list[float] = [
+        0.01, 0.02, 0.025, 0.05, 0.1, 0.2, 0.25, 0.5,
+        1, 2, 5, 10, 15, 20, 30,
+        60, 120, 150, 300, 600, 900, 1800, 3600,
+    ]
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._duration_seconds = 0.0
+        self.setMinimumHeight(34)
+        self.setMaximumHeight(42)
+
+    def set_duration_seconds(self, duration_seconds: float) -> None:
+        self._duration_seconds = max(0.0, float(duration_seconds))
+        self.update()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.update()
+
+    @staticmethod
+    def _fmt_time(seconds: float, interval: float) -> str:
+        """Format a timestamp with precision appropriate for the tick interval."""
+        if interval < 1.0:
+            m = int(seconds // 60)
+            s = seconds - m * 60
+            h, m = divmod(m, 60)
+            if h > 0:
+                return f"{h:02d}:{m:02d}:{s:05.2f}"
+            return f"{m:02d}:{s:05.2f}"
+        elif interval < 10.0:
+            m = int(seconds // 60)
+            s = seconds - m * 60
+            h, m = divmod(m, 60)
+            if h > 0:
+                return f"{h:02d}:{m:02d}:{s:04.1f}"
+            return f"{m:02d}:{s:04.1f}"
+        else:
+            total = max(0, int(round(seconds)))
+            m, s = divmod(total, 60)
+            h, m = divmod(m, 60)
+            if h > 0:
+                return f"{h:02d}:{m:02d}:{s:02d}"
+            return f"{m:02d}:{s:02d}"
+
+    @classmethod
+    def _pick_interval(cls, min_interval_seconds: float) -> float:
+        """Return the coarsest nice interval that is still >= min_interval_seconds."""
+        for iv in cls._NICE_INTERVALS:
+            if iv >= min_interval_seconds:
+                return iv
+        return cls._NICE_INTERVALS[-1]
+
+    def _build_tick_positions(self, interval: float) -> list[float]:
+        """Return major tick positions in seconds, always including 0 and duration."""
+        positions: list[float] = []
+        t = 0.0
+        while t < self._duration_seconds:
+            positions.append(t)
+            t += interval
+        positions.append(self._duration_seconds)
+        # If the last regular tick lands very close to the endpoint, merge them.
+        if len(positions) >= 3 and (positions[-1] - positions[-2]) < interval * 0.3:
+            positions[-2] = positions[-1]
+            positions.pop()
+        return positions
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+
+        width = self.width()
+        height = self.height()
+        if width <= 1 or height <= 1:
+            return
+
+        baseline_y = 8
+        tick_top = baseline_y
+        tick_bottom_major = baseline_y + 8
+        tick_bottom_minor = baseline_y + 5
+        label_y = tick_bottom_major + 14
+
+        axis_pen = QPen(QColor("#6b7280"))
+        axis_pen.setWidth(1)
+        painter.setPen(axis_pen)
+        painter.drawLine(0, baseline_y, width - 1, baseline_y)
+
+        if self._duration_seconds <= 0.0:
+            painter.setPen(QColor("#9ca3af"))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "00:00")
+            return
+
+        # Choose a "nice" interval that keeps labels from crowding each other.
+        fm = painter.fontMetrics()
+        # "00:00.00" is the widest short-duration label; add padding on each side.
+        label_width_est = fm.horizontalAdvance("00:00.00") + 16
+        min_interval_s = label_width_est * self._duration_seconds / max(1, width - 1)
+        interval = self._pick_interval(min_interval_s)
+        positions = self._build_tick_positions(interval)
+
+        minor_pen = QPen(QColor("#4b5563"))
+        minor_pen.setWidth(1)
+        major_pen = QPen(QColor("#9ca3af"))
+        major_pen.setWidth(1)
+
+        # One minor tick at the midpoint between consecutive major ticks.
+        painter.setPen(minor_pen)
+        for i in range(len(positions) - 1):
+            mid_sec = (positions[i] + positions[i + 1]) / 2.0
+            ratio = mid_sec / self._duration_seconds
+            x = int(round(ratio * (width - 1)))
+            painter.drawLine(x, tick_top, x, tick_bottom_minor)
+
+        painter.setPen(major_pen)
+        for sec in positions:
+            ratio = sec / self._duration_seconds
+            x = int(round(ratio * (width - 1)))
+            painter.drawLine(x, tick_top, x, tick_bottom_major)
+
+        painter.setPen(QColor("#e5e7eb"))
+        for idx, sec in enumerate(positions):
+            ratio = sec / self._duration_seconds
+            x = int(round(ratio * (width - 1)))
+            label = self._fmt_time(sec, interval)
+            text_width = fm.horizontalAdvance(label)
+            if idx == 0:
+                painter.drawText(0, label_y, label)
+            elif idx == len(positions) - 1:
+                painter.drawText(max(0, width - text_width), label_y, label)
+            else:
+                painter.drawText(max(0, x - text_width // 2), label_y, label)
+
+
 class JingleEditDialog(QDialog):
     def __init__(
         self,
@@ -209,6 +351,8 @@ class JingleEditDialog(QDialog):
         preview_output_device: str,
         live_volume_percent: int,
         preview_volume_percent: int,
+        waveform_cache_dir: Path | None = None,
+        on_save_clip_points: Callable[[float, float], bool] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -229,7 +373,13 @@ class JingleEditDialog(QDialog):
 
         self._live_output_device = live_output_device.strip()
         self._preview_output_device = preview_output_device.strip()
-        self._playback_volume_percent = _coerce_volume_percent(preview_volume_percent)
+        self._live_volume_percent = _coerce_volume_percent(live_volume_percent)
+        self._preview_volume_percent = _coerce_volume_percent(preview_volume_percent)
+        self._is_preview_mode = True
+        self._waveform_cache_dir = waveform_cache_dir
+        self._on_save_clip_points = on_save_clip_points
+        self._saved_start_seconds = self._start_seconds
+        self._saved_stop_seconds = self._stop_seconds
 
         self._player: QMediaPlayer | None = None
         self._audio_output: QAudioOutput | None = None
@@ -238,21 +388,35 @@ class JingleEditDialog(QDialog):
         self._seek_to_start_pending = False
         self._seek_muted_temporarily = False
         self._clip_boundary_handling = False
+        self._play_btn_breath_effect: QGraphicsOpacityEffect | None = None
+        self._play_btn_breath_anim: QPropertyAnimation | None = None
+        self._stop_btn_breath_effect: QGraphicsOpacityEffect | None = None
+        self._stop_btn_breath_anim: QPropertyAnimation | None = None
+        self._loop_btn_breath_effect: QGraphicsOpacityEffect | None = None
+        self._loop_btn_breath_anim: QPropertyAnimation | None = None
+        self._mode_btn_breath_effect: QGraphicsOpacityEffect | None = None
+        self._mode_btn_breath_anim: QPropertyAnimation | None = None
         self._clip_guard_timer = QTimer(self)
         self._clip_guard_timer.setInterval(40)
         self._clip_guard_timer.timeout.connect(self._on_clip_guard_tick)
+        self._waveform_loaded = False
+        self._save_btn: QPushButton | None = None
 
         root = QVBoxLayout(self)
 
         self._waveform = WaveformWidget(self)
-        peaks = _load_waveform_peaks(file_path)
-        self._waveform.set_waveform(peaks, self._duration_seconds)
+        self._waveform.set_waveform([], self._duration_seconds)
         self._waveform.set_markers(self._start_seconds, self._stop_seconds)
         root.addWidget(self._waveform)
 
-        self._scale_label = QLabel(self)
-        self._scale_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        root.addWidget(self._scale_label)
+        self._waveform_loading_label = QLabel("Loading waveform...")
+        self._waveform_loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._waveform_loading_label.setStyleSheet("color: #7f8790;")
+        root.addWidget(self._waveform_loading_label)
+
+        self._timeline = WaveformTimelineWidget(self)
+        self._timeline.set_duration_seconds(self._duration_seconds)
+        root.addWidget(self._timeline)
 
         self._selection_label = QLabel(self)
         self._selection_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -285,10 +449,6 @@ class JingleEditDialog(QDialog):
         tips_row.addStretch()
         root.addLayout(tips_row)
 
-        self._output_label = QLabel("Output: unknown")
-        self._output_label.setStyleSheet("color: #7f8790;")
-        root.addWidget(self._output_label)
-
         playback_row = QHBoxLayout()
         self._play_pause_btn = QPushButton("Play")
         self._play_pause_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -310,12 +470,26 @@ class JingleEditDialog(QDialog):
         self._loop_btn.clicked.connect(self._on_loop_clicked)
         playback_row.addWidget(self._loop_btn)
 
+        self._mode_btn = QPushButton("Mode: Preview")
+        self._mode_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._mode_btn.setCheckable(True)
+        self._mode_btn.toggled.connect(self._on_mode_toggled)
+        playback_row.addWidget(self._mode_btn)
+
         root.addLayout(playback_row)
+        self._refresh_mode_toggle_state()
+        self._refresh_play_pause_button()
+        self._refresh_stop_button()
+        self._refresh_mute_button()
+        self._refresh_loop_button()
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
-        buttons.accepted.connect(self.accept)
+        self._save_btn = buttons.button(QDialogButtonBox.StandardButton.Save)
+        if self._save_btn is not None:
+            self._save_btn.clicked.connect(self._on_save_clicked)
+            self._save_btn.setEnabled(False)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
 
@@ -330,6 +504,31 @@ class JingleEditDialog(QDialog):
         self._init_player()
         self._sync_controls_from_values()
 
+    def showEvent(self, event: Any) -> None:
+        super().showEvent(event)
+        if self._waveform_loaded:
+            return
+        self._waveform_loaded = True
+        self._load_waveform_data()
+
+    def _load_waveform_data(self) -> None:
+        self._waveform_loading_label.setText("Loading waveform...")
+        self._waveform_loading_label.show()
+        QApplication.processEvents()
+
+        QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
+        try:
+            peaks = _load_waveform_peaks_cached(
+                self._path,
+                bucket_count=900,
+                cache_dir=self._waveform_cache_dir,
+            )
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        self._waveform.set_waveform(peaks, self._duration_seconds)
+        self._waveform_loading_label.hide()
+
     def selected_clip_points(self) -> tuple[float, float]:
         return self._start_seconds, self._stop_seconds
 
@@ -339,14 +538,15 @@ class JingleEditDialog(QDialog):
             self._stop_btn.setEnabled(False)
             self._mute_btn.setEnabled(False)
             self._loop_btn.setEnabled(False)
-            self._output_label.setText("Output: Playback unavailable")
+            self._mode_btn.setEnabled(False)
             return
 
         self._player = QMediaPlayer(self)
         self._audio_output = QAudioOutput(self)
         self._player.setAudioOutput(self._audio_output)
         self._audio_output.setMuted(self._is_muted)
-        self._audio_output.setVolume(self._playback_volume_percent / 100.0)
+        self._audio_output.setVolume(self._active_volume_percent() / 100.0)
+        self._refresh_mode_toggle_state()
         self._apply_editor_output_device()
 
         self._player.durationChanged.connect(self._on_player_duration_changed)
@@ -359,35 +559,96 @@ class JingleEditDialog(QDialog):
     def _normalize_device_key(self, value: str) -> str:
         return value.strip().casefold()
 
-    def _preferred_device_name(self) -> str:
-        return self._preview_output_device
+    def _can_use_preview_mode(self) -> bool:
+        return self._normalize_device_key(self._live_output_device) != self._normalize_device_key(
+            self._preview_output_device
+        )
+
+    def _active_output_device(self) -> str:
+        if self._is_preview_mode and self._can_use_preview_mode():
+            return self._preview_output_device
+        return self._live_output_device
+
+    def _active_volume_percent(self) -> int:
+        if self._is_preview_mode and self._can_use_preview_mode():
+            return self._preview_volume_percent
+        return self._live_volume_percent
+
+    def _refresh_mode_toggle_state(self) -> None:
+        can_use = self._can_use_preview_mode()
+        if not can_use and self._is_preview_mode:
+            self._is_preview_mode = False
+
+        self._mode_btn.blockSignals(True)
+        self._mode_btn.setChecked(self._is_preview_mode)
+        self._mode_btn.blockSignals(False)
+        self._mode_btn.setEnabled(can_use)
+        if can_use:
+            self._mode_btn.setToolTip("Toggle between Live and Preview output devices")
+        else:
+            self._mode_btn.setToolTip(
+                "Preview/Live switch is disabled because Live and Preview devices are the same"
+            )
+        self._set_mode_button_visual()
+
+    def _set_mode_button_visual(self) -> None:
+        if self._is_preview_mode:
+            self._mode_btn.setText("Mode: Preview")
+            self._mode_btn.setStyleSheet(
+                "QPushButton { background-color: #1565c0; color: white; font-weight: bold; }"
+                "QPushButton:hover { background-color: #1976d2; }"
+            )
+            self._set_button_breathing(
+                self._mode_btn,
+                "_mode_btn_breath_effect",
+                "_mode_btn_breath_anim",
+                False,
+                1300,
+                0.72,
+            )
+        else:
+            self._mode_btn.setText("Mode: Live")
+            self._mode_btn.setStyleSheet(
+                "QPushButton { background-color: #b71c1c; color: white; font-weight: bold; }"
+                "QPushButton:hover { background-color: #c62828; }"
+            )
+            self._set_button_breathing(
+                self._mode_btn,
+                "_mode_btn_breath_effect",
+                "_mode_btn_breath_anim",
+                self._mode_btn.isEnabled(),
+                1300,
+                0.72,
+            )
+
+    def _on_mode_toggled(self, checked: bool) -> None:
+        if checked and not self._can_use_preview_mode():
+            self._mode_btn.blockSignals(True)
+            self._mode_btn.setChecked(False)
+            self._mode_btn.blockSignals(False)
+            self._is_preview_mode = False
+            self._set_mode_button_visual()
+            return
+
+        self._is_preview_mode = bool(checked)
+        self._set_mode_button_visual()
+        self._apply_editor_output_device()
 
     def _apply_editor_output_device(self) -> None:
         if self._audio_output is None or not _has_qt_multimedia:
             return
 
-        preferred_name = self._preferred_device_name()
+        preferred_name = self._active_output_device().strip()
         target_device = QMediaDevices.defaultAudioOutput()
-        output_source = f"Preview (system default: {target_device.description()})"
 
         if preferred_name:
             for device in QMediaDevices.audioOutputs():
                 if self._normalize_device_key(device.description()) == self._normalize_device_key(preferred_name):
                     target_device = device
-                    output_source = f"Preview device: {target_device.description()}"
                     break
-            else:
-                if self._live_output_device:
-                    for device in QMediaDevices.audioOutputs():
-                        if self._normalize_device_key(device.description()) == self._normalize_device_key(self._live_output_device):
-                            target_device = device
-                            output_source = f"Live fallback: {target_device.description()}"
-                            break
-                else:
-                    output_source = f"Preview unavailable, using default: {target_device.description()}"
 
         self._audio_output.setDevice(target_device)
-        self._output_label.setText(f"Output: {output_source}")
+        self._audio_output.setVolume(self._active_volume_percent() / 100.0)
 
     def _on_play_pause_clicked(self) -> None:
         if self._player is None:
@@ -414,20 +675,25 @@ class JingleEditDialog(QDialog):
     def _on_stop_clicked(self) -> None:
         if self._player is None:
             return
-        if self._player.playbackState() in (
-            QMediaPlayer.PlaybackState.PlayingState,
-            QMediaPlayer.PlaybackState.PausedState,
-        ):
-            self._player.stop()
+        if self._clip_guard_timer.isActive():
+            self._clip_guard_timer.stop()
+        if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            # Avoid immediate stop+seek; some backends can stall on specific files/devices.
+            self._player.pause()
         start_ms = self._clip_start_ms()
+        self._seek_to_start_pending = False
+        self._clip_boundary_handling = False
         self._player.setPosition(start_ms)
         self._waveform.set_playhead_seconds(start_ms / 1000.0)
+        self._waveform.set_playhead_active(False)
         self._seek_muted_temporarily = False
         if self._audio_output is not None:
             self._audio_output.setMuted(self._is_muted)
+        self._refresh_play_pause_button()
+        self._refresh_stop_button()
 
     def _update_mute_button_visual(self) -> None:
-        self._mute_btn.setText("Unmute" if self._is_muted else "Mute")
+        self._refresh_mute_button()
 
     def _on_mute_clicked(self) -> None:
         if self._audio_output is None:
@@ -440,11 +706,178 @@ class JingleEditDialog(QDialog):
         self._update_mute_button_visual()
 
     def _update_loop_button_visual(self) -> None:
-        self._loop_btn.setText("Loop On" if self._is_looping else "Loop Off")
+        self._refresh_loop_button()
 
     def _on_loop_clicked(self) -> None:
         self._is_looping = not self._is_looping
         self._update_loop_button_visual()
+
+    def _clip_points_changed_from_saved(self) -> bool:
+        return (
+            abs(self._start_seconds - self._saved_start_seconds) >= 0.0005
+            or abs(self._stop_seconds - self._saved_stop_seconds) >= 0.0005
+        )
+
+    def _refresh_save_button_state(self) -> None:
+        if self._save_btn is None:
+            return
+        self._save_btn.setEnabled(self._clip_points_changed_from_saved())
+
+    def _on_save_clicked(self) -> None:
+        if not self._clip_points_changed_from_saved():
+            self._refresh_save_button_state()
+            return
+
+        ok = True
+        if self._on_save_clip_points is not None:
+            try:
+                ok = bool(self._on_save_clip_points(self._start_seconds, self._stop_seconds))
+            except Exception as exc:  # defensive; callback should report details itself
+                ok = False
+                QMessageBox.critical(
+                    self,
+                    "Save Failed",
+                    f"Could not save jingle trim range.\n\n{exc}",
+                )
+
+        if not ok:
+            return
+
+        self._saved_start_seconds = self._start_seconds
+        self._saved_stop_seconds = self._stop_seconds
+        self._refresh_save_button_state()
+
+    # ------------------------------------------------------------------
+    # Button styling helpers
+    # ------------------------------------------------------------------
+
+    def _set_button_breathing(
+        self,
+        btn: QPushButton,
+        effect_attr: str,
+        anim_attr: str,
+        enabled: bool,
+        duration_ms: int,
+        mid_opacity: float,
+    ) -> None:
+        anim: QPropertyAnimation | None = getattr(self, anim_attr)
+        effect: QGraphicsOpacityEffect | None = getattr(self, effect_attr)
+        if not enabled:
+            if anim is not None:
+                anim.stop()
+            if effect is not None:
+                try:
+                    effect.setOpacity(1.0)
+                except RuntimeError:
+                    pass
+            btn.setGraphicsEffect(None)
+            setattr(self, anim_attr, None)
+            setattr(self, effect_attr, None)
+            return
+
+        if effect is None:
+            effect = QGraphicsOpacityEffect(btn)
+            setattr(self, effect_attr, effect)
+        try:
+            btn.setGraphicsEffect(effect)
+        except RuntimeError:
+            effect = QGraphicsOpacityEffect(btn)
+            setattr(self, effect_attr, effect)
+            btn.setGraphicsEffect(effect)
+            setattr(self, anim_attr, None)
+            anim = None
+
+        anim = getattr(self, anim_attr)
+        if anim is None:
+            anim = QPropertyAnimation(effect, b"opacity", self)
+            anim.setDuration(duration_ms)
+            anim.setStartValue(1.0)
+            anim.setKeyValueAt(0.5, mid_opacity)
+            anim.setEndValue(1.0)
+            anim.setLoopCount(-1)
+            anim.setEasingCurve(QEasingCurve.Type.InOutSine)
+            setattr(self, anim_attr, anim)
+        anim.start()
+
+    def _refresh_play_pause_button(self) -> None:
+        is_playing = (
+            self._player is not None
+            and self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        )
+        if is_playing:
+            self._play_pause_btn.setText("Pause")
+            self._play_pause_btn.setStyleSheet(
+                "QPushButton { background-color: #f57c00; color: white; font-weight: bold; }"
+                "QPushButton:hover { background-color: #e65100; }"
+            )
+        else:
+            self._play_pause_btn.setText("Play")
+            self._play_pause_btn.setStyleSheet(
+                "QPushButton { background-color: #2e7d32; color: white; font-weight: bold; }"
+                "QPushButton:hover { background-color: #388e3c; }"
+            )
+        self._set_button_breathing(
+            self._play_pause_btn,
+            "_play_btn_breath_effect",
+            "_play_btn_breath_anim",
+            is_playing,
+            1000,
+            0.68,
+        )
+
+    def _refresh_stop_button(self) -> None:
+        is_active = (
+            self._player is not None
+            and self._player.playbackState() in (
+                QMediaPlayer.PlaybackState.PlayingState,
+                QMediaPlayer.PlaybackState.PausedState,
+            )
+        )
+        self._stop_btn.setStyleSheet(
+            "QPushButton { background-color: #c62828; color: white; font-weight: bold; }"
+            "QPushButton:hover { background-color: #d32f2f; }"
+        )
+        self._set_button_breathing(
+            self._stop_btn,
+            "_stop_btn_breath_effect",
+            "_stop_btn_breath_anim",
+            is_active,
+            1000,
+            0.68,
+        )
+
+    def _refresh_mute_button(self) -> None:
+        if self._is_muted:
+            self._mute_btn.setText("Unmute")
+            self._mute_btn.setStyleSheet(
+                "QPushButton { background-color: #546e7a; color: white; font-weight: bold; }"
+                "QPushButton:hover { background-color: #607d8b; }"
+            )
+        else:
+            self._mute_btn.setText("Mute")
+            self._mute_btn.setStyleSheet(
+                "QPushButton { background-color: #455a64; color: white; font-weight: bold; }"
+                "QPushButton:hover { background-color: #546e7a; }"
+            )
+
+    def _refresh_loop_button(self) -> None:
+        if self._is_looping:
+            self._loop_btn.setText("Loop On")
+            self._loop_btn.setStyleSheet(
+                "QPushButton { background-color: #0d47a1; color: white; font-weight: bold; }"
+                "QPushButton:hover { background-color: #1565c0; }"
+            )
+        else:
+            self._loop_btn.setText("Loop Off")
+            self._loop_btn.setStyleSheet("")
+        self._set_button_breathing(
+            self._loop_btn,
+            "_loop_btn_breath_effect",
+            "_loop_btn_breath_anim",
+            self._is_looping,
+            1100,
+            0.72,
+        )
 
     def _clip_start_ms(self) -> int:
         return int(round(self._start_seconds * 1000.0))
@@ -525,13 +958,11 @@ class JingleEditDialog(QDialog):
             return
         state = self._player.playbackState()
         if state == QMediaPlayer.PlaybackState.PlayingState:
-            self._play_pause_btn.setText("Pause")
             if not self._clip_guard_timer.isActive():
                 self._clip_guard_timer.start()
             self._waveform.set_playhead_active(True)
             self._waveform.set_playhead_seconds(self._player.position() / 1000.0)
         else:
-            self._play_pause_btn.setText("Play")
             if self._clip_guard_timer.isActive():
                 self._clip_guard_timer.stop()
             self._waveform.set_playhead_active(False)
@@ -541,6 +972,8 @@ class JingleEditDialog(QDialog):
                     self._audio_output.setMuted(self._is_muted)
             if state == QMediaPlayer.PlaybackState.StoppedState:
                 self._waveform.set_playhead_seconds(self._clip_start_ms() / 1000.0)
+        self._refresh_play_pause_button()
+        self._refresh_stop_button()
 
     def _on_player_media_status_changed(self, status: QMediaPlayer.MediaStatus) -> None:
         if self._player is None:
@@ -581,15 +1014,14 @@ class JingleEditDialog(QDialog):
             self._stop_spin.blockSignals(False)
 
         self._waveform.set_markers(self._start_seconds, self._stop_seconds)
-        self._scale_label.setText(
-            f"0:00           { _format_duration_hms(self._duration_seconds / 2.0) }           {_format_duration_hms(self._duration_seconds)}"
-        )
+        self._timeline.set_duration_seconds(self._duration_seconds)
         selected_duration = max(0.0, self._stop_seconds - self._start_seconds)
         self._selection_label.setText(
             f"Start: {_format_duration_hms(self._start_seconds)} | "
             f"Stop: {_format_duration_hms(self._stop_seconds)} | "
             f"Selection: {_format_duration_hms(selected_duration)}"
         )
+        self._refresh_save_button_state()
 
     def accept(self) -> None:
         if self._player is not None:
@@ -606,17 +1038,32 @@ def _load_waveform_peaks(path: Path, bucket_count: int = 900) -> list[float]:
     if bucket_count <= 0:
         return []
 
+    try:
+        stat = path.stat()
+        cache_key = (str(path), int(stat.st_mtime_ns), int(stat.st_size), int(bucket_count))
+    except OSError:
+        cache_key = None
+
+    if cache_key is not None:
+        cached = _WAVEFORM_CACHE.get(cache_key)
+        if cached is not None:
+            return list(cached)
+
+    peaks: list[float] = []
     suffix = path.suffix.lower()
     if suffix in {".wav", ".wave"}:
         peaks = _load_wav_waveform_peaks(path, bucket_count)
-        if peaks:
-            return peaks
 
-    peaks = _load_ffmpeg_waveform_peaks(path, bucket_count)
-    if peaks:
-        return peaks
+    if not peaks:
+        peaks = _load_ffmpeg_waveform_peaks(path, bucket_count)
 
-    return []
+    if cache_key is not None:
+        # Keep cache bounded to avoid unbounded growth for large libraries.
+        if len(_WAVEFORM_CACHE) >= 96:
+            _WAVEFORM_CACHE.pop(next(iter(_WAVEFORM_CACHE)))
+        _WAVEFORM_CACHE[cache_key] = list(peaks)
+
+    return peaks
 
 
 def _load_wav_waveform_peaks(path: Path, bucket_count: int) -> list[float]:
@@ -664,7 +1111,7 @@ def _load_ffmpeg_waveform_peaks(path: Path, bucket_count: int) -> list[float]:
         "-ac",
         "1",
         "-ar",
-        "8000",
+        "3000",
         "-f",
         "s16le",
         "-",
@@ -677,17 +1124,29 @@ def _load_ffmpeg_waveform_peaks(path: Path, bucket_count: int) -> list[float]:
     if result.returncode != 0 or not result.stdout:
         return []
 
-    raw = result.stdout
-    sample_count = len(raw) // 2
-    if sample_count <= 0:
+    return _reduce_pcm16_bytes_to_peaks(result.stdout, bucket_count)
+
+
+def _reduce_pcm16_bytes_to_peaks(raw_pcm: bytes, bucket_count: int) -> list[float]:
+    sample_count = len(raw_pcm) // 2
+    if sample_count <= 0 or bucket_count <= 0:
         return []
 
-    amplitudes: list[float] = []
-    for i in range(sample_count):
-        value = int.from_bytes(raw[i * 2 : i * 2 + 2], byteorder="little", signed=True)
-        amplitudes.append(min(1.0, abs(value) / 32767.0))
+    if sample_count <= bucket_count:
+        out: list[float] = []
+        for i in range(sample_count):
+            value = int.from_bytes(raw_pcm[i * 2 : i * 2 + 2], byteorder="little", signed=True)
+            out.append(min(1.0, abs(value) / 32767.0))
+        return out
 
-    return _reduce_to_peaks(amplitudes, bucket_count)
+    peaks = [0.0] * bucket_count
+    for i in range(sample_count):
+        bucket = min(bucket_count - 1, int(i * bucket_count / sample_count))
+        value = int.from_bytes(raw_pcm[i * 2 : i * 2 + 2], byteorder="little", signed=True)
+        amplitude = min(1.0, abs(value) / 32767.0)
+        if amplitude > peaks[bucket]:
+            peaks[bucket] = amplitude
+    return peaks
 
 
 def _reduce_to_peaks(amplitudes: list[float], bucket_count: int) -> list[float]:
@@ -717,5 +1176,5 @@ def shutil_which(name: str) -> str | None:
 
 if __name__ == "__main__":
     print("This module is a helper and is not meant to be run directly.")
-    print("Launch gui.py to start JingleAllTheDay.")
+    print("Launch app.py to start JingleAllTheDay.")
     raise SystemExit(1)

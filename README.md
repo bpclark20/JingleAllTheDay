@@ -31,7 +31,7 @@ pip install -r requirements.txt
 ## Run
 
 ```powershell
-python gui.py
+python app.py
 ```
 
 ## Build EXE

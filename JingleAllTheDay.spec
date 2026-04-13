@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['gui.py'],
+    ['app.py'],
     pathex=[],
     binaries=[],
     datas=[('icon.ico', '.'), ('icon.png', '.')],  # ico for bootloader/EXE; png for Qt setWindowIcon

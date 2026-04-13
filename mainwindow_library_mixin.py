@@ -17,6 +17,7 @@ from app_helpers import (
 )
 from mainwindow_contracts import MainWindowLibraryHost
 from models_store import JingleRecord
+from waveform_cache import build_waveform_previews
 
 
 AUDIO_EXTENSIONS = {
@@ -149,6 +150,8 @@ class MainWindowLibraryMixin:
         try:
             files = self._scan_audio_files(self._samples_dir)
             self._refresh_library_watcher_paths(files)
+            existing_paths = {path_key for path_key, _ in self._store.iter_entries()}
+            new_paths = [path for path in files if str(path) not in existing_paths]
             self._store.sync_with_files(files)
 
             records: list[JingleRecord] = []
@@ -190,13 +193,26 @@ class MainWindowLibraryMixin:
             self._records = records
             self._store.save()
 
+            waveform_generated_count = 0
+            if self._auto_generate_waveforms and new_paths:
+                _total, waveform_generated_count, _cached_count = build_waveform_previews(
+                    new_paths,
+                    cache_dir=self._app_data_dir / "waveform-cache",
+                    bucket_count=900,
+                )
+
             if self._auto_folder_tags:
                 self._apply_folder_titles_to_records(self._records, preserve_existing=True)
 
             self._apply_filters()
-            self._status.showMessage(
+            status_message = (
                 f"Rescan complete: {len(records)} jingles ({changed_count} changed/new files re-probed)."
             )
+            if self._auto_generate_waveforms and new_paths:
+                status_message += (
+                    f" Waveforms generated for {waveform_generated_count}/{len(new_paths)} new file(s)."
+                )
+            self._status.showMessage(status_message)
         finally:
             QApplication.restoreOverrideCursor()
             self._is_rescanning = False
@@ -331,5 +347,5 @@ class MainWindowLibraryMixin:
 
 if __name__ == "__main__":
     print("This module is a helper and is not meant to be run directly.")
-    print("Launch gui.py to start JingleAllTheDay.")
+    print("Launch app.py to start JingleAllTheDay.")
     raise SystemExit(1)

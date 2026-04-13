@@ -3,11 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import cast
 
-from PyQt6.QtWidgets import QInputDialog, QMessageBox
+from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal
+from PyQt6.QtWidgets import QDialog, QHBoxLayout, QInputDialog, QLabel, QMessageBox, QProgressBar, QPushButton, QVBoxLayout
 
 from app_helpers import merge_tags as _merge_tags, normalize_tags as _normalize_tags
 from mainwindow_contracts import MainWindowToolsHost
 from models_store import JingleRecord
+from waveform_cache import build_waveform_previews, has_persisted_waveform_preview
 
 
 DUPLICATE_FORMAT_PRIORITY = {
@@ -21,6 +23,42 @@ DUPLICATE_FORMAT_PRIORITY = {
     ".wma": 6,
     ".mp3": 7,
 }
+
+
+class _WaveformBuildWorker(QObject):
+    progress = pyqtSignal(int, int, str, str)
+    finished = pyqtSignal(int, int, int, bool)
+    failed = pyqtSignal(str)
+
+    def __init__(self, paths: list[Path], cache_dir: Path, bucket_count: int) -> None:
+        super().__init__()
+        self._paths = list(paths)
+        self._cache_dir = cache_dir
+        self._bucket_count = bucket_count
+        self._cancel_requested = False
+
+    def request_cancel(self) -> None:
+        self._cancel_requested = True
+
+    def run(self) -> None:
+        def _on_progress(done: int, total: int, path: Path, source: str) -> None:
+            self.progress.emit(done, total, path.name, source)
+
+        try:
+            total, computed_count, cached_count = build_waveform_previews(
+                self._paths,
+                cache_dir=self._cache_dir,
+                bucket_count=self._bucket_count,
+                progress_callback=_on_progress,
+                should_cancel=lambda: self._cancel_requested,
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+
+        processed_count = computed_count + cached_count
+        was_cancelled = self._cancel_requested and processed_count < total
+        self.finished.emit(total, computed_count, cached_count, was_cancelled)
 
 
 class MainWindowToolsMixin:
@@ -62,6 +100,13 @@ class MainWindowToolsMixin:
         self._save_auto_folder_tags()
         state = "enabled" if checked else "disabled"
         host._status.showMessage(f"Auto-tag from folders on scan: {state}.")
+
+    def _on_auto_generate_waveforms_toggled(self, checked: bool) -> None:
+        host = self._host()
+        host._auto_generate_waveforms = checked
+        self._save_auto_generate_waveforms()
+        state = "enabled" if checked else "disabled"
+        host._status.showMessage(f"Auto-generate waveforms for new files: {state}.")
 
     def _on_watch_library_changes_toggled(self, checked: bool) -> None:
         host = self._host()
@@ -260,6 +305,183 @@ class MainWindowToolsMixin:
         else:
             host._status.showMessage("No duplicate files were removed.")
 
+    def _on_tools_calculate_waveform_previews(self) -> None:
+        host = self._host()
+        if not host._records:
+            host._status.showMessage("No jingles loaded.")
+            return
+
+        paths = [record.path for record in host._records if record.path.exists()]
+        if not paths:
+            host._status.showMessage("No valid jingle files were found.")
+            return
+
+        cache_dir = host._app_data_dir / "waveform-cache"
+        cached_paths = [path for path in paths if has_persisted_waveform_preview(path, cache_dir, bucket_count=900)]
+        paths_to_process = list(paths)
+        if cached_paths:
+            prompt = QMessageBox(self)
+            prompt.setWindowTitle("Calculate Waveform Previews")
+            prompt.setIcon(QMessageBox.Icon.Question)
+            prompt.setText(
+                "Existing waveform cache files were detected.\n\n"
+                f"Cached files: {len(cached_paths)}\n"
+                f"Not yet cached: {max(0, len(paths) - len(cached_paths))}\n\n"
+                "Choose what to calculate:"
+            )
+            new_only_btn = prompt.addButton("New Files Only", QMessageBox.ButtonRole.AcceptRole)
+            all_btn = prompt.addButton("All Files", QMessageBox.ButtonRole.ActionRole)
+            cancel_btn = prompt.addButton(QMessageBox.StandardButton.Cancel)
+            prompt.setDefaultButton(new_only_btn)
+            prompt.exec()
+
+            clicked = prompt.clickedButton()
+            if clicked is cancel_btn:
+                host._status.showMessage("Waveform preview calculation cancelled.")
+                return
+            if clicked is new_only_btn:
+                cached_set = {str(path) for path in cached_paths}
+                paths_to_process = [path for path in paths if str(path) not in cached_set]
+                if not paths_to_process:
+                    host._status.showMessage("All loaded files already have waveform previews cached.")
+                    QMessageBox.information(
+                        self,
+                        "Waveform Previews",
+                        "All loaded files already have cached waveform previews.",
+                    )
+                    return
+            elif clicked is all_btn:
+                paths_to_process = list(paths)
+            else:
+                host._status.showMessage("Waveform preview calculation cancelled.")
+                return
+
+        progress_dialog = QDialog(self)
+        progress_dialog.setWindowTitle("Calculate Waveform Previews")
+        progress_dialog.setModal(True)
+        progress_dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress_dialog.setMinimumWidth(520)
+        progress_dialog.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
+
+        layout = QVBoxLayout(progress_dialog)
+        info_label = QLabel("Building waveform previews for your library...")
+        layout.addWidget(info_label)
+
+        progress_bar = QProgressBar(progress_dialog)
+        progress_bar.setRange(0, len(paths_to_process))
+        progress_bar.setValue(0)
+        layout.addWidget(progress_bar)
+
+        detail_label = QLabel("Preparing...")
+        detail_label.setStyleSheet("color: #7f8790;")
+        layout.addWidget(detail_label)
+
+        buttons_row = QHBoxLayout()
+        buttons_row.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        buttons_row.addWidget(cancel_btn)
+        layout.addLayout(buttons_row)
+
+        state: dict[str, int | str | None] = {
+            "total": 0,
+            "computed": 0,
+            "cached": 0,
+            "error": None,
+            "cancelled": 0,
+        }
+
+        worker_thread = QThread(self)
+        worker = _WaveformBuildWorker(paths_to_process, cache_dir, 900)
+        worker.moveToThread(worker_thread)
+
+        def _on_progress(done: int, total: int, path_name: str, source: str) -> None:
+            progress_bar.setMaximum(total)
+            progress_bar.setValue(done)
+            if source in {"memory", "disk"}:
+                source_label = "cached"
+            else:
+                source_label = "computed"
+            detail_label.setText(f"{done}/{total}: {path_name} ({source_label})")
+
+        def _on_finished(total: int, computed_count: int, cached_count: int, cancelled: bool) -> None:
+            state["total"] = total
+            state["computed"] = computed_count
+            state["cached"] = cached_count
+            state["cancelled"] = 1 if cancelled else 0
+            progress_dialog.accept()
+
+        def _on_failed(message: str) -> None:
+            state["error"] = message
+            progress_dialog.reject()
+
+        worker_thread.started.connect(worker.run)
+        worker.progress.connect(_on_progress)
+        worker.finished.connect(_on_finished)
+        worker.failed.connect(_on_failed)
+        worker.finished.connect(worker_thread.quit)
+        worker.failed.connect(worker_thread.quit)
+        worker_thread.finished.connect(worker.deleteLater)
+        worker_thread.finished.connect(worker_thread.deleteLater)
+
+        def _on_cancel_clicked() -> None:
+            cancel_btn.setEnabled(False)
+            cancel_btn.setText("Cancelling...")
+            detail_label.setText("Cancelling after current file...")
+            worker.request_cancel()
+
+        cancel_btn.clicked.connect(_on_cancel_clicked)
+
+        worker_thread.start()
+        progress_dialog.exec()
+        if worker_thread.isRunning():
+            worker_thread.quit()
+            worker_thread.wait(3000)
+
+        error = state["error"]
+        if isinstance(error, str) and error.strip():
+            QMessageBox.critical(
+                self,
+                "Waveform Previews",
+                f"Waveform preview calculation failed.\n\n{error}",
+            )
+            host._status.showMessage("Waveform preview calculation failed.")
+            return
+
+        total = int(state["total"] or 0)
+        computed_count = int(state["computed"] or 0)
+        cached_count = int(state["cached"] or 0)
+        was_cancelled = int(state["cancelled"] or 0) == 1
+
+        if was_cancelled:
+            processed_count = computed_count + cached_count
+            QMessageBox.information(
+                self,
+                "Waveform Previews",
+                "Waveform preview calculation was cancelled.\n\n"
+                f"Processed: {processed_count}/{total}\n"
+                f"Computed now: {computed_count}\n"
+                f"Already cached: {cached_count}\n"
+                f"Cache folder: {cache_dir}\n\n"
+                "Completed files were preserved.",
+            )
+            host._status.showMessage(
+                f"Waveform preview calculation cancelled: {processed_count}/{total} processed."
+            )
+            return
+
+        QMessageBox.information(
+            self,
+            "Waveform Previews",
+            "Waveform preview calculation complete.\n\n"
+            f"Total files: {total}\n"
+            f"Computed now: {computed_count}\n"
+            f"Already cached: {cached_count}\n"
+            f"Cache folder: {cache_dir}",
+        )
+        host._status.showMessage(
+            f"Waveform previews complete: {computed_count} computed, {cached_count} cached."
+        )
+
     def _on_update_selected_from_folders_clicked(self) -> None:
         host = self._host()
         selected_rows = sorted({idx.row() for idx in host._table.selectedIndexes()})
@@ -355,5 +577,5 @@ class MainWindowToolsMixin:
 
 if __name__ == "__main__":
     print("This module is a helper and is not meant to be run directly.")
-    print("Launch gui.py to start JingleAllTheDay.")
+    print("Launch app.py to start JingleAllTheDay.")
     raise SystemExit(1)

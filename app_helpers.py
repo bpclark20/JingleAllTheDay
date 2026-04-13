@@ -214,5 +214,5 @@ def probe_duration_seconds(path: Path) -> float:
 
 if __name__ == "__main__":
     print("This module is a helper and is not meant to be run directly.")
-    print("Launch gui.py to start JingleAllTheDay.")
+    print("Launch app.py to start JingleAllTheDay.")
     raise SystemExit(1)

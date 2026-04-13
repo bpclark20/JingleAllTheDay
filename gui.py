@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import sys
-import ctypes
 from pathlib import Path
 from typing import Any
 
@@ -82,9 +81,8 @@ try:
 except ModuleNotFoundError:
     pass
 
-ORG_NAME = "JingleAllTheDay"
-APP_NAME = "JingleAllTheDay"
-APP_VERSION = "1.2.0.041226"
+DEFAULT_APP_NAME = "JingleAllTheDay"
+DEFAULT_APP_VERSION = "0.0.0"
 
 DEFAULT_KEYBOARD_SHORTCUTS: dict[str, str] = {
     "rename": "F2",
@@ -145,10 +143,12 @@ class MainWindow(
     MainWindowLibraryMixin,
     QMainWindow,
 ):
-    def __init__(self) -> None:
+    def __init__(self, app_name: str = DEFAULT_APP_NAME, app_version: str = DEFAULT_APP_VERSION) -> None:
         super().__init__()
         self.setWindowTitle("JingleAllTheDay")
         self.resize(1200, 740)
+        self._app_name = app_name
+        self._app_version = app_version
         _icon_path = _HERE / "icon.png"
         if _icon_path.exists():
             self.setWindowIcon(QIcon(str(_icon_path)))
@@ -169,6 +169,7 @@ class MainWindow(
         )
         self._samples_dir: Path | None = self._load_samples_dir()
         self._auto_folder_tags: bool = self._load_auto_folder_tags()
+        self._auto_generate_waveforms: bool = self._load_auto_generate_waveforms()
         self._watch_library_changes: bool = self._load_watch_library_changes()
         self._default_keyboard_shortcuts = dict(DEFAULT_KEYBOARD_SHORTCUTS)
         self._keyboard_shortcuts = self._load_keyboard_shortcuts()
@@ -765,8 +766,8 @@ class MainWindow(
         revision_log_path = runtime_dir / "rev.log"
         resolved_revision_log = revision_log_path if revision_log_path.is_file() else None
         dialog = AboutDialog(
-            app_name=APP_NAME,
-            app_version=APP_VERSION,
+            app_name=self._app_name,
+            app_version=self._app_version,
             icon_path=_HERE / "icon.png",
             library_count=library_count,
             library_duration_seconds=library_duration_seconds,
@@ -817,6 +818,15 @@ class MainWindow(
 
     def _save_auto_folder_tags(self) -> None:
         self._settings.setValue("library/autoFolderTags", "true" if self._auto_folder_tags else "false")
+
+    def _load_auto_generate_waveforms(self) -> bool:
+        return str(self._settings.value("library/autoGenerateWaveforms", "")).strip().lower() == "true"
+
+    def _save_auto_generate_waveforms(self) -> None:
+        self._settings.setValue(
+            "library/autoGenerateWaveforms",
+            "true" if self._auto_generate_waveforms else "false",
+        )
 
     def _load_watch_library_changes(self) -> bool:
         raw = str(self._settings.value("library/watchLibraryChanges", "true")).strip().lower()
@@ -1738,22 +1748,9 @@ class MainWindow(
 
 
 def main() -> None:
-    if sys.platform == "win32":
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("JingleAllTheDay.App")
-    app = QApplication(sys.argv)
-    app.setApplicationName(APP_NAME)
-    icon_path = _HERE / "icon.png"
-    if icon_path.exists():
-        app.setWindowIcon(QIcon(str(icon_path)))
-    window = MainWindow()
-    _apply_windows_taskbar_icon(window)
-    window.show()
-    try:
-        exit_code = app.exec()
-    except KeyboardInterrupt:
-        # Gracefully handle Ctrl+C / debugger stop without noisy tracebacks.
-        exit_code = 130
-    sys.exit(exit_code)
+    print("This module is a helper and is not meant to be run directly.")
+    print("Launch app.py to start JingleAllTheDay.")
+    raise SystemExit(1)
 
 
 if __name__ == "__main__":

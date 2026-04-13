@@ -1,3 +1,8 @@
+## v1.2.1.041226
+- Added Waveform Cache which stores generated waveform previews on disk to speed up loading and reduce CPU usage.
+- Added "Calculate Waveform Previews" action to the Tools menu which generates waveform previews for all jingles in the library that don't already have a persisted waveform preview.
+- Added "Auto Generate Waveforms for New Files" option to the Tools menu which, when enabled, automatically generates and persists a waveform preview for any new jingle added to the library.
+
 ## v1.1.2.041226
 - Added Edit Jingle feature to the context menu of the jingle list.
 - Added Edit Jingle dialog window which allows users to edit the start and stop locations of a jingle, as well as preview the jingle including looping behavior.

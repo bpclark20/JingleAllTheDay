@@ -71,10 +71,12 @@ class MediaPlayerLike(Protocol):
 
 
 class MainWindowLibraryHost(Protocol):
+    _app_data_dir: Path
     _samples_dir: Path | None
     _watch_library_changes: bool
     _is_rescanning: bool
     _auto_folder_tags: bool
+    _auto_generate_waveforms: bool
     _records: list[JingleRecord]
     _visible_indices: list[int]
     _store: LibraryStore
@@ -96,10 +98,12 @@ class MainWindowLibraryHost(Protocol):
 
 
 class MainWindowToolsHost(Protocol):
+    _app_data_dir: Path
     _records: list[JingleRecord]
     _visible_indices: list[int]
     _samples_dir: Path | None
     _auto_folder_tags: bool
+    _auto_generate_waveforms: bool
     _store: LibraryStore
     _status: StatusBarLike
     _watch_library_changes: bool
@@ -109,6 +113,8 @@ class MainWindowToolsHost(Protocol):
     _table: TableLike
 
     def _save_auto_folder_tags(self) -> None: ...
+
+    def _save_auto_generate_waveforms(self) -> None: ...
 
     def _save_watch_library_changes(self) -> None: ...
 

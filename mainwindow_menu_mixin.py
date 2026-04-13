@@ -74,6 +74,9 @@ class MainWindowMenuMixin:
         find_duplicates_action = QAction("Find Duplicates", self)
         find_duplicates_action.triggered.connect(self._on_tools_find_duplicates)
         tools_menu.addAction(find_duplicates_action)
+        calc_waveforms_action = QAction("Calculate Waveform Previews", self)
+        calc_waveforms_action.triggered.connect(self._on_tools_calculate_waveform_previews)
+        tools_menu.addAction(calc_waveforms_action)
         clear_all_categories_action = QAction("Clear All Categories", self)
         clear_all_categories_action.triggered.connect(self._on_tools_clear_all_categories)
         tools_menu.addAction(clear_all_categories_action)
@@ -83,6 +86,12 @@ class MainWindowMenuMixin:
         self._auto_folder_tags_action.setChecked(self._auto_folder_tags)
         self._auto_folder_tags_action.toggled.connect(self._on_auto_folder_tags_toggled)
         tools_menu.addAction(self._auto_folder_tags_action)
+
+        self._auto_generate_waveforms_action = QAction("Auto Generate Waveforms for New Files", self)
+        self._auto_generate_waveforms_action.setCheckable(True)
+        self._auto_generate_waveforms_action.setChecked(self._auto_generate_waveforms)
+        self._auto_generate_waveforms_action.toggled.connect(self._on_auto_generate_waveforms_toggled)
+        tools_menu.addAction(self._auto_generate_waveforms_action)
 
         self._watch_library_changes_action = QAction("Auto-Refresh on Library Changes", self)
         self._watch_library_changes_action.setCheckable(True)
@@ -100,5 +109,5 @@ class MainWindowMenuMixin:
 
 if __name__ == "__main__":
     print("This module is a helper and is not meant to be run directly.")
-    print("Launch gui.py to start JingleAllTheDay.")
+    print("Launch app.py to start JingleAllTheDay.")
     raise SystemExit(1)

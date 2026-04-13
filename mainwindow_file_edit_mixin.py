@@ -202,6 +202,32 @@ class MainWindowFileEditMixin:
             self._status.showMessage("Selected file no longer exists.")
             return
 
+        def _save_clip_points_from_dialog(start_seconds: float, stop_seconds: float) -> bool:
+            if (
+                abs(start_seconds - record.clip_start_seconds) < 0.0005
+                and abs(stop_seconds - record.clip_stop_seconds) < 0.0005
+            ):
+                self._status.showMessage("No jingle trim changes to save.")
+                return True
+
+            try:
+                self._store.set_clip_points(record.path, start_seconds, stop_seconds)
+                self._store.save()
+            except OSError as exc:
+                QMessageBox.critical(
+                    self,
+                    "Save Failed",
+                    f"Could not save jingle trim range.\n\n{exc}",
+                )
+                self._status.showMessage("Saving trim range failed.")
+                return False
+
+            refreshed_start, refreshed_stop = self._store.get_clip_points(record.path, record.duration_seconds)
+            record.clip_start_seconds = refreshed_start
+            record.clip_stop_seconds = refreshed_stop
+            self._status.showMessage(f"Saved trim range for {record.path.name}.")
+            return True
+
         dialog = JingleEditDialog(
             file_path=record.path,
             duration_seconds=record.duration_seconds,
@@ -211,27 +237,11 @@ class MainWindowFileEditMixin:
             preview_output_device=self._preview_output_device,
             live_volume_percent=self._live_volume_percent,
             preview_volume_percent=self._preview_volume_percent,
+            waveform_cache_dir=self._app_data_dir / "waveform-cache",
+            on_save_clip_points=_save_clip_points_from_dialog,
             parent=self,
         )
-        if dialog.exec() != dialog.DialogCode.Accepted:
-            self._status.showMessage("Edit Jingle cancelled.")
-            return
-
-        start_seconds, stop_seconds = dialog.selected_clip_points()
-        if (
-            abs(start_seconds - record.clip_start_seconds) < 0.0005
-            and abs(stop_seconds - record.clip_stop_seconds) < 0.0005
-        ):
-            self._status.showMessage("No jingle trim changes to save.")
-            return
-
-        self._store.set_clip_points(record.path, start_seconds, stop_seconds)
-        self._store.save()
-
-        refreshed_start, refreshed_stop = self._store.get_clip_points(record.path, record.duration_seconds)
-        record.clip_start_seconds = refreshed_start
-        record.clip_stop_seconds = refreshed_stop
-        self._status.showMessage(f"Saved trim range for {record.path.name}.")
+        dialog.exec()
 
     def _on_edit_delete(self) -> None:
         selected_indices = self._selected_record_indices()
@@ -363,5 +373,5 @@ class MainWindowFileEditMixin:
 
 if __name__ == "__main__":
     print("This module is a helper and is not meant to be run directly.")
-    print("Launch gui.py to start JingleAllTheDay.")
+    print("Launch app.py to start JingleAllTheDay.")
     raise SystemExit(1)
