@@ -36,7 +36,11 @@ if ([string]::IsNullOrWhiteSpace($AppVersion)) {
     }
 
     $appText = Get-Content -Raw -Path $appPath
-    $versionMatch = [regex]::Match($appText, 'APP_VERSION\\s*=\\s*"([^"]+)"')
+    $versionMatch = [regex]::Match($appText, 'APP_VERSION\s*=\s*"([^"]+)"')
+    if (-not $versionMatch.Success) {
+        # Try a more robust regex: allow for single/double quotes, comments, and extra whitespace
+        $versionMatch = [regex]::Match($appText, 'APP_VERSION\s*=\s*["'']([^"'']+)["'']')
+    }
     if (-not $versionMatch.Success) {
         throw "Unable to parse APP_VERSION from app.py. Provide -AppVersion explicitly."
     }
