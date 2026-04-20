@@ -1,3 +1,55 @@
+## v1.5.0.042026
+- Upgraded sample pad playback from single-owner behavior to polyphonic playback, allowing multiple pads/voices to play at once.
+- Added per-pad playback ownership/state tracking so pad play/stop state is independent and accurate under concurrent playback.
+- Added Sample Pads stop controls:
+	- New per-pad "Stop" button under each pad (enabled only while that pad is active/pending).
+	- New "Stop All Playback" button in the Sample Pads window to stop all active sample-pad voices.
+- Decoupled sample-pad playback controls from main-window transport semantics while preserving shared mode-bus volume sync (Live bus and Preview bus).
+- Added dedicated Sample Pad Mixer window with per-pad volume, mute, solo, and live post-fader metering.
+- Added mixer state persistence in sample pad layout files (per-pad volume/mute/solo) and autosave/restore integration.
+- Added mixer layout polish and responsive behavior improvements for dense single-row channel strips.
+- Added single-instance app enforcement with PID lock, stale-lock cleanup, and "terminate first instance" prompt flow.
+- Improved auxiliary window lifecycle behavior:
+	- Sample Pads and Mixer close when main window closes.
+	- Sample Pads and Mixer top-level/taskbar visibility behavior improved on Windows.
+- Added proactive sample-pad stream warmup when opening the Sample Pads window to reduce first-trigger cold-start latency.
+- Added background preload when assigning pad jingles and preload-on-layout behavior for assigned pad clips.
+- Added non-blocking cache-miss trigger path so long-file first triggers no longer block the UI thread.
+- Added long-file streaming path for cache misses, including buffered background decode and ffmpeg-pipe fallback for compressed/non-matching sources without creating large temporary files.
+- Added startup prebuffering and larger streaming headroom to reduce first-seconds underrun/glitch artifacts on long compressed sources.
+- Added engine logic to avoid duplicate in-flight preload work and to skip expensive full preloads for long compressed files when streaming is preferred.
+- Added new Options setting "Pad Stream Min" (seconds), persisted as `options/samplePadStreamingMinSeconds`, to control when cache-miss playback uses streaming.
+
+## v1.4.0.041926
+- Replaced QMediaPlayer-based sample pad audio with a new custom `SamplePadAudioEngine` backed by PortAudio (`sounddevice`) and `soundfile`/`numpy`.
+- Sample pad audio now uses a continuously open PortAudio stream, eliminating pipeline teardown clicks/pops on retrigger.
+- Added PCM-level 2ms linear crossfade on retrigger for click-free rapid re-triggering.
+- Added PCM decode cache with background `preload()` so audio files are decoded once and reused, eliminating per-trigger I/O latency.
+- Stream opens with `latency="low"` and a configurable blocksize (default 128 frames) for reduced trigger-to-audio latency.
+- Added "Pad Blocksize" setting to the Options dialog (choices: 64–1024 frames) persisted across sessions.
+- Preview mode sample pads now also route through the new engine (previously only Live mode did, leaving Preview mode with the old pop behavior).
+- Added `modeChanged` signal to `SamplePadsWindow`; main window now eagerly opens/warms the audio stream for the target device when Live/Preview mode is toggled, preventing a silent first trigger after a mode switch.
+- New dependencies: `sounddevice>=0.4,<1`, `soundfile>=0.12,<1`, `numpy>=1.26,<3` (added to `requirements.txt` and `JingleAllTheDay.spec` hidden imports).
+
+## v1.3.0.041926
+- Added Sample Pads window with up to 5 boards x 20 pads, pad modes (One Shot, Loop, Release), and per-pad assignment from the jingle list context menu.
+- Added board pills and board switching hotkeys (Shift+1-5 by default, optional Ctrl+Shift+1-5), including persistence of the active board.
+- Added local and global sample pad triggering (1-0 and Ctrl+1-0), with optional Alt modifier and Windows-native/pynput global hotkey backends.
+- Added sample pad layout save/load support, autosave, and startup restore behavior.
+- Optimized sample pad autosave so writes only happen when state actually changes, with autosave triggers on board changes, sample window close/hide, and main app exit.
+- Fixed autosave recursion during board switching by adding re-entrancy guards around autosave writes.
+- Improved looping behavior to reduce clicks/pops:
+	- Native seamless looping for untrimmed full-file loops in sample pads, main window, and Edit Jingle dialog.
+	- Safer muted-seek handling for manual (trimmed) loop restarts.
+	- Improved Release mode stop behavior during rapid press/release interactions.
+- Added multi-profile clip offsets per jingle in Edit Jingle:
+	- 1 default profile with ability to add up to 4 profile pills.
+	- Each profile stores independent start/stop offsets and persists to the library database.
+	- Active profile selection is auto-persisted immediately when switching profiles.
+- Updated Send to Sample Pad to use the currently active saved clip profile and carry those offsets into pad assignments.
+- Persisted clip profile metadata in sample pad layouts so profile-based pad assignments survive layout save/load and autosave.
+- Added `pynput` as an optional dependency for global hotkey support.
+
 ## v1.2.1.041226
 - Added Waveform Cache which stores generated waveform previews on disk to speed up loading and reduce CPU usage.
 - Added "Calculate Waveform Previews" action to the Tools menu which generates waveform previews for all jingles in the library that don't already have a persisted waveform preview.

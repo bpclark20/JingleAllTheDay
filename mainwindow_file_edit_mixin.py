@@ -202,16 +202,28 @@ class MainWindowFileEditMixin:
             self._status.showMessage("Selected file no longer exists.")
             return
 
-        def _save_clip_points_from_dialog(start_seconds: float, stop_seconds: float) -> bool:
-            if (
-                abs(start_seconds - record.clip_start_seconds) < 0.0005
-                and abs(stop_seconds - record.clip_stop_seconds) < 0.0005
-            ):
-                self._status.showMessage("No jingle trim changes to save.")
+        def _save_clip_profiles_from_dialog(
+            clip_profiles: list[tuple[float, float]],
+            active_profile_index: int,
+            notify: bool,
+        ) -> bool:
+            existing_profiles, existing_active_index = self._store.get_clip_profiles(
+                record.path,
+                record.duration_seconds,
+            )
+            profiles_changed = len(clip_profiles) != len(existing_profiles)
+            if not profiles_changed:
+                for (start_a, stop_a), (start_b, stop_b) in zip(clip_profiles, existing_profiles):
+                    if abs(start_a - start_b) >= 0.0005 or abs(stop_a - stop_b) >= 0.0005:
+                        profiles_changed = True
+                        break
+            if not profiles_changed and active_profile_index == existing_active_index:
+                if notify:
+                    self._status.showMessage("No jingle profile changes to save.")
                 return True
 
             try:
-                self._store.set_clip_points(record.path, start_seconds, stop_seconds)
+                self._store.set_clip_profiles(record.path, clip_profiles, active_profile_index)
                 self._store.save()
             except OSError as exc:
                 QMessageBox.critical(
@@ -219,14 +231,32 @@ class MainWindowFileEditMixin:
                     "Save Failed",
                     f"Could not save jingle trim range.\n\n{exc}",
                 )
-                self._status.showMessage("Saving trim range failed.")
+                if notify:
+                    self._status.showMessage("Saving trim range failed.")
                 return False
 
-            refreshed_start, refreshed_stop = self._store.get_clip_points(record.path, record.duration_seconds)
+            refreshed_profiles, refreshed_active_index = self._store.get_clip_profiles(
+                record.path,
+                record.duration_seconds,
+            )
+            refreshed_start, refreshed_stop = refreshed_profiles[refreshed_active_index]
+            record.clip_profiles = refreshed_profiles
+            record.active_clip_profile_index = refreshed_active_index
             record.clip_start_seconds = refreshed_start
             record.clip_stop_seconds = refreshed_stop
-            self._status.showMessage(f"Saved trim range for {record.path.name}.")
+            if notify:
+                self._status.showMessage(
+                    f"Saved {len(refreshed_profiles)} clip profile(s) for {record.path.name}."
+                )
             return True
+
+        current_profiles, current_active_index = self._store.get_clip_profiles(
+            record.path,
+            record.duration_seconds,
+        )
+        record.clip_profiles = current_profiles
+        record.active_clip_profile_index = current_active_index
+        record.clip_start_seconds, record.clip_stop_seconds = current_profiles[current_active_index]
 
         dialog = JingleEditDialog(
             file_path=record.path,
@@ -237,8 +267,10 @@ class MainWindowFileEditMixin:
             preview_output_device=self._preview_output_device,
             live_volume_percent=self._live_volume_percent,
             preview_volume_percent=self._preview_volume_percent,
+            clip_profiles=current_profiles,
+            active_clip_profile_index=current_active_index,
             waveform_cache_dir=self._app_data_dir / "waveform-cache",
-            on_save_clip_points=_save_clip_points_from_dialog,
+            on_save_clip_profiles=_save_clip_profiles_from_dialog,
             parent=self,
         )
         dialog.exec()

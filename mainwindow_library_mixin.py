@@ -88,7 +88,8 @@ class MainWindowLibraryMixin:
                 duration_seconds = 0.0
             else:
                 size_bytes, duration_seconds, _mtime_ns = media_cache
-            clip_start_seconds, clip_stop_seconds = self._store.get_clip_points(path, duration_seconds)
+            clip_profiles, active_profile_index = self._store.get_clip_profiles(path, duration_seconds)
+            clip_start_seconds, clip_stop_seconds = clip_profiles[active_profile_index]
 
             records.append(
                 JingleRecord(
@@ -98,6 +99,8 @@ class MainWindowLibraryMixin:
                     duration_seconds=duration_seconds,
                     clip_start_seconds=clip_start_seconds,
                     clip_stop_seconds=clip_stop_seconds,
+                    clip_profiles=clip_profiles,
+                    active_clip_profile_index=active_profile_index,
                 )
             )
 
@@ -177,7 +180,8 @@ class MainWindowLibraryMixin:
                     duration_seconds = _probe_duration_seconds(path)
                     changed_count += 1
                 self._store.set_media_cache(path, size_bytes, duration_seconds, mtime_ns)
-                clip_start_seconds, clip_stop_seconds = self._store.get_clip_points(path, duration_seconds)
+                clip_profiles, active_profile_index = self._store.get_clip_profiles(path, duration_seconds)
+                clip_start_seconds, clip_stop_seconds = clip_profiles[active_profile_index]
 
                 records.append(
                     JingleRecord(
@@ -187,6 +191,8 @@ class MainWindowLibraryMixin:
                         duration_seconds=duration_seconds,
                         clip_start_seconds=clip_start_seconds,
                         clip_stop_seconds=clip_stop_seconds,
+                        clip_profiles=clip_profiles,
+                        active_clip_profile_index=active_profile_index,
                     )
                 )
 

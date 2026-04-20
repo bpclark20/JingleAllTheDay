@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -17,6 +17,8 @@ class JingleRecord:
     duration_seconds: float = 0.0
     clip_start_seconds: float = 0.0
     clip_stop_seconds: float = 0.0
+    clip_profiles: list[tuple[float, float]] = field(default_factory=list)
+    active_clip_profile_index: int = 0
 
     @property
     def name(self) -> str:
@@ -105,17 +107,44 @@ class LibraryStore:
                 except (TypeError, ValueError):
                     pass
 
+                clip_profiles_raw = info.get("clip_profiles")
+                if isinstance(clip_profiles_raw, list):
+                    normalized_profiles: list[dict[str, float]] = []
+                    for item in clip_profiles_raw[:4]:
+                        if not isinstance(item, dict):
+                            continue
+                        try:
+                            start_val = max(0.0, float(item.get("start_seconds", 0.0)))
+                            stop_val = max(0.0, float(item.get("stop_seconds", 0.0)))
+                        except (TypeError, ValueError):
+                            continue
+                        normalized_profiles.append(
+                            {
+                                "start_seconds": start_val,
+                                "stop_seconds": stop_val,
+                            }
+                        )
+                    if normalized_profiles:
+                        entry["clip_profiles"] = normalized_profiles
+
+                try:
+                    active_profile_index_raw = info.get("clip_active_profile_index")
+                    if active_profile_index_raw is not None:
+                        entry["clip_active_profile_index"] = max(0, int(active_profile_index_raw))
+                except (TypeError, ValueError):
+                    pass
+
                 entries[path_key] = entry
         return entries
 
     def save(self) -> None:
         self._json_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"version": 5, "items": self._entries}
+        payload = {"version": 6, "items": self._entries}
         self._json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def export_to(self, destination: Path) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"version": 5, "items": self._entries}
+        payload = {"version": 6, "items": self._entries}
         destination.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def import_from(self, source: Path) -> None:
@@ -167,36 +196,68 @@ class LibraryStore:
         self._entries[key] = entry
 
     def get_clip_points(self, path: Path, duration_seconds: float) -> tuple[float, float]:
+        profiles, active_index = self.get_clip_profiles(path, duration_seconds)
+        return profiles[active_index]
+
+    def get_clip_profiles(self, path: Path, duration_seconds: float) -> tuple[list[tuple[float, float]], int]:
         info = self._entries.get(str(path), {})
-        try:
-            start = float(info.get("clip_start_seconds", 0.0))
-        except (TypeError, ValueError):
-            start = 0.0
-
         fallback_stop = max(0.0, float(duration_seconds))
-        try:
-            stop = float(info.get("clip_stop_seconds", fallback_stop))
-        except (TypeError, ValueError):
-            stop = fallback_stop
 
-        if start < 0.0:
-            start = 0.0
-        if stop < 0.0:
-            stop = 0.0
-
-        if duration_seconds > 0.0:
-            start = min(start, duration_seconds)
-            stop = min(stop, duration_seconds)
-            if stop <= start:
+        def _normalize_range(start_raw: Any, stop_raw: Any) -> tuple[float, float]:
+            try:
+                start = max(0.0, float(start_raw))
+            except (TypeError, ValueError):
                 start = 0.0
-                stop = duration_seconds
-        else:
-            if stop < start:
-                start, stop = stop, start
+            try:
+                stop = max(0.0, float(stop_raw))
+            except (TypeError, ValueError):
+                stop = fallback_stop
 
-        return start, stop
+            if duration_seconds > 0.0:
+                start = min(start, duration_seconds)
+                stop = min(stop, duration_seconds)
+                if stop <= start:
+                    start = 0.0
+                    stop = duration_seconds
+            else:
+                if stop < start:
+                    start, stop = stop, start
+            return start, stop
 
-    def set_clip_points(self, path: Path, start_seconds: float, stop_seconds: float) -> None:
+        profiles: list[tuple[float, float]] = []
+        raw_profiles = info.get("clip_profiles")
+        if isinstance(raw_profiles, list):
+            for item in raw_profiles[:4]:
+                if not isinstance(item, dict):
+                    continue
+                profiles.append(
+                    _normalize_range(
+                        item.get("start_seconds", 0.0),
+                        item.get("stop_seconds", fallback_stop),
+                    )
+                )
+
+        if not profiles:
+            profiles.append(
+                _normalize_range(
+                    info.get("clip_start_seconds", 0.0),
+                    info.get("clip_stop_seconds", fallback_stop),
+                )
+            )
+
+        try:
+            active_index = int(info.get("clip_active_profile_index", 0))
+        except (TypeError, ValueError):
+            active_index = 0
+        active_index = max(0, min(active_index, len(profiles) - 1))
+        return profiles, active_index
+
+    def set_clip_profiles(
+        self,
+        path: Path,
+        clip_profiles: list[tuple[float, float]],
+        active_profile_index: int,
+    ) -> None:
         key = str(path)
         entry = dict(self._entries.get(key, {}))
 
@@ -206,29 +267,73 @@ class LibraryStore:
         except (TypeError, ValueError):
             duration_seconds = 0.0
 
-        start = max(0.0, float(start_seconds))
-        stop = max(0.0, float(stop_seconds))
+        fallback_stop = duration_seconds
 
-        if duration_seconds > 0.0:
-            start = min(start, duration_seconds)
-            stop = min(stop, duration_seconds)
-            if stop <= start:
-                start = 0.0
-                stop = duration_seconds
-            is_default = abs(start - 0.0) < 0.0005 and abs(stop - duration_seconds) < 0.0005
-        else:
-            if stop < start:
-                start, stop = stop, start
-            is_default = abs(start - 0.0) < 0.0005 and abs(stop - 0.0) < 0.0005
+        def _normalize_range(start_raw: Any, stop_raw: Any) -> tuple[float, float]:
+            start = max(0.0, float(start_raw))
+            stop = max(0.0, float(stop_raw))
+            if duration_seconds > 0.0:
+                start = min(start, duration_seconds)
+                stop = min(stop, duration_seconds)
+                if stop <= start:
+                    start = 0.0
+                    stop = duration_seconds
+            else:
+                if stop < start:
+                    start, stop = stop, start
+            return start, stop
 
-        if is_default:
-            entry.pop("clip_start_seconds", None)
-            entry.pop("clip_stop_seconds", None)
+        normalized_profiles: list[tuple[float, float]] = []
+        for start, stop in clip_profiles[:4]:
+            normalized_profiles.append(_normalize_range(start, stop))
+
+        if not normalized_profiles:
+            normalized_profiles = [
+                _normalize_range(0.0, fallback_stop),
+            ]
+
+        active_index = max(0, min(int(active_profile_index), len(normalized_profiles) - 1))
+
+        entry.pop("clip_start_seconds", None)
+        entry.pop("clip_stop_seconds", None)
+
+        is_single_default = False
+        if len(normalized_profiles) == 1:
+            start, stop = normalized_profiles[0]
+            if duration_seconds > 0.0:
+                is_single_default = abs(start - 0.0) < 0.0005 and abs(stop - duration_seconds) < 0.0005
+            else:
+                is_single_default = abs(start - 0.0) < 0.0005 and abs(stop - 0.0) < 0.0005
+
+        if is_single_default:
+            entry.pop("clip_profiles", None)
+            entry.pop("clip_active_profile_index", None)
         else:
-            entry["clip_start_seconds"] = round(start, 4)
-            entry["clip_stop_seconds"] = round(stop, 4)
+            entry["clip_profiles"] = [
+                {
+                    "start_seconds": round(start, 4),
+                    "stop_seconds": round(stop, 4),
+                }
+                for start, stop in normalized_profiles
+            ]
+            if active_index == 0:
+                entry.pop("clip_active_profile_index", None)
+            else:
+                entry["clip_active_profile_index"] = active_index
 
         self._entries[key] = entry
+
+    def set_clip_points(self, path: Path, start_seconds: float, stop_seconds: float) -> None:
+        info = self._entries.get(str(path), {})
+        duration_seconds = 0.0
+        try:
+            duration_seconds = max(0.0, float(info.get("duration_seconds", 0.0)))
+        except (TypeError, ValueError):
+            duration_seconds = 0.0
+
+        profiles, active_index = self.get_clip_profiles(path, duration_seconds)
+        profiles[active_index] = (start_seconds, stop_seconds)
+        self.set_clip_profiles(path, profiles, active_index)
 
     def iter_entries(self) -> Iterator[tuple[str, dict[str, Any]]]:
         for path_key, info in self._entries.items():

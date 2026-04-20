@@ -146,6 +146,14 @@ The current build spec is stored in `JingleAllTheDay.spec`.
 	- `Mode: Live/Preview` switches playback between your Live and Preview output devices.
 	- When playback reaches the end naturally, status updates to `Playback finished`.
 
+- Sample Pads:
+	- Right-click a jingle and use `Send to Sample Pad` to assign it to pad 1-8.
+	- In the Sample Pads window, use `Save Layout...` / `Load Layout...` to export or import pad assignments as JSON.
+	- The app remembers the last loaded layout path and reloads it automatically.
+	- Press `1`-`8` while the app is focused to trigger sample pads.
+	- Optional: enable `Global 1-8 Hotkeys` in the Sample Pads window to trigger pads while other apps have focus.
+		- Global hotkeys require the optional `pynput` dependency.
+
 - Audio devices:
 	- Configure both `Live Device` and `Preview Device` in `Tools > Options`.
 	- If both devices are set to the same output, Preview/Live switching is disabled until Preview is changed.

@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QKeySequenceEdit,
     QSizePolicy,
+    QSpinBox,
     QSlider,
     QVBoxLayout,
     QWidget,
@@ -35,6 +36,27 @@ except ModuleNotFoundError:
     pass
 
 
+SAMPLE_PAD_BLOCKSIZE_OPTIONS = (1024, 512, 384, 256, 224, 192, 128, 64)
+
+
+def _coerce_sample_pad_blocksize(value: int | str | None) -> int:
+    try:
+        parsed = int(value) if value is not None else 128
+    except (TypeError, ValueError):
+        parsed = 128
+    if parsed in SAMPLE_PAD_BLOCKSIZE_OPTIONS:
+        return parsed
+    return 128
+
+
+def _coerce_sample_pad_streaming_min_seconds(value: int | str | None) -> int:
+    try:
+        parsed = int(value) if value is not None else 120
+    except (TypeError, ValueError):
+        parsed = 120
+    return max(0, min(3600, parsed))
+
+
 class OptionsDialog(QDialog):
     def __init__(
         self,
@@ -42,6 +64,8 @@ class OptionsDialog(QDialog):
         preview_output_device: str,
         live_volume_percent: int,
         preview_volume_percent: int,
+        sample_pad_blocksize: int,
+        sample_pad_streaming_min_seconds: int,
         samples_dir: Path | None = None,
         parent: QWidget | None = None,
     ) -> None:
@@ -124,6 +148,50 @@ class OptionsDialog(QDialog):
 
         root.addLayout(preview_volume_row)
 
+        sample_pad_blocksize_row = QHBoxLayout()
+        sample_pad_blocksize_label = QLabel("Pad Blocksize")
+        sample_pad_blocksize_label.setFixedWidth(100)
+        sample_pad_blocksize_row.addWidget(sample_pad_blocksize_label)
+
+        self._sample_pad_blocksize_combo = QComboBox()
+        self._sample_pad_blocksize_combo.setMinimumWidth(160)
+        self._sample_pad_blocksize_combo.setToolTip(
+            "Audio buffer size for live sample-pad playback. Lower values reduce trigger latency; higher values increase stability."
+        )
+        selected_blocksize = _coerce_sample_pad_blocksize(sample_pad_blocksize)
+        for option in SAMPLE_PAD_BLOCKSIZE_OPTIONS:
+            self._sample_pad_blocksize_combo.addItem(str(option), option)
+            if option == selected_blocksize:
+                self._sample_pad_blocksize_combo.setCurrentIndex(
+                    self._sample_pad_blocksize_combo.count() - 1
+                )
+        sample_pad_blocksize_row.addWidget(self._sample_pad_blocksize_combo)
+        sample_pad_blocksize_row.addStretch()
+
+        root.addLayout(sample_pad_blocksize_row)
+
+        sample_pad_streaming_row = QHBoxLayout()
+        sample_pad_streaming_label = QLabel("Pad Stream Min")
+        sample_pad_streaming_label.setFixedWidth(100)
+        sample_pad_streaming_row.addWidget(sample_pad_streaming_label)
+
+        self._sample_pad_streaming_min_seconds_spin = QSpinBox()
+        self._sample_pad_streaming_min_seconds_spin.setRange(0, 3600)
+        self._sample_pad_streaming_min_seconds_spin.setSingleStep(15)
+        self._sample_pad_streaming_min_seconds_spin.setSuffix(" s")
+        self._sample_pad_streaming_min_seconds_spin.setValue(
+            _coerce_sample_pad_streaming_min_seconds(sample_pad_streaming_min_seconds)
+        )
+        self._sample_pad_streaming_min_seconds_spin.setToolTip(
+            "Duration threshold for first-trigger streaming on cache miss. "
+            "Files at or above this length stream immediately. Set to 0 to always allow streaming."
+        )
+        self._sample_pad_streaming_min_seconds_spin.setMinimumWidth(160)
+        sample_pad_streaming_row.addWidget(self._sample_pad_streaming_min_seconds_spin)
+        sample_pad_streaming_row.addStretch()
+
+        root.addLayout(sample_pad_streaming_row)
+
         refresh_btn = QPushButton("Refresh Devices")
         refresh_btn.clicked.connect(self._on_refresh_clicked)
         refresh_row = QHBoxLayout()
@@ -202,6 +270,15 @@ class OptionsDialog(QDialog):
         return (
             _coerce_volume_percent(self._live_volume_slider.value()),
             _coerce_volume_percent(self._preview_volume_slider.value()),
+        )
+
+    def selected_sample_pad_blocksize(self) -> int:
+        value = self._sample_pad_blocksize_combo.currentData()
+        return _coerce_sample_pad_blocksize(value)
+
+    def selected_sample_pad_streaming_min_seconds(self) -> int:
+        return _coerce_sample_pad_streaming_min_seconds(
+            self._sample_pad_streaming_min_seconds_spin.value()
         )
 
     def selected_folder(self) -> Path | None:

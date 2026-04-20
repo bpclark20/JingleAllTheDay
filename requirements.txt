@@ -1,2 +1,6 @@
 PyQt6>=6.7,<7
 pyinstaller>=6.0,<7
+pynput>=1.7,<2
+sounddevice>=0.4,<1
+soundfile>=0.12,<1
+numpy>=1.26,<3

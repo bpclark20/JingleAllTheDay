@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app_helpers import format_duration_hms as _format_duration_hms
+from app_helpers import chip_palette_for_tag_seed as _chip_palette_for_tag_seed
 from app_helpers import probe_duration_seconds as _probe_duration_seconds
 from app_helpers import coerce_volume_percent as _coerce_volume_percent
 from waveform_cache import load_waveform_peaks as _load_waveform_peaks_cached
@@ -351,8 +352,10 @@ class JingleEditDialog(QDialog):
         preview_output_device: str,
         live_volume_percent: int,
         preview_volume_percent: int,
+        clip_profiles: list[tuple[float, float]] | None = None,
+        active_clip_profile_index: int = 0,
         waveform_cache_dir: Path | None = None,
-        on_save_clip_points: Callable[[float, float], bool] | None = None,
+        on_save_clip_profiles: Callable[[list[tuple[float, float]], int, bool], bool] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -371,15 +374,24 @@ class JingleEditDialog(QDialog):
             self._start_seconds = 0.0
             self._stop_seconds = default_stop
 
+        initial_profiles = clip_profiles if clip_profiles is not None else [
+            (self._start_seconds, self._stop_seconds)
+        ]
+        self._clip_profiles, self._active_clip_profile_index = self._normalize_clip_profiles(
+            initial_profiles,
+            active_clip_profile_index,
+        )
+        self._start_seconds, self._stop_seconds = self._clip_profiles[self._active_clip_profile_index]
+
         self._live_output_device = live_output_device.strip()
         self._preview_output_device = preview_output_device.strip()
         self._live_volume_percent = _coerce_volume_percent(live_volume_percent)
         self._preview_volume_percent = _coerce_volume_percent(preview_volume_percent)
         self._is_preview_mode = True
         self._waveform_cache_dir = waveform_cache_dir
-        self._on_save_clip_points = on_save_clip_points
-        self._saved_start_seconds = self._start_seconds
-        self._saved_stop_seconds = self._stop_seconds
+        self._on_save_clip_profiles = on_save_clip_profiles
+        self._saved_clip_profiles = [tuple(profile) for profile in self._clip_profiles]
+        self._saved_active_clip_profile_index = self._active_clip_profile_index
 
         self._player: QMediaPlayer | None = None
         self._audio_output: QAudioOutput | None = None
@@ -401,6 +413,9 @@ class JingleEditDialog(QDialog):
         self._clip_guard_timer.timeout.connect(self._on_clip_guard_tick)
         self._waveform_loaded = False
         self._save_btn: QPushButton | None = None
+        self._profile_buttons: list[QPushButton] = []
+        self._profile_row: QHBoxLayout | None = None
+        self._add_profile_btn: QPushButton | None = None
 
         root = QVBoxLayout(self)
 
@@ -448,6 +463,18 @@ class JingleEditDialog(QDialog):
         tips_row.addWidget(tips)
         tips_row.addStretch()
         root.addLayout(tips_row)
+
+        profile_row = QHBoxLayout()
+        profile_row.addWidget(QLabel("Clip Profiles"))
+        self._profile_row = profile_row
+        self._add_profile_btn = QPushButton("+")
+        self._add_profile_btn.setFixedWidth(28)
+        self._add_profile_btn.setToolTip("Add profile (up to 4)")
+        self._add_profile_btn.clicked.connect(self._on_add_profile_clicked)
+        profile_row.addWidget(self._add_profile_btn)
+        profile_row.addStretch()
+        root.addLayout(profile_row)
+        self._refresh_profile_buttons()
 
         playback_row = QHBoxLayout()
         self._play_pause_btn = QPushButton("Play")
@@ -531,6 +558,130 @@ class JingleEditDialog(QDialog):
 
     def selected_clip_points(self) -> tuple[float, float]:
         return self._start_seconds, self._stop_seconds
+
+    def _normalize_clip_range(self, start_seconds: float, stop_seconds: float) -> tuple[float, float]:
+        start = max(0.0, min(float(start_seconds), self._duration_seconds))
+        stop = max(0.0, min(float(stop_seconds), self._duration_seconds))
+        if stop <= start:
+            return 0.0, self._duration_seconds
+        return start, stop
+
+    def _normalize_clip_profiles(
+        self,
+        clip_profiles: list[tuple[float, float]],
+        active_clip_profile_index: int,
+    ) -> tuple[list[tuple[float, float]], int]:
+        normalized: list[tuple[float, float]] = []
+        for start, stop in clip_profiles[:4]:
+            normalized.append(self._normalize_clip_range(start, stop))
+        if not normalized:
+            normalized = [(0.0, self._duration_seconds)]
+        active_index = max(0, min(int(active_clip_profile_index), len(normalized) - 1))
+        return normalized, active_index
+
+    def _profile_pill_style(self, profile_index: int, selected: bool) -> str:
+        seed = str((profile_index % 9) + 1)
+        bg, border, hover = _chip_palette_for_tag_seed(seed)
+        if selected:
+            return (
+                "QPushButton {"
+                f" border: 1px solid {border};"
+                " border-radius: 10px;"
+                " padding: 3px 10px;"
+                f" background: {bg};"
+                " color: #ffffff;"
+                " font-weight: bold;"
+                "}"
+                f"QPushButton:hover {{ background: {hover}; }}"
+            )
+        return (
+            "QPushButton {"
+            " border: 1px solid #9ea7b3;"
+            " border-radius: 10px;"
+            " padding: 3px 10px;"
+            " background: #eceff1;"
+            " color: #263238;"
+            "}"
+            "QPushButton:hover { background: #dfe5ea; }"
+        )
+
+    def _refresh_profile_buttons(self) -> None:
+        if self._profile_row is None:
+            return
+
+        for btn in self._profile_buttons:
+            self._profile_row.removeWidget(btn)
+            btn.deleteLater()
+        self._profile_buttons = []
+
+        insert_index = 1
+        for idx in range(len(self._clip_profiles)):
+            btn = QPushButton(f"P{idx + 1}")
+            btn.setCheckable(True)
+            btn.setChecked(idx == self._active_clip_profile_index)
+            btn.setStyleSheet(self._profile_pill_style(idx, idx == self._active_clip_profile_index))
+            btn.clicked.connect(lambda _checked=False, p_idx=idx: self._on_profile_pill_clicked(p_idx))
+            self._profile_row.insertWidget(insert_index, btn)
+            self._profile_buttons.append(btn)
+            insert_index += 1
+
+        if self._add_profile_btn is not None:
+            self._add_profile_btn.setEnabled(len(self._clip_profiles) < 4)
+
+    def _store_active_profile_from_current_markers(self) -> None:
+        self._clip_profiles[self._active_clip_profile_index] = self._normalize_clip_range(
+            self._start_seconds,
+            self._stop_seconds,
+        )
+
+    def _persist_clip_profiles(self, *, notify: bool) -> bool:
+        self._store_active_profile_from_current_markers()
+        ok = True
+        if self._on_save_clip_profiles is not None:
+            try:
+                ok = bool(
+                    self._on_save_clip_profiles(
+                        list(self._clip_profiles),
+                        self._active_clip_profile_index,
+                        notify,
+                    )
+                )
+            except Exception as exc:  # defensive; callback should report details itself
+                ok = False
+                QMessageBox.critical(
+                    self,
+                    "Save Failed",
+                    f"Could not save jingle clip profiles.\n\n{exc}",
+                )
+
+        if ok:
+            self._saved_clip_profiles = [tuple(profile) for profile in self._clip_profiles]
+            self._saved_active_clip_profile_index = self._active_clip_profile_index
+            self._refresh_save_button_state()
+        return ok
+
+    def _on_profile_pill_clicked(self, profile_index: int) -> None:
+        if profile_index < 0 or profile_index >= len(self._clip_profiles):
+            return
+        if profile_index == self._active_clip_profile_index:
+            return
+
+        self._store_active_profile_from_current_markers()
+        self._active_clip_profile_index = profile_index
+        self._start_seconds, self._stop_seconds = self._clip_profiles[self._active_clip_profile_index]
+        self._refresh_profile_buttons()
+        self._sync_controls_from_values()
+        self._persist_clip_profiles(notify=False)
+
+    def _on_add_profile_clicked(self) -> None:
+        if len(self._clip_profiles) >= 4:
+            return
+        self._store_active_profile_from_current_markers()
+        self._clip_profiles.append((self._start_seconds, self._stop_seconds))
+        self._active_clip_profile_index = len(self._clip_profiles) - 1
+        self._refresh_profile_buttons()
+        self._sync_controls_from_values()
+        self._persist_clip_profiles(notify=False)
 
     def _init_player(self) -> None:
         if not _has_qt_multimedia:
@@ -664,6 +815,7 @@ class JingleEditDialog(QDialog):
             return
 
         self._apply_editor_output_device()
+        self._apply_player_loop_mode()
         start_ms = self._prepare_start_seek(temporary_mute_for_seek=True)
         self._player.setSource(QUrl.fromLocalFile(str(self._path)))
         self._player.play()
@@ -710,13 +862,19 @@ class JingleEditDialog(QDialog):
 
     def _on_loop_clicked(self) -> None:
         self._is_looping = not self._is_looping
+        self._apply_player_loop_mode()
         self._update_loop_button_visual()
 
     def _clip_points_changed_from_saved(self) -> bool:
-        return (
-            abs(self._start_seconds - self._saved_start_seconds) >= 0.0005
-            or abs(self._stop_seconds - self._saved_stop_seconds) >= 0.0005
-        )
+        self._store_active_profile_from_current_markers()
+        if self._active_clip_profile_index != self._saved_active_clip_profile_index:
+            return True
+        if len(self._clip_profiles) != len(self._saved_clip_profiles):
+            return True
+        for (start_a, stop_a), (start_b, stop_b) in zip(self._clip_profiles, self._saved_clip_profiles):
+            if abs(start_a - start_b) >= 0.0005 or abs(stop_a - stop_b) >= 0.0005:
+                return True
+        return False
 
     def _refresh_save_button_state(self) -> None:
         if self._save_btn is None:
@@ -728,24 +886,8 @@ class JingleEditDialog(QDialog):
             self._refresh_save_button_state()
             return
 
-        ok = True
-        if self._on_save_clip_points is not None:
-            try:
-                ok = bool(self._on_save_clip_points(self._start_seconds, self._stop_seconds))
-            except Exception as exc:  # defensive; callback should report details itself
-                ok = False
-                QMessageBox.critical(
-                    self,
-                    "Save Failed",
-                    f"Could not save jingle trim range.\n\n{exc}",
-                )
-
-        if not ok:
+        if not self._persist_clip_profiles(notify=True):
             return
-
-        self._saved_start_seconds = self._start_seconds
-        self._saved_stop_seconds = self._stop_seconds
-        self._refresh_save_button_state()
 
     # ------------------------------------------------------------------
     # Button styling helpers
@@ -895,10 +1037,30 @@ class JingleEditDialog(QDialog):
                 self._audio_output.setMuted(self._is_muted)
         return start_ms
 
+    def _use_native_loop(self) -> bool:
+        """True when the current file and loop state allow seamless native looping."""
+        if not self._is_looping:
+            return False
+        start_ms = int(round(self._start_seconds * 1000.0))
+        stop_ms = int(round(self._stop_seconds * 1000.0))
+        duration_ms = int(round(self._duration_seconds * 1000.0))
+        has_custom_clip_window = start_ms > 0 or (
+            duration_ms > 0 and stop_ms < duration_ms
+        )
+        return not has_custom_clip_window
+
+    def _apply_player_loop_mode(self) -> None:
+        if self._player is None:
+            return
+        if self._use_native_loop():
+            self._player.setLoops(QMediaPlayer.Loops.Infinite)
+        else:
+            self._player.setLoops(1)
+
     def _restart_loop_from_start(self) -> None:
         if self._player is None:
             return
-        start_ms = self._prepare_start_seek(temporary_mute_for_seek=False)
+        start_ms = self._prepare_start_seek(temporary_mute_for_seek=True)
         self._player.setPosition(start_ms)
         self._player.play()
 
@@ -925,6 +1087,10 @@ class JingleEditDialog(QDialog):
 
         start_ms = int(round(self._start_seconds * 1000.0))
         stop_ms = int(round(self._stop_seconds * 1000.0))
+        duration_ms = int(round(self._duration_seconds * 1000.0))
+        has_custom_clip_window = start_ms > 0 or (
+            duration_ms > 0 and stop_ms < duration_ms
+        )
 
         if self._seek_to_start_pending:
             if position_ms + 120 < start_ms:
@@ -937,6 +1103,8 @@ class JingleEditDialog(QDialog):
                     self._audio_output.setMuted(self._is_muted)
 
         if (
+            has_custom_clip_window
+            and
             stop_ms > start_ms
             and position_ms >= stop_ms
             and self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
@@ -945,6 +1113,7 @@ class JingleEditDialog(QDialog):
                 return True
             self._clip_boundary_handling = True
             if self._is_looping:
+                # Mute briefly during seek so any decoder discontinuity is inaudible.
                 self._restart_loop_from_start()
                 return True
             self._player.stop()
@@ -981,6 +1150,9 @@ class JingleEditDialog(QDialog):
         if status != QMediaPlayer.MediaStatus.EndOfMedia:
             return
         if not self._is_looping:
+            return
+        # Native looping handles restart internally; no manual seek needed.
+        if self._use_native_loop():
             return
         self._restart_loop_from_start()
 

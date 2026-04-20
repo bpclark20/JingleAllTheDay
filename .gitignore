@@ -16,9 +16,16 @@ installer/*.exe
 # Runtime user data (stored outside project in %APPDATA%)
 *.ini
 *.json
+*.wav
 
 # IDE / OS
 .vscode/
 .idea/
 Thumbs.db
 desktop.ini
+
+# Test plans and platform-specific docs
+ubuntu.txt
+ubuntu-1.txt
+ubuntu-2.txt
+linux_instructions.md
