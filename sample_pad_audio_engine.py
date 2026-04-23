@@ -20,6 +20,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
+import math
 from pathlib import Path
 import shutil
 import subprocess
@@ -177,10 +178,12 @@ class SamplePadAudioEngine:
         self._voices: dict[int, _Voice | _StreamingVoice] = {}
         self._pad_to_voice: dict[int, int] = {}
         self._next_voice_id: int = 1
-        self._pad_mix_settings: dict[int, tuple[float, bool, bool]] = {}
+        self._pad_mix_settings: dict[int, tuple[float, float, bool, bool]] = {}
         self._pad_meter_levels: dict[int, float] = {}
+        self._output_meter_levels: tuple[float, float] = (0.0, 0.0)
         self._pending_pad_triggers: dict[int, tuple[tuple, float, bool]] = {}
         self._streaming_min_seconds: float = _STREAMING_MIN_SECONDS
+        self._master_gain: float = 1.0
 
     # ------------------------------------------------------------------
     # Public API (called from Qt main thread)
@@ -212,14 +215,21 @@ class SamplePadAudioEngine:
         ):
             return  # already open on the right device — nothing to do
 
+        format_changed = (
+            self._stream_samplerate not in (0, int(samplerate))
+            or self._stream_channels != int(channels)
+        )
         self._close_stream()
-        # Reopening the stream starts from a clean playback state.
-        with self._lock:
-            for voice in self._voices.values():
-                self._close_voice_stream(voice)
-            self._voices.clear()
-            self._pad_to_voice.clear()
-            self._pad_meter_levels.clear()
+        # Preserve active voices across output-device switches whenever the
+        # stream format is unchanged, so long one-shot playback can continue.
+        if format_changed:
+            with self._lock:
+                for voice in self._voices.values():
+                    self._close_voice_stream(voice)
+                self._voices.clear()
+                self._pad_to_voice.clear()
+                self._pad_meter_levels.clear()
+                self._output_meter_levels = (0.0, 0.0)
         device_index = self._find_device(device_name)
         self._stream_samplerate = samplerate
         self._stream_channels = channels
@@ -392,13 +402,37 @@ class SamplePadAudioEngine:
                 return
             self._begin_voice_fade(voice, fade_samples)
 
-    def set_pad_mix(self, pad_index: int, volume_percent: int, muted: bool, solo: bool) -> None:
+    def set_pad_mix(
+        self,
+        pad_index: int,
+        volume_percent: int,
+        pan_percent: int = 0,
+        muted: bool = False,
+        solo: bool = False,
+    ) -> None:
         """Set per-pad mixer settings used for current and future voices."""
         if pad_index < 0:
             return
         volume = max(0.0, min(1.0, float(volume_percent) / 100.0))
+        pan = max(-1.0, min(1.0, float(pan_percent) / 100.0))
         with self._lock:
-            self._pad_mix_settings[pad_index] = (volume, bool(muted), bool(solo))
+            self._pad_mix_settings[pad_index] = (volume, pan, bool(muted), bool(solo))
+
+    @staticmethod
+    def _pan_gains(pan: float) -> tuple[float, float]:
+        """Return equal-power left/right gains for pan in [-1.0, 1.0]."""
+        clamped = max(-1.0, min(1.0, float(pan)))
+        angle = (clamped + 1.0) * (math.pi * 0.25)
+        return float(math.cos(angle)), float(math.sin(angle))
+
+    def set_master_gain(self, gain: float) -> None:
+        """Set global post-mix gain applied to all active and future voices."""
+        try:
+            parsed = float(gain)
+        except (TypeError, ValueError):
+            parsed = 1.0
+        with self._lock:
+            self._master_gain = max(0.0, min(1.0, parsed))
 
     def set_streaming_min_seconds(self, seconds: float) -> None:
         """Set minimum duration for using streaming on cache-miss trigger."""
@@ -412,6 +446,11 @@ class SamplePadAudioEngine:
         """Return normalized post-fader meter levels keyed by pad index."""
         with self._lock:
             return dict(self._pad_meter_levels)
+
+    def output_meter_levels(self) -> tuple[float, float]:
+        """Return normalized post-fader output meter levels as (left, right)."""
+        with self._lock:
+            return self._output_meter_levels
 
     def is_pad_playing(self, pad_index: int) -> bool:
         """Return True when *pad_index* currently has an active voice."""
@@ -440,6 +479,7 @@ class SamplePadAudioEngine:
             self._voices.clear()
             self._pad_to_voice.clear()
             self._pad_meter_levels.clear()
+            self._output_meter_levels = (0.0, 0.0)
         self._close_stream()
 
     # ------------------------------------------------------------------
@@ -1017,6 +1057,15 @@ class SamplePadAudioEngine:
         _status,
     ) -> None:
         with self._lock:
+            left_level, right_level = self._output_meter_levels
+            left_level = left_level * 0.82
+            right_level = right_level * 0.82
+            if left_level < 0.001:
+                left_level = 0.0
+            if right_level < 0.001:
+                right_level = 0.0
+            self._output_meter_levels = (left_level, right_level)
+
             if self._pad_meter_levels:
                 stale_pads: list[int] = []
                 for pad_index, level in self._pad_meter_levels.items():
@@ -1032,17 +1081,18 @@ class SamplePadAudioEngine:
                 outdata[:] = 0
                 return
 
-            solo_active = any(solo for _gain, _muted, solo in self._pad_mix_settings.values())
+            solo_active = any(solo for _gain, _pan, _muted, solo in self._pad_mix_settings.values())
             out = np.zeros((frames, outdata.shape[1]), dtype=np.float32)
             finished_voice_ids: list[int] = []
 
             for voice_id, voice in list(self._voices.items()):
-                pad_gain, pad_muted, pad_solo = self._pad_mix_settings.get(
+                pad_gain, pad_pan, pad_muted, pad_solo = self._pad_mix_settings.get(
                     voice.pad_index,
-                    (1.0, False, False),
+                    (1.0, 0.0, False, False),
                 )
                 gate_open = not pad_muted and (not solo_active or pad_solo)
-                effective_gain = voice.volume * pad_gain if gate_open else 0.0
+                effective_gain = voice.volume * pad_gain * self._master_gain if gate_open else 0.0
+                pan_left_gain, pan_right_gain = self._pan_gains(pad_pan)
                 written = 0
                 pos = voice.pos
                 while written < frames:
@@ -1089,6 +1139,12 @@ class SamplePadAudioEngine:
                         )[:, np.newaxis]
                         if effective_gain > 0.0:
                             scaled = chunk[:n] * ramp * effective_gain
+                            if scaled.shape[1] >= 2:
+                                scaled = scaled.copy()
+                                scaled[:, 0] *= pan_left_gain
+                                scaled[:, 1] *= pan_right_gain
+                            elif scaled.shape[1] == 1:
+                                scaled = scaled * max(pan_left_gain, pan_right_gain)
                             out[written : written + n] += scaled
                             if voice.pad_index >= 0:
                                 peak = float(np.max(np.abs(scaled)))
@@ -1104,6 +1160,12 @@ class SamplePadAudioEngine:
 
                     if effective_gain > 0.0:
                         scaled = chunk * effective_gain
+                        if scaled.shape[1] >= 2:
+                            scaled = scaled.copy()
+                            scaled[:, 0] *= pan_left_gain
+                            scaled[:, 1] *= pan_right_gain
+                        elif scaled.shape[1] == 1:
+                            scaled = scaled * max(pan_left_gain, pan_right_gain)
                         out[written : written + n] += scaled
                         if voice.pad_index >= 0:
                             peak = float(np.max(np.abs(scaled)))
@@ -1133,6 +1195,24 @@ class SamplePadAudioEngine:
         peak = float(np.max(np.abs(out))) if out.size else 0.0
         if peak > 1.0:
             out *= (_MIX_HEADROOM / peak)
+
+        output_left = 0.0
+        output_right = 0.0
+        if out.size:
+            if out.shape[1] >= 2:
+                output_left = float(np.max(np.abs(out[:, 0])))
+                output_right = float(np.max(np.abs(out[:, 1])))
+            elif out.shape[1] == 1:
+                mono_peak = float(np.max(np.abs(out[:, 0])))
+                output_left = mono_peak
+                output_right = mono_peak
+        with self._lock:
+            prev_left, prev_right = self._output_meter_levels
+            self._output_meter_levels = (
+                max(prev_left, output_left),
+                max(prev_right, output_right),
+            )
+
         outdata[:] = out
 
 

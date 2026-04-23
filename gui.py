@@ -560,6 +560,7 @@ class MainWindow(
         pad_mode: str = "one_shot",
         pad_index: int = -1,
         pad_volume_percent: int = 100,
+        pad_pan_percent: int = 0,
         pad_is_muted: bool = False,
         pad_is_solo: bool = False,
     ):
@@ -573,12 +574,8 @@ class MainWindow(
         if not jingle_data or 'path' not in jingle_data:
             self._status.showMessage("No jingle assigned to this pad.")
             return
-        # Find the record by path if possible for clip start/stop
-        record = None
-        for rec in self._records:
-            if str(rec.path) == str(jingle_data['path']):
-                record = rec
-                break
+        record = self._record_for_sample_pad_jingle(jingle_data)
+        clip_start, clip_stop = self._resolved_sample_pad_clip_seconds(jingle_data, record)
 
         # ------------------------------------------------------------------
         # Route sample-pad playback through the low-latency engine for both
@@ -586,23 +583,11 @@ class MainWindow(
         # with a short crossfade instead of QMediaPlayer pipeline resets.
         # ------------------------------------------------------------------
         if _sp_engine_mod.is_available():
-            clip_start = 0.0
-            clip_stop = 0.0
-            clip_start_raw = jingle_data.get("clip_start_seconds")
-            clip_stop_raw = jingle_data.get("clip_stop_seconds")
-            if isinstance(clip_start_raw, (int, float)) and isinstance(clip_stop_raw, (int, float)):
-                clip_start = max(0.0, float(clip_start_raw))
-                clip_stop = max(0.0, float(clip_stop_raw))
-            elif record is not None:
-                clip_start = record.clip_start_seconds
-                clip_stop = record.clip_stop_seconds
             loop = pad_mode in ("loop", "release")
             if is_live_mode:
                 target_device = self._output_device
-                volume = self._live_volume_percent / 100.0
             else:
                 target_device = self._preview_output_device if self._can_use_preview_mode() else self._output_device
-                volume = self._preview_volume_percent / 100.0
             try:
                 stream_needs_reopen = (
                     self._sp_engine._stream_device != target_device
@@ -616,16 +601,18 @@ class MainWindow(
                     # Stream just (re)opened — preload all pads at the new
                     # samplerate so subsequent triggers are instantaneous.
                     self._sp_engine_preload_all_pads()
+                self._sync_sample_pad_engine_gain()
                 if pad_index >= 0:
                     self._sp_engine.set_pad_mix(
                         pad_index,
                         pad_volume_percent,
+                        pad_pan_percent,
                         pad_is_muted,
                         pad_is_solo,
                     )
                 self._sp_engine.trigger(
                     path=jingle_data['path'],
-                    volume=volume,
+                    volume=1.0,
                     clip_start_seconds=clip_start,
                     clip_stop_seconds=clip_stop,
                     loop=loop,
@@ -647,12 +634,11 @@ class MainWindow(
         self._sample_pad_release_looping = (pad_mode == "release")
         self._current_sample_pad_index = pad_index
         if pad_mode in ("loop", "release"):
-            if record:
-                _cs, _ce = self._clip_window_for_record(record)
-                self._sample_pad_native_looping = (_cs == 0 and _ce == -1)
-            else:
-                # Fallback path always plays full file
-                self._sample_pad_native_looping = True
+            self._sample_pad_native_looping = self._sample_pad_clip_is_full_file(
+                record,
+                clip_start,
+                clip_stop,
+            )
         else:
             self._sample_pad_native_looping = False
         # Set the preview/live flag so _play_record's _apply_output_device() call
@@ -660,18 +646,16 @@ class MainWindow(
         self._is_preview_mode = not is_live_mode
         # Play using record if found, else fallback to path
         if record:
-            clip_start_override_raw = jingle_data.get("clip_start_seconds")
-            clip_stop_override_raw = jingle_data.get("clip_stop_seconds")
             has_clip_override = (
-                isinstance(clip_start_override_raw, (int, float))
-                and isinstance(clip_stop_override_raw, (int, float))
+                abs(record.clip_start_seconds - clip_start) >= 0.0005
+                or abs(record.clip_stop_seconds - clip_stop) >= 0.0005
             )
             if has_clip_override:
                 original_start = record.clip_start_seconds
                 original_stop = record.clip_stop_seconds
                 try:
-                    record.clip_start_seconds = max(0.0, float(clip_start_override_raw))
-                    record.clip_stop_seconds = max(0.0, float(clip_stop_override_raw))
+                    record.clip_start_seconds = clip_start
+                    record.clip_stop_seconds = clip_stop
                     self._play_record(self._records.index(record))
                 finally:
                     record.clip_start_seconds = original_start
@@ -684,8 +668,68 @@ class MainWindow(
                 self._reset_clip_playback_window()
                 self._prepare_clip_start_seek(temporary_mute_for_seek=False)
                 self._player.setSource(QUrl.fromLocalFile(str(jingle_data['path'])))
+                if clip_start > 0.0:
+                    self._player.setPosition(max(0, int(round(clip_start * 1000.0))))
                 self._player.play()
                 self._status.showMessage(f"Playing: {jingle_data.get('name', jingle_data['path'])}")
+
+    def _record_for_sample_pad_jingle(self, jingle_data: dict[str, Any]) -> JingleRecord | None:
+        path_text = str(jingle_data.get("path", "")).strip()
+        if not path_text:
+            return None
+        for record in self._records:
+            if str(record.path) == path_text:
+                return record
+        return None
+
+    def _resolved_sample_pad_clip_seconds(
+        self,
+        jingle_data: dict[str, Any],
+        record: JingleRecord | None,
+    ) -> tuple[float, float]:
+        if record is not None:
+            profile_index_raw = jingle_data.get("clip_profile_index")
+            if isinstance(profile_index_raw, int):
+                profiles, active_index = self._store.get_clip_profiles(
+                    record.path,
+                    record.duration_seconds,
+                )
+                if profiles:
+                    profile_index = max(0, min(int(profile_index_raw), len(profiles) - 1))
+                    return profiles[profile_index]
+                return record.clip_start_seconds, record.clip_stop_seconds
+            return record.clip_start_seconds, record.clip_stop_seconds
+
+        clip_start_raw = jingle_data.get("clip_start_seconds")
+        clip_stop_raw = jingle_data.get("clip_stop_seconds")
+        if isinstance(clip_start_raw, (int, float)) and isinstance(clip_stop_raw, (int, float)):
+            return max(0.0, float(clip_start_raw)), max(0.0, float(clip_stop_raw))
+        return 0.0, 0.0
+
+    def _sample_pad_clip_is_full_file(
+        self,
+        record: JingleRecord | None,
+        clip_start: float,
+        clip_stop: float,
+    ) -> bool:
+        if record is None:
+            return clip_start <= 0.0005 and clip_stop <= 0.0005
+
+        duration = max(0.0, float(record.duration_seconds))
+        start = max(0.0, float(clip_start))
+        stop = max(0.0, float(clip_stop))
+        if duration <= 0.0:
+            return start <= 0.0005 and stop <= 0.0005
+
+        start = min(start, duration)
+        if stop <= 0.0:
+            stop = duration
+        else:
+            stop = min(stop, duration)
+            if stop <= start:
+                start = 0.0
+                stop = duration
+        return start <= 0.0005 and abs(duration - stop) <= 0.0005
 
     def stop_sample_pad_jingle(self, pad_index: int = -1) -> None:
         """Stop playback from a sample pad (used by Release mode)."""
@@ -720,13 +764,14 @@ class MainWindow(
         self,
         pad_index: int,
         volume_percent: int,
+        pan_percent: int,
         is_muted: bool,
         is_solo: bool,
     ) -> None:
         if not _sp_engine_mod.is_available() or pad_index < 0:
             return
         try:
-            self._sp_engine.set_pad_mix(pad_index, volume_percent, is_muted, is_solo)
+            self._sp_engine.set_pad_mix(pad_index, volume_percent, pan_percent, is_muted, is_solo)
         except Exception:
             return
 
@@ -740,6 +785,43 @@ class MainWindow(
         except Exception:
             pass
         return {}
+
+    def sample_pad_output_meter_level(self, _is_live_mode: bool) -> float:
+        """Return normalized output meter level for the sample-pad mixer output strip."""
+        try:
+            left, right = self.sample_pad_output_meter_levels(_is_live_mode)
+            return max(0.0, min(1.0, max(float(left), float(right))))
+        except Exception:
+            pass
+        levels = self.sample_pad_meter_levels()
+        if not levels:
+            return 0.0
+        try:
+            peak = max(float(level) for level in levels.values())
+        except Exception:
+            return 0.0
+        return max(0.0, min(1.0, peak))
+
+    def sample_pad_output_meter_levels(self, _is_live_mode: bool) -> tuple[float, float]:
+        """Return normalized output meter levels for the sample-pad mixer as (left, right)."""
+        if _sp_engine_mod.is_available():
+            try:
+                levels = self._sp_engine.output_meter_levels()
+                if isinstance(levels, tuple) and len(levels) == 2:
+                    left = max(0.0, min(1.0, float(levels[0])))
+                    right = max(0.0, min(1.0, float(levels[1])))
+                    return left, right
+            except Exception:
+                pass
+        levels = self.sample_pad_meter_levels()
+        if levels:
+            try:
+                mono = max(0.0, min(1.0, max(float(level) for level in levels.values())))
+            except Exception:
+                mono = 0.0
+        else:
+            mono = 0.0
+        return mono, mono
 
     def is_sample_pad_playing(self, pad_index: int) -> bool:
         if pad_index < 0:
@@ -913,8 +995,8 @@ class MainWindow(
                 if not isinstance(jingle, dict) or 'path' not in jingle:
                     continue
                 path = jingle['path']
-                cs = float(jingle.get('clip_start_seconds') or 0.0)
-                ce = float(jingle.get('clip_stop_seconds') or 0.0)
+                record = self._record_for_sample_pad_jingle(jingle)
+                cs, ce = self._resolved_sample_pad_clip_seconds(jingle, record)
                 key = (path, cs, ce)
                 if key not in seen:
                     seen.add(key)
@@ -944,8 +1026,8 @@ class MainWindow(
         if not path:
             return
 
-        cs = float(jingle_data.get("clip_start_seconds") or 0.0)
-        ce = float(jingle_data.get("clip_stop_seconds") or 0.0)
+        record = self._record_for_sample_pad_jingle(jingle_data)
+        cs, ce = self._resolved_sample_pad_clip_seconds(jingle_data, record)
         engine = self._sp_engine
         sr = engine._stream_samplerate or 44100
         ch = engine._stream_channels or 2
@@ -1016,6 +1098,7 @@ class MainWindow(
                 target_device,
                 blocksize=self._sample_pad_blocksize,
             )
+            self._sync_sample_pad_engine_gain()
             if stream_needs_reopen:
                 self._sp_engine_preload_all_pads()
         except Exception:
@@ -1635,6 +1718,17 @@ class MainWindow(
         self._refresh_volume_controls()
         if self._sample_pads_window is not None:
             self._sample_pads_window.refresh_mode_volume_controls()
+        self._sync_sample_pad_engine_gain()
+
+    def _sync_sample_pad_engine_gain(self) -> None:
+        if not _sp_engine_mod.is_available() or self._sample_pads_window is None:
+            return
+        mode_is_live = bool(self._sample_pads_window.is_live_mode)
+        mode_percent = self._live_volume_percent if mode_is_live else self._preview_volume_percent
+        try:
+            self._sp_engine.set_master_gain(mode_percent / 100.0)
+        except Exception:
+            pass
 
     def _apply_active_volume(self) -> None:
         if self._audio_output is None:
@@ -1664,6 +1758,7 @@ class MainWindow(
         self._volume_value_label.setText(f"{percent}%")
         self._save_volume_settings()
         self._apply_active_volume()
+        self._sync_sample_pad_engine_gain()
         if self._sample_pads_window is not None:
             self._sample_pads_window.refresh_mode_volume_controls()
 
@@ -2218,13 +2313,50 @@ class MainWindow(
                     label = f"Pad {i + 1} \u2014 {stem}"
                 else:
                     label = f"Pad {i + 1}"
-                pad_action = board_menu.addAction(label)
-                pad_action.triggered.connect(
+                pad_menu = board_menu.addMenu(label)
+
+                default_action = pad_menu.addAction("Default Profile")
+                default_action.setEnabled(selected_count == 1)
+                default_action.triggered.connect(
                     lambda checked, b_idx=board_index, p_idx=i: self._assign_selected_to_sample_pad(
                         p_idx,
                         board_index=b_idx,
+                        profile_index=None,
                     )
                 )
+
+                selected_indices = self._selected_record_indices()
+                selected_record = (
+                    self._records[selected_indices[0]]
+                    if selected_count == 1 and selected_indices
+                    else None
+                )
+                profile_count = 0
+                if selected_record is not None:
+                    clip_profiles, _active_profile_index = self._store.get_clip_profiles(
+                        selected_record.path,
+                        selected_record.duration_seconds,
+                    )
+                    profile_count = len(clip_profiles)
+
+                pad_menu.addSeparator()
+                for profile_index in range(4):
+                    profile_label = f"Profile P{profile_index + 1}"
+                    if selected_count == 1 and profile_index < profile_count and selected_record is not None:
+                        start_seconds, stop_seconds = clip_profiles[profile_index]
+                        profile_label = (
+                            f"Profile P{profile_index + 1} "
+                            f"({start_seconds:.2f}s - {stop_seconds:.2f}s)"
+                        )
+                    profile_action = pad_menu.addAction(profile_label)
+                    profile_action.setEnabled(selected_count == 1 and profile_index < profile_count)
+                    profile_action.triggered.connect(
+                        lambda checked, b_idx=board_index, p_idx=i, prof_idx=profile_index: self._assign_selected_to_sample_pad(
+                            p_idx,
+                            board_index=b_idx,
+                            profile_index=prof_idx,
+                        )
+                    )
 
         rename_action = menu.addAction("Rename")
         rename_action.setEnabled(selected_count == 1)
@@ -2236,7 +2368,12 @@ class MainWindow(
 
         menu.exec(self._table.viewport().mapToGlobal(pos))
 
-    def _assign_selected_to_sample_pad(self, pad_index: int, board_index: int | None = None):
+    def _assign_selected_to_sample_pad(
+        self,
+        pad_index: int,
+        board_index: int | None = None,
+        profile_index: int | None = None,
+    ):
         # Assign the first selected jingle to the given pad index
         selected_indices = self._selected_record_indices()
         if not selected_indices or self._sample_pads_window is None:
@@ -2248,11 +2385,15 @@ class MainWindow(
             record.path,
             record.duration_seconds,
         )
-        active_start, active_stop = clip_profiles[active_profile_index]
+
+        target_profile_index = active_profile_index
+        if isinstance(profile_index, int) and clip_profiles:
+            target_profile_index = max(0, min(profile_index, len(clip_profiles) - 1))
+
+        active_start, active_stop = clip_profiles[target_profile_index]
         record.clip_profiles = clip_profiles
         record.active_clip_profile_index = active_profile_index
-        record.clip_start_seconds = active_start
-        record.clip_stop_seconds = active_stop
+        record.clip_start_seconds, record.clip_stop_seconds = clip_profiles[active_profile_index]
 
         # Include the active profile clip points so pad assignments can pin
         # different profile windows for the same source file.
@@ -2261,7 +2402,7 @@ class MainWindow(
             'path': str(record.path),
             'clip_start_seconds': active_start,
             'clip_stop_seconds': active_stop,
-            'clip_profile_index': active_profile_index,
+            'clip_profile_index': target_profile_index,
         }
         if board_index is None:
             self._sample_pads_window.assign_jingle_to_pad(pad_index, jingle_data)

@@ -416,12 +416,15 @@ class JingleEditDialog(QDialog):
         self._profile_buttons: list[QPushButton] = []
         self._profile_row: QHBoxLayout | None = None
         self._add_profile_btn: QPushButton | None = None
+        self._remove_profile_btn: QPushButton | None = None
 
         root = QVBoxLayout(self)
 
         self._waveform = WaveformWidget(self)
         self._waveform.set_waveform([], self._duration_seconds)
         self._waveform.set_markers(self._start_seconds, self._stop_seconds)
+        self._waveform.set_playhead_seconds(self._start_seconds)
+        self._waveform.set_playhead_active(False)
         root.addWidget(self._waveform)
 
         self._waveform_loading_label = QLabel("Loading waveform...")
@@ -472,6 +475,11 @@ class JingleEditDialog(QDialog):
         self._add_profile_btn.setToolTip("Add profile (up to 4)")
         self._add_profile_btn.clicked.connect(self._on_add_profile_clicked)
         profile_row.addWidget(self._add_profile_btn)
+        self._remove_profile_btn = QPushButton("-")
+        self._remove_profile_btn.setFixedWidth(28)
+        self._remove_profile_btn.setToolTip("Remove selected profile")
+        self._remove_profile_btn.clicked.connect(self._on_remove_profile_clicked)
+        profile_row.addWidget(self._remove_profile_btn)
         profile_row.addStretch()
         root.addLayout(profile_row)
         self._refresh_profile_buttons()
@@ -627,6 +635,8 @@ class JingleEditDialog(QDialog):
 
         if self._add_profile_btn is not None:
             self._add_profile_btn.setEnabled(len(self._clip_profiles) < 4)
+        if self._remove_profile_btn is not None:
+            self._remove_profile_btn.setEnabled(len(self._clip_profiles) > 1)
 
     def _store_active_profile_from_current_markers(self) -> None:
         self._clip_profiles[self._active_clip_profile_index] = self._normalize_clip_range(
@@ -671,7 +681,6 @@ class JingleEditDialog(QDialog):
         self._start_seconds, self._stop_seconds = self._clip_profiles[self._active_clip_profile_index]
         self._refresh_profile_buttons()
         self._sync_controls_from_values()
-        self._persist_clip_profiles(notify=False)
 
     def _on_add_profile_clicked(self) -> None:
         if len(self._clip_profiles) >= 4:
@@ -681,7 +690,18 @@ class JingleEditDialog(QDialog):
         self._active_clip_profile_index = len(self._clip_profiles) - 1
         self._refresh_profile_buttons()
         self._sync_controls_from_values()
-        self._persist_clip_profiles(notify=False)
+
+    def _on_remove_profile_clicked(self) -> None:
+        if len(self._clip_profiles) <= 1:
+            return
+
+        self._store_active_profile_from_current_markers()
+        remove_index = self._active_clip_profile_index
+        self._clip_profiles.pop(remove_index)
+        self._active_clip_profile_index = max(0, min(remove_index, len(self._clip_profiles) - 1))
+        self._start_seconds, self._stop_seconds = self._clip_profiles[self._active_clip_profile_index]
+        self._refresh_profile_buttons()
+        self._sync_controls_from_values()
 
     def _init_player(self) -> None:
         if not _has_qt_multimedia:
@@ -818,11 +838,10 @@ class JingleEditDialog(QDialog):
         self._apply_player_loop_mode()
         start_ms = self._prepare_start_seek(temporary_mute_for_seek=True)
         self._player.setSource(QUrl.fromLocalFile(str(self._path)))
-        self._player.play()
         if self._seek_to_start_pending:
             self._player.setPosition(start_ms)
-        else:
-            self._enforce_clip_window(self._player.position())
+        self._player.play()
+        self._enforce_clip_window(self._player.position())
 
     def _on_stop_clicked(self) -> None:
         if self._player is None:
@@ -1186,6 +1205,19 @@ class JingleEditDialog(QDialog):
             self._stop_spin.blockSignals(False)
 
         self._waveform.set_markers(self._start_seconds, self._stop_seconds)
+        should_anchor_playhead = True
+        if self._player is not None:
+            try:
+                state = self._player.playbackState()
+                state_type = type(state)
+                playing_state = getattr(state_type, "PlayingState", None)
+                paused_state = getattr(state_type, "PausedState", None)
+                should_anchor_playhead = state not in (playing_state, paused_state)
+            except Exception:
+                should_anchor_playhead = True
+        if should_anchor_playhead:
+            self._waveform.set_playhead_seconds(self._start_seconds)
+            self._waveform.set_playhead_active(False)
         self._timeline.set_duration_seconds(self._duration_seconds)
         selected_duration = max(0.0, self._stop_seconds - self._start_seconds)
         self._selection_label.setText(

@@ -1,3 +1,21 @@
+## v1.6.0.042226
+- Added per-pad stereo pan control in the Sample Pad Mixer, placed above mute/solo, with real-time audio routing updates.
+- Added center-detent behavior for pan controls so near-center values snap cleanly to exact center.
+- Added pan persistence in sample pad layouts/autosave (`panPercent`) and restore/reset handling.
+- Updated mixer layout/sizing calculations after pan-row addition to prevent mute/solo controls from being clipped in dense/small window sizes.
+- Upgraded output strip metering to stereo (independent L/R output meters) while keeping pad strips as single-channel post-fader meters.
+- Added engine-level stereo output metering API (`output_meter_levels`) and integrated it through MainWindow/Sample Pads mixer display.
+- Added equal-power panning in the sample pad audio engine callback and expanded per-pad mix settings to include pan.
+- Added sample-pad master-gain sync to Live/Preview mode faders so sample pad engine loudness tracks current mode volume consistently.
+- Improved sample pad clip/profile resolution flow:
+	- Centralized record/path/profile clip-window resolution for trigger/preload paths.
+	- Improved full-file loop detection for native looping decisions.
+- Expanded "Send to Sample Pad" assignment menu to support profile-specific assignment (Default / Profile P1-P4) and preserve profile index in assignment payload.
+- Enhanced Edit Jingle profile workflow:
+	- Added remove-profile button with proper enable/disable state.
+	- Improved waveform playhead anchoring/visibility behavior when not actively playing.
+	- Tightened preview start-seek ordering and clip-window enforcement around playback start.
+
 ## v1.5.0.042026
 - Upgraded sample pad playback from single-owner behavior to polyphonic playback, allowing multiple pads/voices to play at once.
 - Added per-pad playback ownership/state tracking so pad play/stop state is independent and accurate under concurrent playback.

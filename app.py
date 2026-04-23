@@ -18,7 +18,7 @@ from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 APP_NAME = "JingleAllTheDay"
-APP_VERSION = "1.5.0.042026"
+APP_VERSION = "1.6.0.042226"
 APP_ID = "JingleAllTheDay.App"
 _INSTANCE_LOCK_NAME = "single_instance.lock"
 
