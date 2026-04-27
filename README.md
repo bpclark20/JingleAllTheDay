@@ -150,6 +150,11 @@ The current build spec is stored in `JingleAllTheDay.spec`.
 	- Right-click a jingle and use `Send to Sample Pad` to assign it to pad 1-8.
 	- In the Sample Pads window, use `Save Layout...` / `Load Layout...` to export or import pad assignments as JSON.
 	- The app remembers the last loaded layout path and reloads it automatically.
+	- Each pad cycles playback modes with its mode button:
+		- `One Shot`: plays once per press.
+		- `Loop`: toggles continuous looping on/off with each press.
+		- `Release (OS)`: plays while held and stops on release; if it reaches the end while still held, it does not loop.
+		- `Release (L)`: plays while held and stops on release; if it reaches the end while still held, it loops until released.
 	- Press `1`-`8` while the app is focused to trigger sample pads.
 	- Optional: enable `Global 1-8 Hotkeys` in the Sample Pads window to trigger pads while other apps have focus.
 		- Global hotkeys require the optional `pynput` dependency.

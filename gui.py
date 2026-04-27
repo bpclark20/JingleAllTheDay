@@ -6,6 +6,8 @@ from __future__ import annotations
 import sys
 import ctypes
 import json
+import math
+import threading
 from pathlib import Path
 from typing import Any, Callable
 
@@ -30,6 +32,7 @@ from mainwindow_menu_mixin import MainWindowMenuMixin
 from mainwindow_shortcuts_mixin import MainWindowShortcutsMixin
 from mainwindow_tools_mixin import MainWindowToolsMixin
 from models_store import JingleRecord, LibraryStore
+from waveform_cache import load_waveform_peaks as _load_waveform_peaks
 
 from widgets import DeselectableTableWidget
 # Import SamplePadsWindow for sample pad feature
@@ -281,6 +284,10 @@ class MainWindow(
         self._sample_pad_release_looping: bool = False
         self._sample_pad_native_looping: bool = False
         self._current_sample_pad_index: int = -1
+        self._main_playback_meter_peaks_path: str = ""
+        self._main_playback_meter_peaks: list[float] = []
+        self._main_playback_meter_loading_path: str = ""
+        self._main_playback_meter_loading: bool = False
         # Low-latency engine used for live-mode sample pad playback
         self._sp_engine: _SamplePadAudioEngine = _SamplePadAudioEngine()
         self._sp_engine.set_streaming_min_seconds(self._sample_pad_streaming_min_seconds)
@@ -568,7 +575,8 @@ class MainWindow(
         Play a jingle from a sample pad in live or preview mode.
         jingle_data: dict with at least 'name' and 'path'.
         is_live_mode: bool, True for live, False for preview.
-        pad_mode: the SamplePad mode string (one_shot / loop / release).
+        pad_mode: the SamplePad mode string
+            (one_shot / loop / release_os / release_l).
         pad_index: which pad is triggering playback (-1 if unknown).
         """
         if not jingle_data or 'path' not in jingle_data:
@@ -583,7 +591,9 @@ class MainWindow(
         # with a short crossfade instead of QMediaPlayer pipeline resets.
         # ------------------------------------------------------------------
         if _sp_engine_mod.is_available():
-            loop = pad_mode in ("loop", "release")
+            release_mode = pad_mode in ("release_os", "release_l", "release")
+            release_loops_at_end = pad_mode in ("release_l", "release")
+            loop = (pad_mode == "loop") or release_loops_at_end
             if is_live_mode:
                 target_device = self._output_device
             else:
@@ -628,12 +638,13 @@ class MainWindow(
         # ------------------------------------------------------------------
         # Preview mode (or engine unavailable): use QMediaPlayer as before.
         # ------------------------------------------------------------------
-        # Use native seamless looping (no seek gap) for untrimmed full-file loop/release mode.
-        # stop() works fine with Infinite loops, so release mode can use native looping too.
-        self._sample_pad_looping = pad_mode in ("loop", "release")
-        self._sample_pad_release_looping = (pad_mode == "release")
+        release_mode = pad_mode in ("release_os", "release_l", "release")
+        release_loops_at_end = pad_mode in ("release_l", "release")
+        # Use native seamless looping (no seek gap) for untrimmed full-file loop-style playback.
+        self._sample_pad_looping = (pad_mode == "loop") or release_loops_at_end
+        self._sample_pad_release_looping = release_mode
         self._current_sample_pad_index = pad_index
-        if pad_mode in ("loop", "release"):
+        if self._sample_pad_looping:
             self._sample_pad_native_looping = self._sample_pad_clip_is_full_file(
                 record,
                 clip_start,
@@ -804,24 +815,116 @@ class MainWindow(
 
     def sample_pad_output_meter_levels(self, _is_live_mode: bool) -> tuple[float, float]:
         """Return normalized output meter levels for the sample-pad mixer as (left, right)."""
+        sample_left = 0.0
+        sample_right = 0.0
         if _sp_engine_mod.is_available():
             try:
                 levels = self._sp_engine.output_meter_levels()
                 if isinstance(levels, tuple) and len(levels) == 2:
-                    left = max(0.0, min(1.0, float(levels[0])))
-                    right = max(0.0, min(1.0, float(levels[1])))
-                    return left, right
+                    sample_left = max(0.0, min(1.0, float(levels[0])))
+                    sample_right = max(0.0, min(1.0, float(levels[1])))
             except Exception:
                 pass
-        levels = self.sample_pad_meter_levels()
-        if levels:
+        elif self.sample_pad_meter_levels():
             try:
-                mono = max(0.0, min(1.0, max(float(level) for level in levels.values())))
+                mono = max(0.0, min(1.0, max(float(level) for level in self.sample_pad_meter_levels().values())))
             except Exception:
                 mono = 0.0
-        else:
-            mono = 0.0
-        return mono, mono
+            sample_left = mono
+            sample_right = mono
+
+        main_left = 0.0
+        main_right = 0.0
+        if self._should_include_main_playback_in_sample_pad_meter(bool(_is_live_mode)):
+            main_left, main_right = self._main_window_playback_meter_levels()
+
+        return max(sample_left, main_left), max(sample_right, main_right)
+
+    def _sample_pad_mode_output_device_key(self, is_live_mode: bool) -> str:
+        device_name = self._output_device
+        if not bool(is_live_mode) and self._can_use_preview_mode():
+            device_name = self._preview_output_device
+        return self._normalize_device_key(device_name)
+
+    def _active_main_output_device_key(self) -> str:
+        return self._normalize_device_key(self._active_output_device())
+
+    def _should_include_main_playback_in_sample_pad_meter(self, is_live_mode: bool) -> bool:
+        if not _has_qt_multimedia or self._player is None:
+            return False
+        if self._player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+            return False
+        return self._sample_pad_mode_output_device_key(is_live_mode) == self._active_main_output_device_key()
+
+    def _main_window_playback_meter_levels(self) -> tuple[float, float]:
+        if self._player is None:
+            return 0.0, 0.0
+        active_gain = max(0.0, min(1.0, self._active_volume_percent() / 100.0))
+        position_ms = max(0, int(self._player.position()))
+
+        # Always provide a dynamic fallback so mixer metering remains visible
+        # even if waveform peaks are unavailable or still loading.
+        pulse_a = abs(math.sin(position_ms * 0.013))
+        pulse_b = abs(math.sin(position_ms * 0.041))
+        fallback_level = max(0.0, min(1.0, (0.12 + 0.22 * pulse_a + 0.16 * pulse_b) * active_gain))
+
+        source_url = self._player.source()
+        source_path = source_url.toLocalFile().strip() if source_url is not None else ""
+        if source_path:
+            path_obj = Path(source_path)
+            if path_obj.exists():
+                self._ensure_main_playback_meter_peaks(path_obj)
+
+        duration_ms = max(0, int(self._player.duration()))
+        clip_start_ms = max(0, int(self._current_clip_start_ms))
+        clip_stop_ms = int(self._current_clip_stop_ms)
+        if clip_stop_ms <= clip_start_ms:
+            clip_stop_ms = duration_ms
+        if clip_stop_ms <= clip_start_ms:
+            clip_start_ms = 0
+            clip_stop_ms = max(duration_ms, 1)
+
+        position_ms = max(clip_start_ms, min(max(clip_start_ms, clip_stop_ms), int(self._player.position())))
+        clip_span = max(1, clip_stop_ms - clip_start_ms)
+        ratio = max(0.0, min(1.0, (position_ms - clip_start_ms) / float(clip_span)))
+        peaks = self._main_playback_meter_peaks
+        if peaks:
+            idx = min(len(peaks) - 1, max(0, int(round(ratio * (len(peaks) - 1)))))
+            peak_level = max(0.0, min(1.0, float(peaks[idx]) * active_gain))
+            level = max(fallback_level * 0.45, peak_level)
+            return level, level
+        return fallback_level, fallback_level
+
+    def _ensure_main_playback_meter_peaks(self, path: Path) -> None:
+        path_key = str(path)
+        if path_key == self._main_playback_meter_peaks_path and self._main_playback_meter_peaks:
+            return
+        if self._main_playback_meter_loading and self._main_playback_meter_loading_path == path_key:
+            return
+
+        self._main_playback_meter_loading = True
+        self._main_playback_meter_loading_path = path_key
+
+        def _worker() -> None:
+            peaks: list[float] = []
+            try:
+                peaks = _load_waveform_peaks(
+                    path,
+                    bucket_count=900,
+                    cache_dir=self._app_data_dir / "waveform-cache",
+                )
+            except Exception:
+                peaks = []
+
+            self._main_playback_meter_peaks_path = path_key
+            self._main_playback_meter_peaks = [
+                max(0.0, min(1.0, float(value)))
+                for value in peaks
+            ]
+            self._main_playback_meter_loading = False
+            self._main_playback_meter_loading_path = ""
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def is_sample_pad_playing(self, pad_index: int) -> bool:
         if pad_index < 0:
@@ -1701,18 +1804,29 @@ class MainWindow(
         self._settings.setValue("options/previewVolumePercent", self._preview_volume_percent)
 
     def sample_pad_mode_volume_percent(self, is_live_mode: bool) -> int:
+        if not self._can_use_preview_mode():
+            return self._live_volume_percent
         return self._live_volume_percent if is_live_mode else self._preview_volume_percent
 
     def set_sample_pad_mode_volume_percent(self, is_live_mode: bool, value: int) -> None:
         percent = _coerce_volume_percent(value)
-        if is_live_mode:
+        if not self._can_use_preview_mode():
+            # When both modes route to the same physical output, keep both
+            # mode volumes identical regardless of which UI surface changed.
+            self._live_volume_percent = percent
+            self._preview_volume_percent = percent
+        elif is_live_mode:
             self._live_volume_percent = percent
         else:
             self._preview_volume_percent = percent
         self._save_volume_settings()
 
         # Apply to the currently-audible main bus only.
-        if (self._is_preview_mode and not is_live_mode) or (not self._is_preview_mode and is_live_mode):
+        if (
+            not self._can_use_preview_mode()
+            or (self._is_preview_mode and not is_live_mode)
+            or (not self._is_preview_mode and is_live_mode)
+        ):
             self._apply_active_volume()
 
         self._refresh_volume_controls()
@@ -1755,6 +1869,10 @@ class MainWindow(
             self._preview_volume_percent = percent
         else:
             self._live_volume_percent = percent
+            if not self._can_use_preview_mode():
+                # Keep preview volume synchronized while both modes use the
+                # same output device.
+                self._preview_volume_percent = percent
         self._volume_value_label.setText(f"{percent}%")
         self._save_volume_settings()
         self._apply_active_volume()

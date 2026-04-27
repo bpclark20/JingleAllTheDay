@@ -8,11 +8,26 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 from app_helpers import chip_palette_for_tag_seed as _chip_palette_for_tag_seed
 from app_helpers import coerce_volume_percent as _coerce_volume_percent
 
-_PAD_MODES = ("one_shot", "loop", "release")
-_PAD_MODE_LABELS = {"one_shot": "One Shot", "loop": "Loop", "release": "Release"}
+_PAD_MODES = ("one_shot", "loop", "release_os", "release_l")
+_PAD_MODE_LABELS = {
+    "one_shot": "One Shot",
+    "loop": "Loop",
+    "release_os": "Release (OS)",
+    "release_l": "Release (L)",
+}
+_RELEASE_PAD_MODES = {"release_os", "release_l"}
+_PAD_MODE_ALIASES = {"release": "release_l"}
 _METER_DB_FLOOR = -60.0
 _METER_DB_TOP_SPLIT = -20.0
 _METER_TOP_PORTION = 0.62
+
+
+def _normalize_pad_mode(value: Any) -> str:
+    mode = str(value).strip()
+    mode = _PAD_MODE_ALIASES.get(mode, mode)
+    if mode not in _PAD_MODES:
+        return "one_shot"
+    return mode
 
 
 def _coerce_pan_percent(value: Any) -> int:
@@ -167,7 +182,7 @@ class SamplePad(QtWidgets.QWidget):
     def on_sample_released(self) -> None:
         if not self._is_held:
             return
-        if self.pad_mode == "release":
+        if self.pad_mode in _RELEASE_PAD_MODES:
             self.stop_sample()
         else:
             self._is_held = False
@@ -266,6 +281,7 @@ class SamplePad(QtWidgets.QWidget):
                 parent_window.padStateChanged.emit()
 
     def on_mode_clicked(self) -> None:
+        self.pad_mode = _normalize_pad_mode(self.pad_mode)
         current_index = _PAD_MODES.index(self.pad_mode)
         self.pad_mode = _PAD_MODES[(current_index + 1) % len(_PAD_MODES)]
         self.mode_btn.setText(_PAD_MODE_LABELS[self.pad_mode])
@@ -1615,9 +1631,7 @@ class SamplePadsWindow(QtWidgets.QDialog):
                     pad.assign_jingle(restored_jingle)
                     assigned += 1
 
-            mode_value = str(entry_dict.get("mode", "one_shot")).strip()
-            if mode_value not in _PAD_MODES:
-                mode_value = "one_shot"
+            mode_value = _normalize_pad_mode(entry_dict.get("mode", "one_shot"))
             pad.pad_mode = mode_value
             pad.mode_btn.setText(_PAD_MODE_LABELS[mode_value])
 
@@ -1666,6 +1680,7 @@ class SamplePadsWindow(QtWidgets.QDialog):
                 self.mode_btn.blockSignals(False)
                 self.is_live_mode = is_live_mode
                 self.mode_btn.setText("Mode: Live" if self.is_live_mode else "Mode: Preview")
+                self.refresh_mode_volume_controls()
 
             active_board = int(payload.get("activeBoard", 0))
             if active_board < 0 or active_board >= self._num_boards:
