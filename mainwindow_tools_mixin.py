@@ -574,6 +574,125 @@ class MainWindowToolsMixin:
         self._apply_filters()
         return updated
 
+    def _on_record_jingle(self) -> None:
+        """Open recording dialog to record a new jingle."""
+        from dialogs import RecordingDialog
+        from datetime import datetime
+        import shutil
+
+        if not self._recording_output_folder:
+            QMessageBox.warning(
+                self,
+                "Recording Folder Not Set",
+                "Please configure a recording output folder in Options before recording.",
+            )
+            return
+
+        dialog = RecordingDialog(
+            recording_device=self._recording_input_device,
+            use_wasapi_loopback=self._use_wasapi_loopback,
+            parent=self,
+        )
+
+        if dialog.exec() != int(QDialog.DialogCode.Accepted):
+            return
+
+        recorded_file = dialog.recorded_file_path()
+        if not recorded_file or not recorded_file.exists():
+            QMessageBox.warning(
+                self,
+                "Recording Failed",
+                "No audio was recorded or the file could not be saved.",
+            )
+            return
+
+        # Generate filename with date/time
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        final_filename = f"{timestamp}_recording.wav"
+        final_path = self._recording_output_folder / final_filename
+
+        try:
+            # Move recorded file to final location
+            shutil.move(str(recorded_file), str(final_path))
+
+            # Add to library with auto-tagging from folder structure
+            auto_tags = self._extract_tags_from_path(final_path)
+            record = JingleRecord(
+                path=str(final_path),
+                categories=auto_tags,
+            )
+            self._store.set(str(final_path), auto_tags)
+            self._rescan_library()
+            QMessageBox.information(
+                self,
+                "Recording Saved",
+                f"Jingle saved to:\n{final_path}\n\nTags: {', '.join(auto_tags) if auto_tags else '(none)'}",
+            )
+
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Error Saving Recording",
+                f"Failed to save recorded jingle:\n\n{str(e)}",
+            )
+            if recorded_file.exists():
+                try:
+                    recorded_file.unlink()
+                except OSError:
+                    pass
+
+    def _extract_tags_from_path(self, path: Path) -> list[str]:
+        """Extract folder-based tags from a file path."""
+        tags: list[str] = []
+        for parent in path.parents:
+            if parent == self._recording_output_folder or parent == self._recording_output_folder.parent:
+                break
+            if parent != path.parent:
+                continue
+            # Use the immediate parent folder as a tag
+            folder_name = parent.name
+            if folder_name and folder_name not in tags:
+                tags.append(folder_name)
+        # Also check intermediate folders
+        rel_path = path.relative_to(self._recording_output_folder)
+        for part in rel_path.parts[:-1]:  # Exclude filename
+            if part not in tags:
+                tags.append(part)
+        return _normalize_tags(tags)
+
+    def _on_open_sequencer(self) -> None:
+        """Open the sequencer window."""
+        self._ensure_sequencer_window()
+        self._sequencer_btn.setChecked(True)
+        self._on_sequencer_btn_clicked()
+
+    def _on_open_mixer_switcher(self) -> None:
+        """Open either sample pads mixer or sequencer mixer."""
+        options = ["Sample Pads Mixer", "Sequencer Mixer"]
+        selection, accepted = QInputDialog.getItem(
+            self,
+            "Open Mixer",
+            "Choose mixer:",
+            options,
+            0,
+            False,
+        )
+        if not accepted:
+            return
+
+        if selection == "Sample Pads Mixer":
+            self._sample_pads_btn.setChecked(True)
+            self._on_sample_pads_btn_clicked()
+            if self._sample_pads_window is not None:
+                self._sample_pads_window._on_mixer_clicked()
+            return
+
+        self._ensure_sequencer_window()
+        self._sequencer_btn.setChecked(True)
+        self._on_sequencer_btn_clicked()
+        if self._sequencer_window is not None:
+            self._sequencer_window.open_mixer()
+
 
 if __name__ == "__main__":
     print("This module is a helper and is not meant to be run directly.")

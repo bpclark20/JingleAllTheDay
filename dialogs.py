@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 
 from app_helpers import coerce_volume_percent as _coerce_volume_percent
 from app_helpers import format_duration_hms as _format_duration_hms
 from app_helpers import format_size_label as _format_size_label
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QKeySequence, QPixmap
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -18,6 +21,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QKeySequenceEdit,
     QSizePolicy,
@@ -67,6 +71,9 @@ class OptionsDialog(QDialog):
         sample_pad_blocksize: int,
         sample_pad_streaming_min_seconds: int,
         samples_dir: Path | None = None,
+        recording_input_device: str | None = None,
+        recording_output_folder: Path | None = None,
+        use_wasapi_loopback: bool = False,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -192,6 +199,43 @@ class OptionsDialog(QDialog):
 
         root.addLayout(sample_pad_streaming_row)
 
+        # Recording settings section
+        recording_folder_row = QHBoxLayout()
+        recording_folder_label = QLabel("Recording Folder")
+        recording_folder_label.setFixedWidth(120)
+        recording_folder_row.addWidget(recording_folder_label)
+        self._recording_folder_edit = QLineEdit(str(recording_output_folder) if recording_output_folder else "")
+        self._recording_folder_edit.setReadOnly(True)
+        self._recording_folder_edit.setPlaceholderText("No folder selected")
+        recording_folder_row.addWidget(self._recording_folder_edit)
+        recording_browse_btn = QPushButton("Browse")
+        recording_browse_btn.clicked.connect(self._on_browse_recording_folder)
+        recording_folder_row.addWidget(recording_browse_btn)
+        root.addLayout(recording_folder_row)
+
+        recording_device_row = QHBoxLayout()
+        recording_device_label = QLabel("Recording Device")
+        recording_device_label.setFixedWidth(100)
+        recording_device_row.addWidget(recording_device_label)
+
+        self._recording_device_combo = QComboBox()
+        self._recording_device_combo.setMinimumWidth(340)
+        self._recording_device_combo.setToolTip("Audio input device for recording jingles.")
+        recording_device_row.addWidget(self._recording_device_combo)
+
+        root.addLayout(recording_device_row)
+
+        recording_wasapi_row = QHBoxLayout()
+        recording_wasapi_row.addSpacing(120)
+        self._use_wasapi_loopback_checkbox = QCheckBox("Use WASAPI Loopback (Stereo Mix)")
+        self._use_wasapi_loopback_checkbox.setChecked(use_wasapi_loopback)
+        self._use_wasapi_loopback_checkbox.setToolTip(
+            "When checked, record system audio via stereo mix/loopback device instead of physical input."
+        )
+        recording_wasapi_row.addWidget(self._use_wasapi_loopback_checkbox)
+        recording_wasapi_row.addStretch()
+        root.addLayout(recording_wasapi_row)
+
         refresh_btn = QPushButton("Refresh Devices")
         refresh_btn.clicked.connect(self._on_refresh_clicked)
         refresh_row = QHBoxLayout()
@@ -208,6 +252,7 @@ class OptionsDialog(QDialog):
         root.addWidget(buttons)
 
         self._populate_devices(live_output_device, preview_output_device)
+        self._populate_recording_devices(recording_input_device, use_wasapi_loopback)
         self._live_volume_slider.valueChanged.connect(self._sync_volume_labels)
         self._preview_volume_slider.valueChanged.connect(self._sync_volume_labels)
         self._sync_volume_labels()
@@ -258,6 +303,10 @@ class OptionsDialog(QDialog):
         live_selected = str(live_current).strip() if live_current is not None else ""
         preview_selected = str(preview_current).strip() if preview_current is not None else ""
         self._populate_devices(live_selected, preview_selected)
+        recording_current = self._recording_device_combo.currentData()
+        recording_selected = str(recording_current).strip() if recording_current is not None else ""
+        use_wasapi = self._use_wasapi_loopback_checkbox.isChecked()
+        self._populate_recording_devices(recording_selected, use_wasapi)
 
     def selected_devices(self) -> tuple[str, str]:
         live = self._live_device_combo.currentData()
@@ -288,6 +337,20 @@ class OptionsDialog(QDialog):
         p = Path(text)
         return p if p.exists() and p.is_dir() else None
 
+    def selected_recording_folder(self) -> Path | None:
+        text = self._recording_folder_edit.text().strip()
+        if not text:
+            return None
+        p = Path(text)
+        return p if p.exists() and p.is_dir() else None
+
+    def selected_recording_device(self) -> str:
+        data = self._recording_device_combo.currentData()
+        return str(data).strip() if data is not None else ""
+
+    def selected_use_wasapi_loopback(self) -> bool:
+        return self._use_wasapi_loopback_checkbox.isChecked()
+
     def _on_browse_folder(self) -> None:
         current = self._folder_edit.text().strip()
         start = current if current else str(Path.home())
@@ -298,9 +361,226 @@ class OptionsDialog(QDialog):
         if path.exists() and path.is_dir():
             self._folder_edit.setText(str(path))
 
+    def _on_browse_recording_folder(self) -> None:
+        current = self._recording_folder_edit.text().strip()
+        start = current if current else str(Path.home())
+        selected = QFileDialog.getExistingDirectory(self, "Choose Recording Output Folder", start)
+        if not selected:
+            return
+        path = Path(selected)
+        if path.exists() and path.is_dir():
+            self._recording_folder_edit.setText(str(path))
+
+    def _populate_recording_devices(self, selected_device: str, use_wasapi: bool) -> None:
+        """Populate recording input device combo."""
+        from recording_engine import get_recording_engine
+
+        self._recording_device_combo.blockSignals(True)
+        self._recording_device_combo.clear()
+
+        engine = get_recording_engine()
+        seen: set[str] = set()
+
+        # Add available input devices
+        for device_id, device_name in engine.get_available_devices():
+            if device_name in seen:
+                continue
+            seen.add(device_name)
+            self._recording_device_combo.addItem(device_name, device_name)
+
+        # If WASAPI loopback is selected, show those devices too (and prioritize them)
+        if use_wasapi:
+            wasapi_devices = engine.get_wasapi_loopback_devices()
+            for device_id, device_name in wasapi_devices:
+                if device_name in seen:
+                    continue
+                seen.add(device_name)
+                label = f"{device_name} (WASAPI Loopback)"
+                self._recording_device_combo.addItem(label, device_name)
+
+        # Restore selection
+        target = selected_device.strip() if selected_device else ""
+        if target:
+            idx = self._recording_device_combo.findData(target)
+            if idx >= 0:
+                self._recording_device_combo.setCurrentIndex(idx)
+            else:
+                self._recording_device_combo.addItem(f"{target} (Unavailable)", target)
+                self._recording_device_combo.setCurrentIndex(self._recording_device_combo.count() - 1)
+        else:
+            self._recording_device_combo.setCurrentIndex(0 if self._recording_device_combo.count() > 0 else -1)
+
+        self._recording_device_combo.blockSignals(False)
+
     def _sync_volume_labels(self) -> None:
         self._live_volume_value_label.setText(f"{self._live_volume_slider.value()}%")
         self._preview_volume_value_label.setText(f"{self._preview_volume_slider.value()}%")
+
+
+class RecordingDialog(QDialog):
+    """Dialog for recording audio from input device or WASAPI loopback."""
+
+    def __init__(
+        self,
+        recording_device: str | None = None,
+        use_wasapi_loopback: bool = False,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Record Jingle")
+        self.setMinimumWidth(480)
+        self.setFixedHeight(240)
+
+        from recording_engine import RecordingConfig, get_recording_engine
+
+        self._engine = get_recording_engine()
+        self._config = RecordingConfig(
+            device_id=recording_device or None,
+            sample_rate=44100,
+            channels=2,
+            blocksize=2048,
+            use_wasapi_loopback=use_wasapi_loopback,
+        )
+        self._recorded_path: Path | None = None
+        self._timer = QTimer()
+        self._timer.timeout.connect(self._on_update_metrics)
+
+        root = QVBoxLayout(self)
+
+        # Status display
+        status_row = QHBoxLayout()
+        status_row.addWidget(QLabel("Device:"))
+        self._device_label = QLabel(recording_device or "Default")
+        status_row.addWidget(self._device_label)
+        status_row.addStretch()
+        root.addLayout(status_row)
+
+        # Duration display
+        duration_row = QHBoxLayout()
+        duration_row.addWidget(QLabel("Duration:"))
+        self._duration_label = QLabel("00:00:00")
+        self._duration_label.setMinimumWidth(80)
+        duration_row.addWidget(self._duration_label)
+        duration_row.addStretch()
+        root.addLayout(duration_row)
+
+        # VU meter (progress bar as visual indicator)
+        meter_row = QHBoxLayout()
+        meter_row.addWidget(QLabel("Level:"))
+        self._peak_meter = QProgressBar()
+        self._peak_meter.setRange(0, 100)
+        self._peak_meter.setValue(0)
+        self._peak_meter.setMaximumHeight(20)
+        meter_row.addWidget(self._peak_meter)
+        self._peak_label = QLabel("0%")
+        self._peak_label.setMinimumWidth(40)
+        meter_row.addWidget(self._peak_label)
+        root.addLayout(meter_row)
+
+        # Status message
+        self._status_label = QLabel("Ready to record")
+        self._status_label.setWordWrap(True)
+        self._status_label.setStyleSheet("color: #666;")
+        root.addWidget(self._status_label)
+
+        root.addStretch()
+
+        # Buttons
+        button_row = QHBoxLayout()
+        self._start_btn = QPushButton("Start Recording")
+        self._start_btn.clicked.connect(self._on_start_recording)
+        button_row.addWidget(self._start_btn)
+
+        self._stop_btn = QPushButton("Stop Recording")
+        self._stop_btn.setEnabled(False)
+        self._stop_btn.clicked.connect(self._on_stop_recording)
+        button_row.addWidget(self._stop_btn)
+
+        button_row.addStretch()
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.reject)
+        button_row.addWidget(close_btn)
+
+        root.addLayout(button_row)
+
+    def _on_start_recording(self) -> None:
+        """Start recording audio."""
+        import tempfile
+
+        try:
+            # Create temp file for recording
+            temp_fd, temp_path = tempfile.mkstemp(suffix=".wav")
+            import os
+
+            os.close(temp_fd)
+            self._recorded_path = Path(temp_path)
+
+            error = self._engine.start_recording(
+                self._recorded_path,
+                self._config,
+                metrics_callback=self._on_metrics_update,
+            )
+
+            if error:
+                self._status_label.setText(f"Error: {error}")
+                self._recorded_path = None
+                return
+
+            self._start_btn.setEnabled(False)
+            self._stop_btn.setEnabled(True)
+            self._status_label.setText("Recording...")
+            self._status_label.setStyleSheet("color: #080;")
+            self._timer.start(100)
+
+        except Exception as e:
+            self._status_label.setText(f"Error: {str(e)}")
+            self._recorded_path = None
+
+    def _on_stop_recording(self) -> None:
+        """Stop recording audio."""
+        self._timer.stop()
+        self._engine.stop_recording()
+
+        # Check for errors
+        error = self._engine.get_latest_error()
+        if error:
+            self._status_label.setText(f"Error: {error}")
+            self._status_label.setStyleSheet("color: #800;")
+            if self._recorded_path and self._recorded_path.exists():
+                self._recorded_path.unlink()
+                self._recorded_path = None
+        else:
+            self._status_label.setText("Recording complete. Auto-saving...")
+            self._status_label.setStyleSheet("color: #080;")
+
+        self._start_btn.setEnabled(True)
+        self._stop_btn.setEnabled(False)
+
+        # Accept dialog to return the recorded file
+        self.accept()
+
+    def _on_metrics_update(self, metrics) -> None:
+        """Callback from recording engine with metrics."""
+        pass
+
+    def _on_update_metrics(self) -> None:
+        """Poll and update metrics display."""
+        metrics = self._engine.get_latest_metrics()
+        if metrics is not None:
+            # Update duration
+            minutes, seconds = divmod(int(metrics.current_seconds), 60)
+            hours, minutes = divmod(minutes, 60)
+            self._duration_label.setText(f"{hours:02d}:{minutes:02d}:{seconds:02d}")
+
+            # Update peak level meter
+            peak_percent = int(metrics.peak_level * 100)
+            self._peak_meter.setValue(peak_percent)
+            self._peak_label.setText(f"{peak_percent}%")
+
+    def recorded_file_path(self) -> Path | None:
+        """Return path to recorded file if recording was successful."""
+        return self._recorded_path if self._recorded_path and self._recorded_path.exists() else None
 
 
 class KeyboardShortcutsDialog(QDialog):

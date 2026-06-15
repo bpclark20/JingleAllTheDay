@@ -25,7 +25,7 @@ from app_helpers import (
     runtime_app_dir as _runtime_app_dir,
     tags_to_text as _tags_to_text,
 )
-from dialogs import AboutDialog, OptionsDialog, SAMPLE_PAD_BLOCKSIZE_OPTIONS
+from dialogs import AboutDialog, OptionsDialog, RecordingDialog, SAMPLE_PAD_BLOCKSIZE_OPTIONS
 from mainwindow_file_edit_mixin import MainWindowFileEditMixin
 from mainwindow_library_mixin import MainWindowLibraryMixin
 from mainwindow_menu_mixin import MainWindowMenuMixin
@@ -298,6 +298,11 @@ class MainWindow(
         self._auto_folder_tags: bool = self._load_auto_folder_tags()
         self._auto_generate_waveforms: bool = self._load_auto_generate_waveforms()
         self._watch_library_changes: bool = self._load_watch_library_changes()
+        self._recording_input_device: str = str(self._settings.value("recording/inputDevice", "")).strip()
+        self._recording_output_folder: Path | None = self._load_recording_output_folder()
+        self._use_wasapi_loopback: bool = (
+            str(self._settings.value("recording/useWasapiLoopback", "false")).strip().lower() == "true"
+        )
         self._default_keyboard_shortcuts = dict(DEFAULT_KEYBOARD_SHORTCUTS)
         self._keyboard_shortcuts = self._load_keyboard_shortcuts()
 
@@ -531,6 +536,14 @@ class MainWindow(
         self._sample_pads_btn.setToolTip("Show or hide the Sample Pads window")
         self._sample_pads_btn.clicked.connect(self._on_sample_pads_btn_clicked)
         playback_row.addWidget(self._sample_pads_btn)
+
+        # --- Sequencer Feature ---
+        self._sequencer_window = None
+        self._sequencer_btn = QPushButton("Show Sequencer")
+        self._sequencer_btn.setCheckable(True)
+        self._sequencer_btn.setToolTip("Show or hide the Sequencer window")
+        self._sequencer_btn.clicked.connect(self._on_sequencer_btn_clicked)
+        playback_row.addWidget(self._sequencer_btn)
 
         self._refresh_volume_controls()
         root.addLayout(playback_row)
@@ -961,6 +974,62 @@ class MainWindow(
             self._sample_pads_window.hide()
             self._autosave_sample_pad_layout()
             self._sample_pads_btn.setText("Show Sample Pads")
+
+    def _on_sequencer_btn_clicked(self) -> None:
+        """Toggle sequencer window visibility."""
+        if self._sequencer_btn.isChecked():
+            self._ensure_sequencer_window()
+            self._sequencer_window.show()
+            self._sequencer_window.raise_()
+            self._sequencer_window.activateWindow()
+            self._sequencer_btn.setText("Hide Sequencer")
+        else:
+            if self._sequencer_window:
+                self._sequencer_window.hide()
+            self._sequencer_btn.setText("Show Sequencer")
+
+    def _on_sequencer_window_closed(self) -> None:
+        """Handle sequencer window close."""
+        self._sequencer_btn.setChecked(False)
+        self._sequencer_btn.setText("Show Sequencer")
+
+    def _ensure_sequencer_window(self):
+        """Create sequencer window if it doesn't exist."""
+        if self._sequencer_window is None:
+            from sequencer_window import SequencerWindow
+
+            self._sequencer_window = SequencerWindow(
+                app_data_dir=self._app_data_dir,
+                sample_pad_audio_engine=self._sp_engine,
+                ensure_audio_ready=self._prepare_sequencer_audio_engine,
+                can_use_preview_mode=self._can_use_preview_mode,
+                parent=self,
+            )
+            self._sequencer_window.window_closed.connect(self._on_sequencer_window_closed)
+        return self._sequencer_window
+
+    def _prepare_sequencer_audio_engine(self, is_live_mode: bool) -> bool:
+        """Ensure the shared sample-pad engine stream is open before sequencer playback."""
+        if not _sp_engine_mod.is_available():
+            self._status.showMessage("Low-latency audio engine unavailable.")
+            return False
+
+        target_device = self._output_device
+        target_gain_percent = self._live_volume_percent
+        if not is_live_mode and self._can_use_preview_mode():
+            target_device = self._preview_output_device
+            target_gain_percent = self._preview_volume_percent
+
+        try:
+            self._sp_engine.set_device(
+                target_device,
+                blocksize=self._sample_pad_blocksize,
+            )
+            self._sp_engine.set_master_gain(target_gain_percent / 100.0)
+            return True
+        except Exception as exc:
+            self._status.showMessage(f"Sequencer audio setup failed: {exc}")
+            return False
 
     def _on_sample_pads_window_closed(self):
         self._autosave_sample_pad_layout()
@@ -2018,10 +2087,24 @@ class MainWindow(
         super().keyReleaseEvent(event)
 
     def closeEvent(self, event: QEvent | None) -> None:
+        if self._sequencer_window is not None:
+            try:
+                if not self._sequencer_window.confirm_close_for_application():
+                    if event is not None:
+                        event.ignore()
+                    return
+            except Exception:
+                pass
         self._autosave_sample_pad_layout()
         if self._sample_pads_window is not None:
             try:
                 self._sample_pads_window.close()
+            except Exception:
+                pass
+        if self._sequencer_window is not None:
+            try:
+                self._sequencer_window.prepare_for_application_close()
+                self._sequencer_window.close()
             except Exception:
                 pass
         self._stop_sample_pad_global_hotkeys()
@@ -2204,6 +2287,19 @@ class MainWindow(
     def _save_samples_dir(self) -> None:
         if self._samples_dir is not None:
             self._settings.setValue("library/samplesDir", str(self._samples_dir))
+
+    def _load_recording_output_folder(self) -> Path | None:
+        raw = str(self._settings.value("recording/outputFolder", "")).strip()
+        if raw:
+            candidate = Path(raw)
+            if candidate.exists() and candidate.is_dir():
+                return candidate
+        return None
+
+    def _save_recording_output_folder(self) -> None:
+        if self._recording_output_folder is not None:
+            self._settings.setValue("recording/outputFolder", str(self._recording_output_folder))
+            self._settings.sync()  # Force flush to disk
 
     def _load_auto_folder_tags(self) -> bool:
         return str(self._settings.value("library/autoFolderTags", "")).strip().lower() == "true"
@@ -2419,6 +2515,11 @@ class MainWindow(
         edit_jingle_action.triggered.connect(self._on_edit_jingle)
 
         menu.addSeparator()
+        # --- Sequencer track assignment ---
+        send_to_seq_action = menu.addAction("Send to Sequencer as New Track")
+        send_to_seq_action.setEnabled(selected_count == 1)
+        send_to_seq_action.triggered.connect(self._on_send_selected_to_sequencer)
+        menu.addSeparator()
 
         # --- Sample Pad assignment ---
         pads_window = self._ensure_sample_pads_window()
@@ -2480,6 +2581,10 @@ class MainWindow(
         rename_action.setEnabled(selected_count == 1)
         rename_action.triggered.connect(self._on_edit_rename)
 
+        move_action = menu.addAction("Move To...")
+        move_action.setEnabled(selected_count == 1)
+        move_action.triggered.connect(self._on_edit_move_to)
+
         delete_action = menu.addAction("Delete")
         delete_action.setEnabled(selected_count > 0)
         delete_action.triggered.connect(self._on_edit_delete)
@@ -2528,6 +2633,53 @@ class MainWindow(
             self._sample_pads_window.assign_jingle_to_board_pad(board_index, pad_index, jingle_data)
         # Preload the newly assigned audio so the first trigger is instant.
         self._sp_engine_preload_all_pads()
+
+    def _on_send_selected_to_sequencer(self) -> None:
+        """Add selected jingle as a new track in the sequencer."""
+        sequencer_window = self._ensure_sequencer_window()
+        selected_indices = self._selected_record_indices()
+        if not selected_indices:
+            return
+
+        record_index = selected_indices[0]
+        record = self._records[record_index]
+        clip_profiles, active_profile_index = self._store.get_clip_profiles(
+            record.path,
+            record.duration_seconds,
+        )
+        clip_start, clip_stop = clip_profiles[active_profile_index]
+        clip_length_seconds = max(0.0, float(clip_stop) - float(clip_start))
+
+        sequence = sequencer_window.get_sequence()
+        bpm = max(1.0, float(sequence.bpm))
+        # Convert active clip length in seconds to sequencer beats.
+        if clip_length_seconds > 0.0:
+            default_duration_beats = max(0.1, clip_length_seconds * (bpm / 60.0))
+        else:
+            default_duration_beats = 4.0
+
+        # Create a new sequencer track with a default trigger at beat 0.
+        from sequencer_model import SequenceTrack, TriggerEvent
+
+        track = SequenceTrack(
+            name=record.name,
+            source_path=str(record.path),
+            is_jingle=True,
+            triggers=[TriggerEvent(beat_position=0.0, duration_beats=default_duration_beats)],
+        )
+        sequence.add_track(track)
+        sequencer_window._update_track_list()
+        sequencer_window.sequence_changed.emit()
+
+        # Ensure sequencer is visible
+        if not self._sequencer_btn.isChecked():
+            self._sequencer_btn.setChecked(True)
+            self._on_sequencer_btn_clicked()
+        else:
+            sequencer_window.raise_()
+            sequencer_window.activateWindow()
+
+        self._status.showMessage(f"Added '{record.name}' to sequencer as new track")
 
     def _on_table_item_double_clicked(self, item: QTableWidgetItem) -> None:
         if item.column() != 0:
@@ -3125,6 +3277,9 @@ class MainWindow(
             self._sample_pad_blocksize,
             self._sample_pad_streaming_min_seconds,
             self._samples_dir,
+            self._recording_input_device,
+            self._recording_output_folder,
+            self._use_wasapi_loopback,
             self,
         )
         if dialog.exec() != int(QDialog.DialogCode.Accepted):
@@ -3154,6 +3309,15 @@ class MainWindow(
             self._samples_dir = new_dir
             self._save_samples_dir()
             self._rescan_library()
+
+        # Recording settings
+        self._recording_input_device = dialog.selected_recording_device()
+        self._recording_output_folder = dialog.selected_recording_folder()
+        self._use_wasapi_loopback = dialog.selected_use_wasapi_loopback()
+        self._settings.setValue("recording/inputDevice", self._recording_input_device)
+        self._settings.setValue("recording/useWasapiLoopback", "true" if self._use_wasapi_loopback else "false")
+        self._save_recording_output_folder()
+        self._settings.sync()  # Ensure all settings are written to disk
 
         if not self._can_use_preview_mode():
             QMessageBox.information(

@@ -381,9 +381,24 @@ class MainWindowFileEditMixin:
                 )
             except OSError:
                 pass
-            self._store.set(destination_path, source_categories)
+            
+            # Determine categories for the destination
             if move:
+                # When moving and auto-tagging is enabled, re-derive tags from new location
+                self._store.set(destination_path, source_categories)
+                if self._auto_folder_tags and self._samples_dir:
+                    # Create a temporary record to derive tags from new location
+                    from models_store import JingleRecord
+                    temp_record = JingleRecord(
+                        path=str(destination_path),
+                        categories=source_categories,
+                    )
+                    self._apply_folder_titles_to_records([temp_record], preserve_existing=True)
+                    new_categories = temp_record.categories
+                    self._store.set(destination_path, new_categories)
                 source_path.unlink()
+            else:
+                self._store.set(destination_path, source_categories)
         except OSError as exc:
             QMessageBox.critical(self, f"{operation_name} Failed", f"Could not {operation_name.lower()} file.\n\n{exc}")
             self._status.showMessage(f"{operation_name} failed.")
