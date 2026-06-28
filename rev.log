@@ -1,3 +1,15 @@
+## 1.7.2.061826
+- Various Record Jingle window improvements:
+	- Recording meter always runs regardless of recording state to provide visual feedback on input levels and clipping.
+	- Meter label is now expressed as dB instead of 0-100 percentage.
+	- Recording Audio Device setting is synced between main Application Options and Record Jingle window, with persistence and restore behavior.
+	- Added a "Prompt for Filename When Recording Stops? control. If the user has this enabled and cancels out of the save file dialog, the file is still saved to the default location with a timestamped filename.
+
+## 1.7.1.061826
+- Updated a bug where the application fails to load if the previously saved output audio device is no longer available, by falling back to the system default output device and showing a warning message.
+- Updated directory search to use relative paths based on the previously saved jingle library directory, to prevent search failures for certain terms when the search term is present in a parent directory of the library.
+
+
 ## v1.6.0.042226
 - Added per-pad stereo pan control in the Sample Pad Mixer, placed above mute/solo, with real-time audio routing updates.
 - Added center-detent behavior for pan controls so near-center values snap cleanly to exact center.

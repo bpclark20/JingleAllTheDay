@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import threading
 import time
+import math
 from pathlib import Path
 
 from app_helpers import coerce_volume_percent as _coerce_volume_percent
 from app_helpers import format_duration_hms as _format_duration_hms
 from app_helpers import format_size_label as _format_size_label
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import QEvent, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QKeySequence, QPixmap
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -74,6 +75,7 @@ class OptionsDialog(QDialog):
         recording_input_device: str | None = None,
         recording_output_folder: Path | None = None,
         use_wasapi_loopback: bool = False,
+        prompt_filename_on_stop: bool = False,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -236,6 +238,19 @@ class OptionsDialog(QDialog):
         recording_wasapi_row.addStretch()
         root.addLayout(recording_wasapi_row)
 
+        recording_prompt_filename_row = QHBoxLayout()
+        recording_prompt_filename_row.addSpacing(120)
+        self._recording_prompt_filename_checkbox = QCheckBox(
+            "Prompt for Filename When Recording Stops?"
+        )
+        self._recording_prompt_filename_checkbox.setChecked(prompt_filename_on_stop)
+        self._recording_prompt_filename_checkbox.setToolTip(
+            "When checked, stopping a recording opens Save As before the file is moved from temp storage."
+        )
+        recording_prompt_filename_row.addWidget(self._recording_prompt_filename_checkbox)
+        recording_prompt_filename_row.addStretch()
+        root.addLayout(recording_prompt_filename_row)
+
         refresh_btn = QPushButton("Refresh Devices")
         refresh_btn.clicked.connect(self._on_refresh_clicked)
         refresh_row = QHBoxLayout()
@@ -351,6 +366,9 @@ class OptionsDialog(QDialog):
     def selected_use_wasapi_loopback(self) -> bool:
         return self._use_wasapi_loopback_checkbox.isChecked()
 
+    def selected_prompt_filename_on_stop(self) -> bool:
+        return self._recording_prompt_filename_checkbox.isChecked()
+
     def _on_browse_folder(self) -> None:
         current = self._folder_edit.text().strip()
         start = current if current else str(Path.home())
@@ -420,16 +438,22 @@ class OptionsDialog(QDialog):
 class RecordingDialog(QDialog):
     """Dialog for recording audio from input device or WASAPI loopback."""
 
+    recording_ready = pyqtSignal(str, bool)
+
     def __init__(
         self,
         recording_device: str | None = None,
         use_wasapi_loopback: bool = False,
+        prompt_filename_on_stop: bool = False,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Record Jingle")
         self.setMinimumWidth(480)
-        self.setFixedHeight(240)
+        self.setWindowFlags(
+            (self.windowFlags() | Qt.WindowType.WindowMinimizeButtonHint)
+            & ~Qt.WindowType.WindowMaximizeButtonHint
+        )
 
         from recording_engine import RecordingConfig, get_recording_engine
 
@@ -444,6 +468,11 @@ class RecordingDialog(QDialog):
         self._recorded_path: Path | None = None
         self._timer = QTimer()
         self._timer.timeout.connect(self._on_update_metrics)
+        self._meter_monitor_thread: threading.Thread | None = None
+        self._meter_monitor_stop = threading.Event()
+        self._meter_monitor_peak = 0.0
+        self._meter_monitor_lock = threading.Lock()
+        self._minimized_low_power_active = False
 
         root = QVBoxLayout(self)
 
@@ -470,12 +499,23 @@ class RecordingDialog(QDialog):
         self._peak_meter = QProgressBar()
         self._peak_meter.setRange(0, 100)
         self._peak_meter.setValue(0)
+        self._peak_meter.setTextVisible(False)
         self._peak_meter.setMaximumHeight(20)
         meter_row.addWidget(self._peak_meter)
-        self._peak_label = QLabel("0%")
-        self._peak_label.setMinimumWidth(40)
+        self._peak_label = QLabel("-inf dB")
+        self._peak_label.setMinimumWidth(56)
         meter_row.addWidget(self._peak_label)
         root.addLayout(meter_row)
+
+        prompt_row = QHBoxLayout()
+        prompt_row.addSpacing(6)
+        self._prompt_filename_on_stop_checkbox = QCheckBox(
+            "Prompt for Filename When Recording Stops?"
+        )
+        self._prompt_filename_on_stop_checkbox.setChecked(prompt_filename_on_stop)
+        prompt_row.addWidget(self._prompt_filename_on_stop_checkbox)
+        prompt_row.addStretch()
+        root.addLayout(prompt_row)
 
         # Status message
         self._status_label = QLabel("Ready to record")
@@ -483,7 +523,7 @@ class RecordingDialog(QDialog):
         self._status_label.setStyleSheet("color: #666;")
         root.addWidget(self._status_label)
 
-        root.addStretch()
+        root.addSpacing(4)
 
         # Buttons
         button_row = QHBoxLayout()
@@ -504,6 +544,12 @@ class RecordingDialog(QDialog):
 
         root.addLayout(button_row)
 
+        self.setFixedHeight(self.sizeHint().height())
+
+        self.finished.connect(self._cleanup_meter_monitor)
+        self._start_meter_monitor()
+        self._timer.start(100)
+
     def _on_start_recording(self) -> None:
         """Start recording audio."""
         import tempfile
@@ -516,6 +562,11 @@ class RecordingDialog(QDialog):
             os.close(temp_fd)
             self._recorded_path = Path(temp_path)
 
+            # Avoid opening two input streams on the same device at once.
+            self._stop_meter_monitor()
+            with self._meter_monitor_lock:
+                self._meter_monitor_peak = 0.0
+
             error = self._engine.start_recording(
                 self._recorded_path,
                 self._config,
@@ -525,21 +576,29 @@ class RecordingDialog(QDialog):
             if error:
                 self._status_label.setText(f"Error: {error}")
                 self._recorded_path = None
+                self._start_meter_monitor()
                 return
 
             self._start_btn.setEnabled(False)
             self._stop_btn.setEnabled(True)
             self._status_label.setText("Recording...")
             self._status_label.setStyleSheet("color: #080;")
-            self._timer.start(100)
 
         except Exception as e:
             self._status_label.setText(f"Error: {str(e)}")
             self._recorded_path = None
+            self._start_meter_monitor()
+
+    def changeEvent(self, event: QEvent | None) -> None:
+        if event is not None and event.type() == QEvent.Type.WindowStateChange:
+            if self.isMinimized():
+                self._enter_minimized_low_power_mode()
+            else:
+                self._exit_minimized_low_power_mode()
+        super().changeEvent(event)
 
     def _on_stop_recording(self) -> None:
         """Stop recording audio."""
-        self._timer.stop()
         self._engine.stop_recording()
 
         # Check for errors
@@ -551,14 +610,14 @@ class RecordingDialog(QDialog):
                 self._recorded_path.unlink()
                 self._recorded_path = None
         else:
-            self._status_label.setText("Recording complete. Auto-saving...")
-            self._status_label.setStyleSheet("color: #080;")
+            if self._recorded_path is not None and self._recorded_path.exists():
+                self.recording_ready.emit(
+                    str(self._recorded_path),
+                    self.should_prompt_filename_on_stop(),
+                )
+            self._recorded_path = None
 
-        self._start_btn.setEnabled(True)
-        self._stop_btn.setEnabled(False)
-
-        # Accept dialog to return the recorded file
-        self.accept()
+        self._reset_ready_state()
 
     def _on_metrics_update(self, metrics) -> None:
         """Callback from recording engine with metrics."""
@@ -566,21 +625,133 @@ class RecordingDialog(QDialog):
 
     def _on_update_metrics(self) -> None:
         """Poll and update metrics display."""
-        metrics = self._engine.get_latest_metrics()
+        metrics = self._engine.get_latest_metrics() if self._engine.is_recording() else None
         if metrics is not None:
             # Update duration
             minutes, seconds = divmod(int(metrics.current_seconds), 60)
             hours, minutes = divmod(minutes, 60)
             self._duration_label.setText(f"{hours:02d}:{minutes:02d}:{seconds:02d}")
 
-            # Update peak level meter
-            peak_percent = int(metrics.peak_level * 100)
-            self._peak_meter.setValue(peak_percent)
-            self._peak_label.setText(f"{peak_percent}%")
+            self._apply_peak_level(float(metrics.peak_level))
+            return
+
+        # Idle mode metering: keep showing live input level when not recording.
+        with self._meter_monitor_lock:
+            peak_level = self._meter_monitor_peak
+        self._apply_peak_level(peak_level)
+
+    def _apply_peak_level(self, raw_peak: float) -> None:
+        peak_level = max(0.0, min(1.0, float(raw_peak)))
+        peak_percent = int(peak_level * 100)
+        self._peak_meter.setValue(peak_percent)
+        if peak_level <= 0.0:
+            self._peak_label.setText("-inf dB")
+            return
+        dbfs = 20.0 * math.log10(peak_level)
+        self._peak_label.setText(f"{dbfs:.1f} dB")
+
+    def _start_meter_monitor(self) -> None:
+        if self._minimized_low_power_active:
+            return
+        if self._meter_monitor_thread is not None and self._meter_monitor_thread.is_alive():
+            return
+
+        self._meter_monitor_stop.clear()
+
+        def _run_monitor() -> None:
+            try:
+                import sounddevice as sd
+            except Exception:
+                return
+
+            def _audio_callback(indata, _frames, _time_info, _status) -> None:
+                try:
+                    peak = float(abs(indata).max())
+                except Exception:
+                    peak = 0.0
+                with self._meter_monitor_lock:
+                    self._meter_monitor_peak = peak
+
+            try:
+                with sd.InputStream(
+                    device=self._config.device_id,
+                    samplerate=self._config.sample_rate,
+                    channels=self._config.channels,
+                    blocksize=self._config.blocksize,
+                    callback=_audio_callback,
+                ):
+                    while not self._meter_monitor_stop.wait(0.1):
+                        pass
+            except Exception:
+                with self._meter_monitor_lock:
+                    self._meter_monitor_peak = 0.0
+
+        self._meter_monitor_thread = threading.Thread(target=_run_monitor, daemon=True)
+        self._meter_monitor_thread.start()
+
+    def _stop_meter_monitor(self) -> None:
+        self._meter_monitor_stop.set()
+        if self._meter_monitor_thread is not None:
+            self._meter_monitor_thread.join(timeout=1.0)
+        self._meter_monitor_thread = None
+
+    def _cleanup_meter_monitor(self, _result: int) -> None:
+        self._timer.stop()
+        self._stop_meter_monitor()
+
+    def _reset_ready_state(self) -> None:
+        self._start_btn.setEnabled(True)
+        self._stop_btn.setEnabled(False)
+        self._duration_label.setText("00:00:00")
+        self._status_label.setText("Ready to record")
+        self._status_label.setStyleSheet("color: #666;")
+        if not self._engine.is_recording():
+            self._start_meter_monitor()
+
+    def _enter_minimized_low_power_mode(self) -> None:
+        if self._minimized_low_power_active:
+            return
+        self._minimized_low_power_active = True
+        self._timer.stop()
+        if not self._engine.is_recording():
+            self._stop_meter_monitor()
+
+    def _exit_minimized_low_power_mode(self) -> None:
+        if not self._minimized_low_power_active:
+            return
+        self._minimized_low_power_active = False
+        if not self._engine.is_recording():
+            self._start_meter_monitor()
+        if not self._timer.isActive():
+            self._timer.start(100)
 
     def recorded_file_path(self) -> Path | None:
         """Return path to recorded file if recording was successful."""
         return self._recorded_path if self._recorded_path and self._recorded_path.exists() else None
+
+    def should_prompt_filename_on_stop(self) -> bool:
+        return self._prompt_filename_on_stop_checkbox.isChecked()
+
+    def sync_recording_settings(
+        self,
+        recording_device: str | None,
+        use_wasapi_loopback: bool,
+        prompt_filename_on_stop: bool,
+    ) -> None:
+        self._config.device_id = recording_device or None
+        self._config.use_wasapi_loopback = use_wasapi_loopback
+        self._device_label.setText(recording_device or "Default")
+        self._prompt_filename_on_stop_checkbox.setChecked(prompt_filename_on_stop)
+
+        # If actively recording, keep the current stream stable and apply on next take.
+        if self._engine.is_recording():
+            return
+
+        # Apply the device change immediately to idle metering.
+        self._stop_meter_monitor()
+        with self._meter_monitor_lock:
+            self._meter_monitor_peak = 0.0
+        self._start_meter_monitor()
 
 
 class KeyboardShortcutsDialog(QDialog):

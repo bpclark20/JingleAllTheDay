@@ -34,6 +34,12 @@ pip install -r requirements.txt
 python app.py
 ```
 
+## Build Reference
+
+For a dedicated guide on build and installer inputs/outputs, parameters, defaults, and examples, see:
+
+- [BUILDING.md](BUILDING.md)
+
 ## Build EXE
 
 Use PyInstaller from the project virtual environment:

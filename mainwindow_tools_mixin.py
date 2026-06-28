@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import cast
 
 from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal
-from PyQt6.QtWidgets import QDialog, QHBoxLayout, QInputDialog, QLabel, QMessageBox, QProgressBar, QPushButton, QVBoxLayout
+from PyQt6.QtWidgets import QFileDialog, QDialog, QHBoxLayout, QInputDialog, QLabel, QMessageBox, QProgressBar, QPushButton, QVBoxLayout
 
 from app_helpers import merge_tags as _merge_tags, normalize_tags as _normalize_tags
 from mainwindow_contracts import MainWindowToolsHost
@@ -577,8 +577,6 @@ class MainWindowToolsMixin:
     def _on_record_jingle(self) -> None:
         """Open recording dialog to record a new jingle."""
         from dialogs import RecordingDialog
-        from datetime import datetime
-        import shutil
 
         if not self._recording_output_folder:
             QMessageBox.warning(
@@ -588,17 +586,51 @@ class MainWindowToolsMixin:
             )
             return
 
+        existing = getattr(self, "_recording_dialog", None)
+        if existing is not None:
+            existing.showNormal()
+            existing.raise_()
+            existing.activateWindow()
+            return
+
         dialog = RecordingDialog(
             recording_device=self._recording_input_device,
             use_wasapi_loopback=self._use_wasapi_loopback,
+            prompt_filename_on_stop=self._recording_prompt_filename_on_stop,
             parent=self,
         )
+        self._recording_dialog = dialog
+        dialog.recording_ready.connect(self._save_recorded_jingle)
+        dialog.finished.connect(self._on_recording_dialog_finished)
+        dialog.setModal(False)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
-        if dialog.exec() != int(QDialog.DialogCode.Accepted):
-            return
+    def _on_recording_dialog_finished(self, _result: int) -> None:
+        dialog = getattr(self, "_recording_dialog", None)
+        if dialog is not None:
+            self._recording_prompt_filename_on_stop = dialog.should_prompt_filename_on_stop()
+            self._settings.setValue(
+                "recording/promptFilenameOnStop",
+                "true" if self._recording_prompt_filename_on_stop else "false",
+            )
+            self._settings.sync()
+        self._recording_dialog = None
 
-        recorded_file = dialog.recorded_file_path()
-        if not recorded_file or not recorded_file.exists():
+    def _save_recorded_jingle(self, recorded_file_path: str, prompt_filename_on_stop: bool) -> None:
+        from datetime import datetime
+        import shutil
+
+        recorded_file = Path(recorded_file_path)
+
+        self._recording_prompt_filename_on_stop = prompt_filename_on_stop
+        self._settings.setValue(
+            "recording/promptFilenameOnStop",
+            "true" if self._recording_prompt_filename_on_stop else "false",
+        )
+
+        if not recorded_file.exists():
             QMessageBox.warning(
                 self,
                 "Recording Failed",
@@ -606,10 +638,37 @@ class MainWindowToolsMixin:
             )
             return
 
-        # Generate filename with date/time
+        if not self._recording_output_folder:
+            QMessageBox.warning(
+                self,
+                "Recording Folder Not Set",
+                "Please configure a recording output folder in Options before recording.",
+            )
+            try:
+                recorded_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return
+
+        # Generate default filename with date/time
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        final_filename = f"{timestamp}_recording.wav"
-        final_path = self._recording_output_folder / final_filename
+        default_filename = f"{timestamp}_recording.wav"
+        final_path = self._recording_output_folder / default_filename
+
+        if prompt_filename_on_stop:
+            selected_path, _selected_filter = QFileDialog.getSaveFileName(
+                self,
+                "Save Recorded Jingle As",
+                str(final_path),
+                "WAV Audio (*.wav);;All Files (*)",
+            )
+            if selected_path:
+                candidate = Path(selected_path)
+                if not candidate.suffix:
+                    candidate = candidate.with_suffix(".wav")
+                final_path = candidate
+
+        final_path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
             # Move recorded file to final location
@@ -617,11 +676,7 @@ class MainWindowToolsMixin:
 
             # Add to library with auto-tagging from folder structure
             auto_tags = self._extract_tags_from_path(final_path)
-            record = JingleRecord(
-                path=str(final_path),
-                categories=auto_tags,
-            )
-            self._store.set(str(final_path), auto_tags)
+            self._store.set(final_path, auto_tags)
             self._rescan_library()
             QMessageBox.information(
                 self,
@@ -643,6 +698,9 @@ class MainWindowToolsMixin:
 
     def _extract_tags_from_path(self, path: Path) -> list[str]:
         """Extract folder-based tags from a file path."""
+        if self._recording_output_folder is None:
+            return []
+
         tags: list[str] = []
         for parent in path.parents:
             if parent == self._recording_output_folder or parent == self._recording_output_folder.parent:
@@ -654,7 +712,10 @@ class MainWindowToolsMixin:
             if folder_name and folder_name not in tags:
                 tags.append(folder_name)
         # Also check intermediate folders
-        rel_path = path.relative_to(self._recording_output_folder)
+        try:
+            rel_path = path.relative_to(self._recording_output_folder)
+        except ValueError:
+            return _normalize_tags(tags)
         for part in rel_path.parts[:-1]:  # Exclude filename
             if part not in tags:
                 tags.append(part)

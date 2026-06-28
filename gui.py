@@ -7,6 +7,7 @@ import sys
 import ctypes
 import json
 import math
+import re
 import threading
 from pathlib import Path
 from typing import Any, Callable
@@ -303,6 +304,9 @@ class MainWindow(
         self._use_wasapi_loopback: bool = (
             str(self._settings.value("recording/useWasapiLoopback", "false")).strip().lower() == "true"
         )
+        self._recording_prompt_filename_on_stop: bool = (
+            str(self._settings.value("recording/promptFilenameOnStop", "false")).strip().lower() == "true"
+        )
         self._default_keyboard_shortcuts = dict(DEFAULT_KEYBOARD_SHORTCUTS)
         self._keyboard_shortcuts = self._load_keyboard_shortcuts()
 
@@ -344,7 +348,6 @@ class MainWindow(
             self._player = QMediaPlayer(self)
             self._audio_output = QAudioOutput(self)
             self._player.setAudioOutput(self._audio_output)
-            self._apply_output_device()
 
         central = QWidget(self)
         self._central_widget = central
@@ -550,6 +553,10 @@ class MainWindow(
 
         self._status = QStatusBar(self)
         self.setStatusBar(self._status)
+
+        if _has_qt_multimedia:
+            self._reconcile_saved_output_devices()
+            self._apply_output_device()
 
         self._library_watcher = QFileSystemWatcher(self)
         self._library_watcher.directoryChanged.connect(self._on_library_watch_path_changed)
@@ -3280,6 +3287,7 @@ class MainWindow(
             self._recording_input_device,
             self._recording_output_folder,
             self._use_wasapi_loopback,
+            self._recording_prompt_filename_on_stop,
             self,
         )
         if dialog.exec() != int(QDialog.DialogCode.Accepted):
@@ -3314,10 +3322,23 @@ class MainWindow(
         self._recording_input_device = dialog.selected_recording_device()
         self._recording_output_folder = dialog.selected_recording_folder()
         self._use_wasapi_loopback = dialog.selected_use_wasapi_loopback()
+        self._recording_prompt_filename_on_stop = dialog.selected_prompt_filename_on_stop()
         self._settings.setValue("recording/inputDevice", self._recording_input_device)
         self._settings.setValue("recording/useWasapiLoopback", "true" if self._use_wasapi_loopback else "false")
+        self._settings.setValue(
+            "recording/promptFilenameOnStop",
+            "true" if self._recording_prompt_filename_on_stop else "false",
+        )
         self._save_recording_output_folder()
         self._settings.sync()  # Ensure all settings are written to disk
+
+        record_dialog = getattr(self, "_recording_dialog", None)
+        if record_dialog is not None:
+            record_dialog.sync_recording_settings(
+                recording_device=self._recording_input_device,
+                use_wasapi_loopback=self._use_wasapi_loopback,
+                prompt_filename_on_stop=self._recording_prompt_filename_on_stop,
+            )
 
         if not self._can_use_preview_mode():
             QMessageBox.information(
@@ -3336,14 +3357,10 @@ class MainWindow(
         target_device = QMediaDevices.defaultAudioOutput()
 
         if selected:
-            matched = None
-            for device in QMediaDevices.audioOutputs():
-                if device.description().strip() == selected:
-                    matched = device
-                    break
+            matched = self._find_output_device_by_name(selected)
             if matched is not None:
                 target_device = matched
-            else:
+            elif hasattr(self, "_status"):
                 self._status.showMessage(
                     f"Selected device unavailable. Using system default: {target_device.description()}"
                 )
@@ -3363,7 +3380,72 @@ class MainWindow(
         self._apply_active_volume()
 
     def _normalize_device_key(self, value: str) -> str:
-        return value.strip().casefold()
+        # Normalize legacy Windows endpoint labels that may include instance
+        # counters like "(2- Device Name)" on one machine but "(Device Name)"
+        # on another.
+        key = " ".join(value.strip().split()).casefold()
+        key = re.sub(r"\(\s*\d+\s*-\s*", "(", key)
+        return key
+
+    def _find_output_device_by_name(self, selected_name: str):
+        target_key = self._normalize_device_key(selected_name)
+        if not target_key:
+            return None
+
+        devices = list(QMediaDevices.audioOutputs())
+
+        for device in devices:
+            if self._normalize_device_key(device.description()) == target_key:
+                return device
+
+        # As a last resort, allow partial matching for renamed endpoints.
+        for device in devices:
+            device_key = self._normalize_device_key(device.description())
+            if device_key and (device_key in target_key or target_key in device_key):
+                return device
+
+        return None
+
+    def _reconcile_saved_output_devices(self) -> None:
+        unavailable: list[tuple[str, str]] = []
+
+        live_saved = self._output_device.strip()
+        if live_saved:
+            live_match = self._find_output_device_by_name(live_saved)
+            if live_match is None:
+                unavailable.append(("Live", live_saved))
+                self._output_device = ""
+            else:
+                self._output_device = live_match.description().strip()
+
+        preview_saved = self._preview_output_device.strip()
+        if preview_saved:
+            preview_match = self._find_output_device_by_name(preview_saved)
+            if preview_match is None:
+                unavailable.append(("Preview", preview_saved))
+                self._preview_output_device = ""
+            else:
+                self._preview_output_device = preview_match.description().strip()
+
+        if not unavailable:
+            return
+
+        self._settings.setValue("options/outputDevice", self._output_device)
+        self._settings.setValue("options/previewOutputDevice", self._preview_output_device)
+        self._settings.sync()
+
+        default_name = QMediaDevices.defaultAudioOutput().description().strip()
+        unavailable_text = "\n".join(f"- {role}: {name}" for role, name in unavailable)
+        message = (
+            "One or more previously saved audio output devices are unavailable.\n\n"
+            f"{unavailable_text}\n\n"
+            f"Live and Preview outputs were reset to System Default ({default_name})."
+        )
+        self._status.showMessage(
+            f"Saved output device missing; using system default ({default_name}).",
+            12000,
+        )
+        QMessageBox.information(self, "Audio Output Device Updated", message)
 
     def _can_use_preview_mode(self) -> bool:
         return self._normalize_device_key(self._output_device) != self._normalize_device_key(
