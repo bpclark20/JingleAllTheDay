@@ -1,16 +1,17 @@
 from __future__ import annotations
 
-import threading
-import time
-import math
+import sys
 from pathlib import Path
+from typing import Any, Callable
 
 from app_helpers import coerce_volume_percent as _coerce_volume_percent
 from app_helpers import format_duration_hms as _format_duration_hms
 from app_helpers import format_size_label as _format_size_label
-from PyQt6.QtCore import QEvent, Qt, QTimer, pyqtSignal
+import sample_pad_audio_engine as _sp_engine_mod
+from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QKeySequence, QPixmap
 from PyQt6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -22,7 +23,6 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPlainTextEdit,
-    QProgressBar,
     QPushButton,
     QKeySequenceEdit,
     QSizePolicy,
@@ -42,6 +42,58 @@ except ModuleNotFoundError:
 
 
 SAMPLE_PAD_BLOCKSIZE_OPTIONS = (1024, 512, 384, 256, 224, 192, 128, 64)
+
+_VIRTUAL_AUDIO_KEYWORDS = (
+    "broadcast",
+    "blackhole",
+    "cable",
+    "dante",
+    "jack",
+    "loopback",
+    "monitor",
+    "null",
+    "sink",
+    "soundflower",
+    "vb-audio",
+    "virtual",
+    "voicemeeter",
+)
+
+
+def is_virtual_audio_device_name(name: str) -> bool:
+    normalized = name.strip().casefold()
+    if not normalized:
+        return False
+    if any(keyword in normalized for keyword in _VIRTUAL_AUDIO_KEYWORDS):
+        return True
+
+    # On Linux, Qt friendly labels for null sinks can be shortened or cleaned up
+    # compared with the PortAudio device names. If a matching PortAudio output has
+    # a corresponding .monitor input, treat it as a virtual sink.
+    if sys.platform.startswith("linux") and _sp_engine_mod.is_available():
+        try:
+            devices = _sp_engine_mod.list_audio_devices()
+        except Exception:
+            devices = []
+        candidate_names = {
+            str(dev.get("name", "")).strip().casefold()
+            for dev in devices
+            if str(dev.get("name", "")).strip()
+        }
+        for candidate in candidate_names:
+            if normalized not in candidate and candidate not in normalized:
+                continue
+            if f"{candidate}.monitor" in candidate_names:
+                return True
+            if candidate.endswith("broadcast") or candidate.endswith("sink"):
+                return True
+    return False
+
+
+def format_audio_device_label(name: str) -> str:
+    if is_virtual_audio_device_name(name):
+        return f"[Virtual] {name}"
+    return name
 
 
 def _coerce_sample_pad_blocksize(value: int | str | None) -> int:
@@ -67,15 +119,15 @@ class OptionsDialog(QDialog):
         self,
         live_output_device: str,
         preview_output_device: str,
+        broadcast_output_device: str,
+        mixer_enabled: bool,
+        microphone_input_device: str,
+        microphone_gain_percent: int,
         live_volume_percent: int,
         preview_volume_percent: int,
         sample_pad_blocksize: int,
         sample_pad_streaming_min_seconds: int,
         samples_dir: Path | None = None,
-        recording_input_device: str | None = None,
-        recording_output_folder: Path | None = None,
-        use_wasapi_loopback: bool = False,
-        prompt_filename_on_stop: bool = False,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -109,6 +161,20 @@ class OptionsDialog(QDialog):
 
         root.addLayout(live_row)
 
+        broadcast_row = QHBoxLayout()
+        broadcast_label = QLabel("Broadcast Device")
+        broadcast_label.setFixedWidth(100)
+        broadcast_row.addWidget(broadcast_label)
+
+        self._broadcast_device_combo = QComboBox()
+        self._broadcast_device_combo.setMinimumWidth(340)
+        self._broadcast_device_combo.setToolTip(
+            "Optional virtual or loopback output used for mixer audio and live sample-pad routing in broadcast workflows."
+        )
+        broadcast_row.addWidget(self._broadcast_device_combo)
+
+        root.addLayout(broadcast_row)
+
         preview_row = QHBoxLayout()
         preview_label = QLabel("Preview Device")
         preview_label.setFixedWidth(100)
@@ -120,6 +186,56 @@ class OptionsDialog(QDialog):
         preview_row.addWidget(self._preview_device_combo)
 
         root.addLayout(preview_row)
+
+        mixer_enabled_row = QHBoxLayout()
+        mixer_enabled_label = QLabel("Mixer Mode")
+        mixer_enabled_label.setFixedWidth(100)
+        mixer_enabled_row.addWidget(mixer_enabled_label)
+
+        self._mixer_enabled_checkbox = QCheckBox("Enable in-app microphone + jingle mixer")
+        self._mixer_enabled_checkbox.setChecked(bool(mixer_enabled))
+        self._mixer_enabled_checkbox.setToolTip(
+            "Foundation setting for future internal microphone+jingle mixing. "
+            "Current builds persist this setting but do not yet switch playback behavior."
+        )
+        mixer_enabled_row.addWidget(self._mixer_enabled_checkbox)
+        mixer_enabled_row.addStretch()
+
+        root.addLayout(mixer_enabled_row)
+
+        microphone_row = QHBoxLayout()
+        microphone_label = QLabel("Microphone")
+        microphone_label.setFixedWidth(100)
+        microphone_row.addWidget(microphone_label)
+
+        self._microphone_device_combo = QComboBox()
+        self._microphone_device_combo.setMinimumWidth(340)
+        self._microphone_device_combo.setToolTip(
+            "Input device reserved for future in-app microphone+jingle mixing."
+        )
+        microphone_row.addWidget(self._microphone_device_combo)
+
+        root.addLayout(microphone_row)
+
+        microphone_gain_row = QHBoxLayout()
+        microphone_gain_label = QLabel("Mic Gain")
+        microphone_gain_label.setFixedWidth(100)
+        microphone_gain_row.addWidget(microphone_gain_label)
+
+        self._microphone_gain_slider = QSlider(Qt.Orientation.Horizontal)
+        self._microphone_gain_slider.setRange(0, 200)
+        self._microphone_gain_slider.setPageStep(5)
+        self._microphone_gain_slider.setValue(max(0, min(200, int(microphone_gain_percent))))
+        self._microphone_gain_slider.setToolTip(
+            "Input gain for future internal microphone mixing. 100% is unity gain."
+        )
+        microphone_gain_row.addWidget(self._microphone_gain_slider)
+
+        self._microphone_gain_value_label = QLabel()
+        self._microphone_gain_value_label.setFixedWidth(52)
+        microphone_gain_row.addWidget(self._microphone_gain_value_label)
+
+        root.addLayout(microphone_gain_row)
 
         live_volume_row = QHBoxLayout()
         live_volume_label = QLabel("Live Volume")
@@ -201,56 +317,6 @@ class OptionsDialog(QDialog):
 
         root.addLayout(sample_pad_streaming_row)
 
-        # Recording settings section
-        recording_folder_row = QHBoxLayout()
-        recording_folder_label = QLabel("Recording Folder")
-        recording_folder_label.setFixedWidth(120)
-        recording_folder_row.addWidget(recording_folder_label)
-        self._recording_folder_edit = QLineEdit(str(recording_output_folder) if recording_output_folder else "")
-        self._recording_folder_edit.setReadOnly(True)
-        self._recording_folder_edit.setPlaceholderText("No folder selected")
-        recording_folder_row.addWidget(self._recording_folder_edit)
-        recording_browse_btn = QPushButton("Browse")
-        recording_browse_btn.clicked.connect(self._on_browse_recording_folder)
-        recording_folder_row.addWidget(recording_browse_btn)
-        root.addLayout(recording_folder_row)
-
-        recording_device_row = QHBoxLayout()
-        recording_device_label = QLabel("Recording Device")
-        recording_device_label.setFixedWidth(100)
-        recording_device_row.addWidget(recording_device_label)
-
-        self._recording_device_combo = QComboBox()
-        self._recording_device_combo.setMinimumWidth(340)
-        self._recording_device_combo.setToolTip("Audio input device for recording jingles.")
-        recording_device_row.addWidget(self._recording_device_combo)
-
-        root.addLayout(recording_device_row)
-
-        recording_wasapi_row = QHBoxLayout()
-        recording_wasapi_row.addSpacing(120)
-        self._use_wasapi_loopback_checkbox = QCheckBox("Use WASAPI Loopback (Stereo Mix)")
-        self._use_wasapi_loopback_checkbox.setChecked(use_wasapi_loopback)
-        self._use_wasapi_loopback_checkbox.setToolTip(
-            "When checked, record system audio via stereo mix/loopback device instead of physical input."
-        )
-        recording_wasapi_row.addWidget(self._use_wasapi_loopback_checkbox)
-        recording_wasapi_row.addStretch()
-        root.addLayout(recording_wasapi_row)
-
-        recording_prompt_filename_row = QHBoxLayout()
-        recording_prompt_filename_row.addSpacing(120)
-        self._recording_prompt_filename_checkbox = QCheckBox(
-            "Prompt for Filename When Recording Stops?"
-        )
-        self._recording_prompt_filename_checkbox.setChecked(prompt_filename_on_stop)
-        self._recording_prompt_filename_checkbox.setToolTip(
-            "When checked, stopping a recording opens Save As before the file is moved from temp storage."
-        )
-        recording_prompt_filename_row.addWidget(self._recording_prompt_filename_checkbox)
-        recording_prompt_filename_row.addStretch()
-        root.addLayout(recording_prompt_filename_row)
-
         refresh_btn = QPushButton("Refresh Devices")
         refresh_btn.clicked.connect(self._on_refresh_clicked)
         refresh_row = QHBoxLayout()
@@ -259,6 +325,16 @@ class OptionsDialog(QDialog):
 
         root.addLayout(refresh_row)
 
+        self._broadcast_warning_label = QLabel()
+        self._broadcast_warning_label.setWordWrap(True)
+        root.addWidget(self._broadcast_warning_label)
+
+        virtual_hint = QLabel(
+            "Tip: choose a [Virtual] Broadcast Device for Discord/OBS style routing while keeping Live Device for local monitoring."
+        )
+        virtual_hint.setWordWrap(True)
+        root.addWidget(virtual_hint)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -266,15 +342,32 @@ class OptionsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
 
-        self._populate_devices(live_output_device, preview_output_device)
-        self._populate_recording_devices(recording_input_device, use_wasapi_loopback)
+        self._populate_devices(
+            live_output_device,
+            preview_output_device,
+            broadcast_output_device,
+            microphone_input_device,
+        )
         self._live_volume_slider.valueChanged.connect(self._sync_volume_labels)
         self._preview_volume_slider.valueChanged.connect(self._sync_volume_labels)
+        self._microphone_gain_slider.valueChanged.connect(self._sync_volume_labels)
+        self._live_device_combo.currentIndexChanged.connect(self._refresh_broadcast_warning)
+        self._broadcast_device_combo.currentIndexChanged.connect(self._refresh_broadcast_warning)
+        self._mixer_enabled_checkbox.toggled.connect(self._refresh_broadcast_warning)
         self._sync_volume_labels()
+        self._refresh_broadcast_warning()
 
-    def _populate_devices(self, live_selected: str, preview_selected: str) -> None:
+    def _populate_devices(
+        self,
+        live_selected: str,
+        preview_selected: str,
+        broadcast_selected: str,
+        microphone_selected: str,
+    ) -> None:
         self._populate_device_combo(self._live_device_combo, live_selected)
         self._populate_device_combo(self._preview_device_combo, preview_selected)
+        self._populate_device_combo(self._broadcast_device_combo, broadcast_selected)
+        self._populate_input_device_combo(self._microphone_device_combo, microphone_selected)
 
     def _populate_device_combo(self, combo: QComboBox, selected_device: str) -> None:
         combo.blockSignals(True)
@@ -290,7 +383,7 @@ class OptionsDialog(QDialog):
                     if not name or name in seen:
                         continue
                     seen.add(name)
-                    combo.addItem(name, name)
+                    combo.addItem(format_audio_device_label(name), name)
             except Exception:
                 pass
 
@@ -305,7 +398,7 @@ class OptionsDialog(QDialog):
             if idx >= 0:
                 combo.setCurrentIndex(idx)
             else:
-                combo.addItem(f"{target} (Unavailable)", target)
+                combo.addItem(f"{format_audio_device_label(target)} (Unavailable)", target)
                 combo.setCurrentIndex(combo.count() - 1)
         else:
             combo.setCurrentIndex(0)
@@ -315,20 +408,97 @@ class OptionsDialog(QDialog):
     def _on_refresh_clicked(self) -> None:
         live_current = self._live_device_combo.currentData()
         preview_current = self._preview_device_combo.currentData()
+        broadcast_current = self._broadcast_device_combo.currentData()
+        microphone_current = self._microphone_device_combo.currentData()
         live_selected = str(live_current).strip() if live_current is not None else ""
         preview_selected = str(preview_current).strip() if preview_current is not None else ""
-        self._populate_devices(live_selected, preview_selected)
-        recording_current = self._recording_device_combo.currentData()
-        recording_selected = str(recording_current).strip() if recording_current is not None else ""
-        use_wasapi = self._use_wasapi_loopback_checkbox.isChecked()
-        self._populate_recording_devices(recording_selected, use_wasapi)
+        broadcast_selected = str(broadcast_current).strip() if broadcast_current is not None else ""
+        microphone_selected = str(microphone_current).strip() if microphone_current is not None else ""
+        self._populate_devices(
+            live_selected,
+            preview_selected,
+            broadcast_selected,
+            microphone_selected,
+        )
+        self._refresh_broadcast_warning()
 
-    def selected_devices(self) -> tuple[str, str]:
+    def _populate_input_device_combo(self, combo: QComboBox, selected_device: str) -> None:
+        combo.blockSignals(True)
+        combo.clear()
+
+        default_name = ""
+        if _has_qt_multimedia:
+            try:
+                default_name = QMediaDevices.defaultAudioInput().description().strip()
+                seen: set[str] = set()
+                for device in QMediaDevices.audioInputs():
+                    name = device.description().strip()
+                    if not name or name in seen:
+                        continue
+                    seen.add(name)
+                    combo.addItem(format_audio_device_label(name), name)
+            except Exception:
+                pass
+
+        default_label = "System Default"
+        if default_name:
+            default_label = f"System Default ({default_name})"
+        combo.insertItem(0, default_label, "")
+
+        target = selected_device.strip()
+        if target:
+            idx = combo.findData(target)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+            else:
+                combo.addItem(f"{format_audio_device_label(target)} (Unavailable)", target)
+                combo.setCurrentIndex(combo.count() - 1)
+        else:
+            combo.setCurrentIndex(0)
+
+        combo.blockSignals(False)
+
+    def selected_devices(self) -> tuple[str, str, str]:
         live = self._live_device_combo.currentData()
         preview = self._preview_device_combo.currentData()
+        broadcast = self._broadcast_device_combo.currentData()
         live_value = str(live).strip() if live is not None else ""
         preview_value = str(preview).strip() if preview is not None else ""
-        return live_value, preview_value
+        broadcast_value = str(broadcast).strip() if broadcast is not None else ""
+        return live_value, preview_value, broadcast_value
+
+    def _refresh_broadcast_warning(self) -> None:
+        live = str(self._live_device_combo.currentData() or "").strip()
+        broadcast = str(self._broadcast_device_combo.currentData() or "").strip()
+        mixer_enabled = bool(self._mixer_enabled_checkbox.isChecked())
+
+        messages: list[str] = []
+        if not mixer_enabled:
+            messages.append("Mixer Mode is off, so microphone audio will not be sent to any broadcast route.")
+        if not broadcast:
+            if live and not is_virtual_audio_device_name(live):
+                messages.append(
+                    "No Broadcast Device is selected. Discord/OBS routing usually works best with a virtual or loopback broadcast device instead of a physical Live Device."
+                )
+        else:
+            if not is_virtual_audio_device_name(broadcast):
+                messages.append(
+                    "The selected Broadcast Device does not look like a virtual or loopback device. Physical outputs usually will not behave like an isolated broadcast feed."
+                )
+            if live.strip().casefold() == broadcast.strip().casefold():
+                messages.append(
+                    "Broadcast Device matches Live Device, so broadcast and local monitoring are not isolated from each other."
+                )
+        messages.append(
+            "Main library jingles are mirrored to the Broadcast Device. Sample-pad jingles still follow the current Live/Preview monitor route, and live-mode sample pads are also duplicated to the Broadcast Device when it differs from the monitor route."
+        )
+        self._broadcast_warning_label.setText("\n".join(messages))
+
+    def selected_mixer_config(self) -> tuple[bool, str, int]:
+        microphone = self._microphone_device_combo.currentData()
+        microphone_value = str(microphone).strip() if microphone is not None else ""
+        microphone_gain = max(0, min(200, int(self._microphone_gain_slider.value())))
+        return bool(self._mixer_enabled_checkbox.isChecked()), microphone_value, microphone_gain
 
     def selected_volumes(self) -> tuple[int, int]:
         return (
@@ -352,23 +522,6 @@ class OptionsDialog(QDialog):
         p = Path(text)
         return p if p.exists() and p.is_dir() else None
 
-    def selected_recording_folder(self) -> Path | None:
-        text = self._recording_folder_edit.text().strip()
-        if not text:
-            return None
-        p = Path(text)
-        return p if p.exists() and p.is_dir() else None
-
-    def selected_recording_device(self) -> str:
-        data = self._recording_device_combo.currentData()
-        return str(data).strip() if data is not None else ""
-
-    def selected_use_wasapi_loopback(self) -> bool:
-        return self._use_wasapi_loopback_checkbox.isChecked()
-
-    def selected_prompt_filename_on_stop(self) -> bool:
-        return self._recording_prompt_filename_checkbox.isChecked()
-
     def _on_browse_folder(self) -> None:
         current = self._folder_edit.text().strip()
         start = current if current else str(Path.home())
@@ -379,379 +532,145 @@ class OptionsDialog(QDialog):
         if path.exists() and path.is_dir():
             self._folder_edit.setText(str(path))
 
-    def _on_browse_recording_folder(self) -> None:
-        current = self._recording_folder_edit.text().strip()
-        start = current if current else str(Path.home())
-        selected = QFileDialog.getExistingDirectory(self, "Choose Recording Output Folder", start)
-        if not selected:
-            return
-        path = Path(selected)
-        if path.exists() and path.is_dir():
-            self._recording_folder_edit.setText(str(path))
-
-    def _populate_recording_devices(self, selected_device: str, use_wasapi: bool) -> None:
-        """Populate recording input device combo."""
-        from recording_engine import get_recording_engine
-
-        self._recording_device_combo.blockSignals(True)
-        self._recording_device_combo.clear()
-
-        engine = get_recording_engine()
-        seen: set[str] = set()
-
-        # Add available input devices
-        for device_id, device_name in engine.get_available_devices():
-            if device_name in seen:
-                continue
-            seen.add(device_name)
-            self._recording_device_combo.addItem(device_name, device_name)
-
-        # If WASAPI loopback is selected, show those devices too (and prioritize them)
-        if use_wasapi:
-            wasapi_devices = engine.get_wasapi_loopback_devices()
-            for device_id, device_name in wasapi_devices:
-                if device_name in seen:
-                    continue
-                seen.add(device_name)
-                label = f"{device_name} (WASAPI Loopback)"
-                self._recording_device_combo.addItem(label, device_name)
-
-        # Restore selection
-        target = selected_device.strip() if selected_device else ""
-        if target:
-            idx = self._recording_device_combo.findData(target)
-            if idx >= 0:
-                self._recording_device_combo.setCurrentIndex(idx)
-            else:
-                self._recording_device_combo.addItem(f"{target} (Unavailable)", target)
-                self._recording_device_combo.setCurrentIndex(self._recording_device_combo.count() - 1)
-        else:
-            self._recording_device_combo.setCurrentIndex(0 if self._recording_device_combo.count() > 0 else -1)
-
-        self._recording_device_combo.blockSignals(False)
-
     def _sync_volume_labels(self) -> None:
         self._live_volume_value_label.setText(f"{self._live_volume_slider.value()}%")
         self._preview_volume_value_label.setText(f"{self._preview_volume_slider.value()}%")
+        self._microphone_gain_value_label.setText(f"{self._microphone_gain_slider.value()}%")
 
 
-class RecordingDialog(QDialog):
-    """Dialog for recording audio from input device or WASAPI loopback."""
-
-    recording_ready = pyqtSignal(str, bool)
-
+class AudioDiagnosticsDialog(QDialog):
     def __init__(
         self,
-        recording_device: str | None = None,
-        use_wasapi_loopback: bool = False,
-        prompt_filename_on_stop: bool = False,
+        snapshot_provider: Callable[[], dict[str, Any]],
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Record Jingle")
-        self.setMinimumWidth(480)
-        self.setWindowFlags(
-            (self.windowFlags() | Qt.WindowType.WindowMinimizeButtonHint)
-            & ~Qt.WindowType.WindowMaximizeButtonHint
-        )
-
-        from recording_engine import RecordingConfig, get_recording_engine
-
-        self._engine = get_recording_engine()
-        self._config = RecordingConfig(
-            device_id=recording_device or None,
-            sample_rate=44100,
-            channels=2,
-            blocksize=2048,
-            use_wasapi_loopback=use_wasapi_loopback,
-        )
-        self._recorded_path: Path | None = None
-        self._timer = QTimer()
-        self._timer.timeout.connect(self._on_update_metrics)
-        self._meter_monitor_thread: threading.Thread | None = None
-        self._meter_monitor_stop = threading.Event()
-        self._meter_monitor_peak = 0.0
-        self._meter_monitor_lock = threading.Lock()
-        self._minimized_low_power_active = False
+        self.setWindowTitle("Audio Diagnostics")
+        self.resize(860, 640)
+        self._snapshot_provider = snapshot_provider
 
         root = QVBoxLayout(self)
 
-        # Status display
-        status_row = QHBoxLayout()
-        status_row.addWidget(QLabel("Device:"))
-        self._device_label = QLabel(recording_device or "Default")
-        status_row.addWidget(self._device_label)
-        status_row.addStretch()
-        root.addLayout(status_row)
-
-        # Duration display
-        duration_row = QHBoxLayout()
-        duration_row.addWidget(QLabel("Duration:"))
-        self._duration_label = QLabel("00:00:00")
-        self._duration_label.setMinimumWidth(80)
-        duration_row.addWidget(self._duration_label)
-        duration_row.addStretch()
-        root.addLayout(duration_row)
-
-        # VU meter (progress bar as visual indicator)
-        meter_row = QHBoxLayout()
-        meter_row.addWidget(QLabel("Level:"))
-        self._peak_meter = QProgressBar()
-        self._peak_meter.setRange(0, 100)
-        self._peak_meter.setValue(0)
-        self._peak_meter.setTextVisible(False)
-        self._peak_meter.setMaximumHeight(20)
-        meter_row.addWidget(self._peak_meter)
-        self._peak_label = QLabel("-inf dB")
-        self._peak_label.setMinimumWidth(56)
-        meter_row.addWidget(self._peak_label)
-        root.addLayout(meter_row)
-
-        prompt_row = QHBoxLayout()
-        prompt_row.addSpacing(6)
-        self._prompt_filename_on_stop_checkbox = QCheckBox(
-            "Prompt for Filename When Recording Stops?"
+        intro = QLabel(
+            "Inspect current audio routes, mixer state, and virtual-device candidates for broadcast workflows."
         )
-        self._prompt_filename_on_stop_checkbox.setChecked(prompt_filename_on_stop)
-        prompt_row.addWidget(self._prompt_filename_on_stop_checkbox)
-        prompt_row.addStretch()
-        root.addLayout(prompt_row)
+        intro.setWordWrap(True)
+        root.addWidget(intro)
 
-        # Status message
-        self._status_label = QLabel("Ready to record")
-        self._status_label.setWordWrap(True)
-        self._status_label.setStyleSheet("color: #666;")
-        root.addWidget(self._status_label)
+        self._report_edit = QPlainTextEdit(self)
+        self._report_edit.setReadOnly(True)
+        self._report_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self._report_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        root.addWidget(self._report_edit, 1)
 
-        root.addSpacing(4)
-
-        # Buttons
         button_row = QHBoxLayout()
-        self._start_btn = QPushButton("Start Recording")
-        self._start_btn.clicked.connect(self._on_start_recording)
-        button_row.addWidget(self._start_btn)
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self.refresh_report)
+        button_row.addWidget(refresh_btn)
 
-        self._stop_btn = QPushButton("Stop Recording")
-        self._stop_btn.setEnabled(False)
-        self._stop_btn.clicked.connect(self._on_stop_recording)
-        button_row.addWidget(self._stop_btn)
+        copy_btn = QPushButton("Copy Report")
+        copy_btn.clicked.connect(self._copy_report)
+        button_row.addWidget(copy_btn)
+
+        if sys.platform.startswith("linux"):
+            copy_create_btn = QPushButton("Copy Create Broadcast Devices")
+            copy_create_btn.clicked.connect(
+                lambda: self._copy_text(
+                    "pactl load-module module-null-sink sink_name=JingleBroadcast sink_properties=device.description=\"Jingle Broadcast\"\n"
+                    "pactl load-module module-remap-source master=JingleBroadcast.monitor source_name=JingleMic source_properties=device.description=\"Jingle Mic\""
+                )
+            )
+            button_row.addWidget(copy_create_btn)
+
+            copy_delete_btn = QPushButton("Copy Delete Broadcast Devices")
+            copy_delete_btn.clicked.connect(
+                lambda: self._copy_text(
+                    "for id in $(pactl list short modules | awk '/module-remap-source/ && /source_name=JingleMic/ {print $1}'); do pactl unload-module \"$id\"; done\n"
+                    "for id in $(pactl list short modules | awk '/module-null-sink/ && /sink_name=JingleBroadcast/ {print $1}'); do pactl unload-module \"$id\"; done"
+                )
+            )
+            button_row.addWidget(copy_delete_btn)
+
+            copy_list_btn = QPushButton("Copy List Audio Devices")
+            copy_list_btn.clicked.connect(
+                lambda: self._copy_text("pactl list short sinks\npactl list short sources")
+            )
+            button_row.addWidget(copy_list_btn)
 
         button_row.addStretch()
 
         close_btn = QPushButton("Close")
-        close_btn.clicked.connect(self.reject)
+        close_btn.clicked.connect(self.accept)
         button_row.addWidget(close_btn)
-
         root.addLayout(button_row)
 
-        self.setFixedHeight(self.sizeHint().height())
+        self.refresh_report()
 
-        self.finished.connect(self._cleanup_meter_monitor)
-        self._start_meter_monitor()
-        self._timer.start(100)
+    def refresh_report(self) -> None:
+        self._report_edit.setPlainText(self._format_snapshot(self._snapshot_provider()))
 
-    def _on_start_recording(self) -> None:
-        """Start recording audio."""
-        import tempfile
+    def _copy_report(self) -> None:
+        self._copy_text(self._report_edit.toPlainText())
 
-        try:
-            # Create temp file for recording
-            temp_fd, temp_path = tempfile.mkstemp(suffix=".wav")
-            import os
-
-            os.close(temp_fd)
-            self._recorded_path = Path(temp_path)
-
-            # Avoid opening two input streams on the same device at once.
-            self._stop_meter_monitor()
-            with self._meter_monitor_lock:
-                self._meter_monitor_peak = 0.0
-
-            error = self._engine.start_recording(
-                self._recorded_path,
-                self._config,
-                metrics_callback=self._on_metrics_update,
-            )
-
-            if error:
-                self._status_label.setText(f"Error: {error}")
-                self._recorded_path = None
-                self._start_meter_monitor()
-                return
-
-            self._start_btn.setEnabled(False)
-            self._stop_btn.setEnabled(True)
-            self._status_label.setText("Recording...")
-            self._status_label.setStyleSheet("color: #080;")
-
-        except Exception as e:
-            self._status_label.setText(f"Error: {str(e)}")
-            self._recorded_path = None
-            self._start_meter_monitor()
-
-    def changeEvent(self, event: QEvent | None) -> None:
-        if event is not None and event.type() == QEvent.Type.WindowStateChange:
-            if self.isMinimized():
-                self._enter_minimized_low_power_mode()
-            else:
-                self._exit_minimized_low_power_mode()
-        super().changeEvent(event)
-
-    def _on_stop_recording(self) -> None:
-        """Stop recording audio."""
-        self._engine.stop_recording()
-
-        # Check for errors
-        error = self._engine.get_latest_error()
-        if error:
-            self._status_label.setText(f"Error: {error}")
-            self._status_label.setStyleSheet("color: #800;")
-            if self._recorded_path and self._recorded_path.exists():
-                self._recorded_path.unlink()
-                self._recorded_path = None
-        else:
-            if self._recorded_path is not None and self._recorded_path.exists():
-                self.recording_ready.emit(
-                    str(self._recorded_path),
-                    self.should_prompt_filename_on_stop(),
-                )
-            self._recorded_path = None
-
-        self._reset_ready_state()
-
-    def _on_metrics_update(self, metrics) -> None:
-        """Callback from recording engine with metrics."""
-        pass
-
-    def _on_update_metrics(self) -> None:
-        """Poll and update metrics display."""
-        metrics = self._engine.get_latest_metrics() if self._engine.is_recording() else None
-        if metrics is not None:
-            # Update duration
-            minutes, seconds = divmod(int(metrics.current_seconds), 60)
-            hours, minutes = divmod(minutes, 60)
-            self._duration_label.setText(f"{hours:02d}:{minutes:02d}:{seconds:02d}")
-
-            self._apply_peak_level(float(metrics.peak_level))
+    def _copy_text(self, text: str) -> None:
+        app = QApplication.instance()
+        if app is None:
             return
-
-        # Idle mode metering: keep showing live input level when not recording.
-        with self._meter_monitor_lock:
-            peak_level = self._meter_monitor_peak
-        self._apply_peak_level(peak_level)
-
-    def _apply_peak_level(self, raw_peak: float) -> None:
-        peak_level = max(0.0, min(1.0, float(raw_peak)))
-        peak_percent = int(peak_level * 100)
-        self._peak_meter.setValue(peak_percent)
-        if peak_level <= 0.0:
-            self._peak_label.setText("-inf dB")
+        clipboard = app.clipboard()
+        if clipboard is None:
             return
-        dbfs = 20.0 * math.log10(peak_level)
-        self._peak_label.setText(f"{dbfs:.1f} dB")
+        clipboard.setText(text)
 
-    def _start_meter_monitor(self) -> None:
-        if self._minimized_low_power_active:
-            return
-        if self._meter_monitor_thread is not None and self._meter_monitor_thread.is_alive():
-            return
+    def _format_snapshot(self, snapshot: dict[str, Any]) -> str:
+        def fmt_value(value: Any, *, empty: str = "(none)") -> str:
+            text = str(value).strip() if value is not None else ""
+            return text if text else empty
 
-        self._meter_monitor_stop.clear()
+        def fmt_list(values: list[str], *, empty: str = "(none)") -> str:
+            if not values:
+                return empty
+            return "\n".join(f"- {value}" for value in values)
 
-        def _run_monitor() -> None:
-            try:
-                import sounddevice as sd
-            except Exception:
-                return
-
-            def _audio_callback(indata, _frames, _time_info, _status) -> None:
-                try:
-                    peak = float(abs(indata).max())
-                except Exception:
-                    peak = 0.0
-                with self._meter_monitor_lock:
-                    self._meter_monitor_peak = peak
-
-            try:
-                with sd.InputStream(
-                    device=self._config.device_id,
-                    samplerate=self._config.sample_rate,
-                    channels=self._config.channels,
-                    blocksize=self._config.blocksize,
-                    callback=_audio_callback,
-                ):
-                    while not self._meter_monitor_stop.wait(0.1):
-                        pass
-            except Exception:
-                with self._meter_monitor_lock:
-                    self._meter_monitor_peak = 0.0
-
-        self._meter_monitor_thread = threading.Thread(target=_run_monitor, daemon=True)
-        self._meter_monitor_thread.start()
-
-    def _stop_meter_monitor(self) -> None:
-        self._meter_monitor_stop.set()
-        if self._meter_monitor_thread is not None:
-            self._meter_monitor_thread.join(timeout=1.0)
-        self._meter_monitor_thread = None
-
-    def _cleanup_meter_monitor(self, _result: int) -> None:
-        self._timer.stop()
-        self._stop_meter_monitor()
-
-    def _reset_ready_state(self) -> None:
-        self._start_btn.setEnabled(True)
-        self._stop_btn.setEnabled(False)
-        self._duration_label.setText("00:00:00")
-        self._status_label.setText("Ready to record")
-        self._status_label.setStyleSheet("color: #666;")
-        if not self._engine.is_recording():
-            self._start_meter_monitor()
-
-    def _enter_minimized_low_power_mode(self) -> None:
-        if self._minimized_low_power_active:
-            return
-        self._minimized_low_power_active = True
-        self._timer.stop()
-        if not self._engine.is_recording():
-            self._stop_meter_monitor()
-
-    def _exit_minimized_low_power_mode(self) -> None:
-        if not self._minimized_low_power_active:
-            return
-        self._minimized_low_power_active = False
-        if not self._engine.is_recording():
-            self._start_meter_monitor()
-        if not self._timer.isActive():
-            self._timer.start(100)
-
-    def recorded_file_path(self) -> Path | None:
-        """Return path to recorded file if recording was successful."""
-        return self._recorded_path if self._recorded_path and self._recorded_path.exists() else None
-
-    def should_prompt_filename_on_stop(self) -> bool:
-        return self._prompt_filename_on_stop_checkbox.isChecked()
-
-    def sync_recording_settings(
-        self,
-        recording_device: str | None,
-        use_wasapi_loopback: bool,
-        prompt_filename_on_stop: bool,
-    ) -> None:
-        self._config.device_id = recording_device or None
-        self._config.use_wasapi_loopback = use_wasapi_loopback
-        self._device_label.setText(recording_device or "Default")
-        self._prompt_filename_on_stop_checkbox.setChecked(prompt_filename_on_stop)
-
-        # If actively recording, keep the current stream stable and apply on next take.
-        if self._engine.is_recording():
-            return
-
-        # Apply the device change immediately to idle metering.
-        self._stop_meter_monitor()
-        with self._meter_monitor_lock:
-            self._meter_monitor_peak = 0.0
-        self._start_meter_monitor()
+        sections = [
+            "Current State",
+            f"- Mixer: {fmt_value(snapshot.get('mixer_status'), empty='Unknown')}",
+            f"- Active route: {fmt_value(snapshot.get('active_output_route'))}",
+            f"- Live device setting: {fmt_value(snapshot.get('live_output_setting'), empty='System Default')}",
+            f"- Preview device setting: {fmt_value(snapshot.get('preview_output_setting'), empty='System Default')}",
+            f"- Broadcast device setting: {fmt_value(snapshot.get('broadcast_output_setting'), empty='(disabled)')}",
+            f"- Mixer microphone setting: {fmt_value(snapshot.get('microphone_setting'), empty='System Default')}",
+            f"- Qt playback device: {fmt_value(snapshot.get('qt_output_device'))}",
+            f"- PortAudio output route: {fmt_value(snapshot.get('portaudio_output_device'))}",
+            f"- PortAudio input route: {fmt_value(snapshot.get('portaudio_input_device'))}",
+            "",
+            "Warnings",
+            fmt_list(list(snapshot.get('warnings', []))),
+            "",
+            "Virtual / Loopback Candidates",
+            fmt_list(list(snapshot.get('virtual_candidates', []))),
+            "",
+            "Qt Output Devices",
+            fmt_list(list(snapshot.get('qt_output_devices', []))),
+            "",
+            "Qt Input Devices",
+            fmt_list(list(snapshot.get('qt_input_devices', []))),
+            "",
+            "PortAudio Output Devices",
+            fmt_list(list(snapshot.get('portaudio_output_devices', []))),
+            "",
+            "PortAudio Input Devices",
+            fmt_list(list(snapshot.get('portaudio_input_devices', []))),
+            "",
+            "Linux Virtual Sink Assistant",
+            fmt_list(list(snapshot.get('linux_assistant', []))),
+            "",
+            "Broadcast Workflow",
+            "- Pick a [Virtual] Broadcast Device in Options when sending mixer audio to Discord, OBS, or a loopback sink.",
+            "- On Linux, create both the sink and the Jingle Mic remapped source, then select Jingle Mic in Discord or other chat apps.",
+            "- Audacity can usually record from either Jingle Mic or the raw JingleBroadcast.monitor source.",
+            "- Use Refresh after changing audio devices or mixer settings.",
+        ]
+        return "\n".join(sections)
 
 
 class KeyboardShortcutsDialog(QDialog):

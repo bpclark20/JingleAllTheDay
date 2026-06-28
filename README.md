@@ -14,13 +14,13 @@ Desktop jingle browser for quickly categorizing and finding samples in a selecte
 
 ## Default sample folder
 
-The app starts with:
+On first launch, the app prompts you to choose the folder that contains your jingles and samples.
 
-`C:\Users\brian\Documents\GoXLR\Samples`
-
-You can change the folder from the GUI, and that choice is remembered.
+That choice is remembered for later launches, so you can point it at whatever folder layout makes sense on Windows or Linux.
 
 ## Install
+
+Windows:
 
 ```powershell
 python -m venv .venv
@@ -28,17 +28,42 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
+Linux:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
 ## Run
+
+Windows:
 
 ```powershell
 python app.py
 ```
 
-## Build Reference
+Linux:
 
-For a dedicated guide on build and installer inputs/outputs, parameters, defaults, and examples, see:
+```bash
+python3 app.py
+```
 
-- [BUILDING.md](BUILDING.md)
+## Platform Support
+
+- Windows: fully supported, including Windows-native hotkey fallback and installer workflow.
+- Linux (X11): supported; preferred Linux session type for global hotkey reliability.
+- Linux (Wayland): best-effort support. Global keyboard hooks may be restricted by compositor security policies.
+
+Linux runtime packages (Debian/Ubuntu variants):
+
+```bash
+sudo apt update
+sudo apt install -y libportaudio2 libsndfile1
+```
+
+These packages are required for the low-latency sample-pad audio backend (`sounddevice`/PortAudio).
 
 ## Build EXE
 
@@ -63,6 +88,19 @@ Or use the helper script in this repo, which flattens output into `dist\`:
 ```
 
 That script places `JingleAllTheDay.exe` and `_internal\` directly under `dist\`.
+
+## Build on Linux
+
+Use the Linux build helper from a virtual environment:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install pyinstaller
+bash ./build_linux.sh
+```
+
+The Linux helper uses the same `JingleAllTheDay.spec` file and writes a one-folder bundle to `dist/JingleAllTheDay/`.
 
 ## Build Installer (Windows)
 
@@ -114,17 +152,17 @@ The packaged EXE does not require Python to be installed on the target system. P
 
 Things that can still matter on the target machine:
 
-- A working Windows audio device and drivers.
+- A working audio device and drivers/backends for the host OS.
 - Permission to read the user's jingle/sample folders.
-- The `%APPDATA%` location, where the tag database is stored.
+- Writable app-data location for settings and library metadata.
 - `ffprobe` is optional. If it is not present, playback still works, but duration detection for some non-WAV formats may be less accurate.
 
 The current build spec is stored in `JingleAllTheDay.spec`.
 
 ## Notes
 
-- Metadata is saved to `%APPDATA%\JingleAllTheDay\jingle-library.json`.
-- Settings are saved to `%APPDATA%\JingleAllTheDay\settings.ini`.
+- Metadata is saved under the OS app-data folder used by Qt (`QStandardPaths.AppDataLocation`) as `jingle-library.json`.
+- Settings are saved under the same app-data folder as `settings.ini`.
 - In table edits and bulk fields, use comma or semicolon separated tags.
 	- Example categories: `Holiday, Radio, Comedy`
 - Category filtering supports multiple tags at once using comma-separated input.

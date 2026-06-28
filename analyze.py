@@ -1,8 +1,20 @@
-import wave, struct, math
-import sys
-import os
+from __future__ import annotations
 
-def analyze_wav(path, label):
+import argparse
+import math
+import os
+import struct
+import wave
+from pathlib import Path
+
+
+DEFAULT_SAMPLE_FILES = (
+    "Dean Scream - 4 Perfect Loops.wav",
+    "Dean Scream - 4 Loops From App.wav",
+)
+
+
+def analyze_wav(path: Path, label: str) -> None:
     print(f"\nChecking file: {path}")
     if not os.path.exists(path):
         print(f"File not found: {path}")
@@ -62,6 +74,35 @@ def analyze_wav(path, label):
         jump = abs(at - before)
         print(f"    Boundary {loop_num}: sample[{boundary-1}]={before:.4f}  sample[{boundary}]={at:.4f}  jump={jump:.4f}")
 
-base = r"C:\Users\brian\Documents\GitHub\JingleAllTheDay"
-analyze_wav(os.path.join(base, "Dean Scream - 4 Perfect Loops.wav"), "Dean Scream - 4 Perfect Loops (Reference)")
-analyze_wav(os.path.join(base, "Dean Scream - 4 Loops From App.wav"), "Dean Scream - 4 Loops From App (Loopback Recording)")
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Inspect WAV files and print loop-quality diagnostics.")
+    parser.add_argument(
+        "--base-dir",
+        type=Path,
+        default=Path(__file__).resolve().parent,
+        help="Directory containing the sample WAV files.",
+    )
+    parser.add_argument(
+        "files",
+        nargs="*",
+        type=Path,
+        help="Optional explicit WAV file paths. Relative paths are resolved against --base-dir.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+    if args.files:
+        wav_paths = [path if path.is_absolute() else args.base_dir / path for path in args.files]
+    else:
+        wav_paths = [args.base_dir / name for name in DEFAULT_SAMPLE_FILES]
+
+    labels = [path.name for path in wav_paths]
+    for path, label in zip(wav_paths, labels, strict=False):
+        analyze_wav(path, label)
+
+
+if __name__ == "__main__":
+    main()

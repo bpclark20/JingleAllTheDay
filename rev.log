@@ -1,3 +1,7 @@
+## 1.8.0.062726
+- Began Cross-platform support for Linux, with initial testing on Kubuntu.
+- Added a feature that will give the user commands to create a virtual audio device/sink for use with Discord/Audacity. The program will mix the microphone input (selected in settings) with the jingle output and send it to the virtual device, which can then be selected as an input.
+
 ## 1.7.2.061826
 - Various Record Jingle window improvements:
 	- Recording meter always runs regardless of recording state to provide visual feedback on input levels and clipping.

@@ -3,8 +3,7 @@ param(
     [string]$SourceDir = "",
     [string]$ScriptPath = (Join-Path $PSScriptRoot "installer.iss"),
     [string]$AppVersion = "",
-    [string]$OutputDir = (Join-Path $PSScriptRoot "installer"),
-    [string]$IsccPath = ""
+    [string]$OutputDir = (Join-Path $PSScriptRoot "installer")
 )
 
 $ErrorActionPreference = "Stop"
@@ -145,20 +144,10 @@ if ($env:ChocolateyInstall -and (Test-Path $env:ChocolateyInstall)) {
 }
 
 $isccPath = $null
-
-if (-not [string]::IsNullOrWhiteSpace($IsccPath)) {
-    if (-not (Test-Path $IsccPath)) {
-        throw "Provided -IsccPath does not exist: $IsccPath"
-    }
-    $isccPath = (Resolve-Path $IsccPath).Path
-}
-
-if (-not $isccPath) {
-    foreach ($candidate in $isccCandidates) {
-        if ($candidate -and (Test-Path $candidate)) {
-            $isccPath = $candidate
-            break
-        }
+foreach ($candidate in $isccCandidates) {
+    if ($candidate -and (Test-Path $candidate)) {
+        $isccPath = $candidate
+        break
     }
 }
 

@@ -223,14 +223,6 @@ class MainWindowLibraryMixin:
             QApplication.restoreOverrideCursor()
             self._is_rescanning = False
 
-    def _searchable_path_text(self, path: Path) -> str:
-        if self._samples_dir is not None:
-            try:
-                return str(path.relative_to(self._samples_dir))
-            except ValueError:
-                pass
-        return str(path)
-
     def _apply_filters(self) -> None:
         query = self._search_edit.text().strip().casefold()
         scope_data = self._search_scope_combo.currentData()
@@ -258,13 +250,13 @@ class MainWindowLibraryMixin:
                 elif search_scope == "tag":
                     haystack = _tags_to_text(record.categories).casefold()
                 elif search_scope == "path":
-                    haystack = self._searchable_path_text(record.path).casefold()
+                    haystack = str(record.path).casefold()
                 else:
                     haystack = " ".join(
                         [
                             record.name,
                             _tags_to_text(record.categories),
-                            self._searchable_path_text(record.path),
+                            str(record.path),
                         ]
                     ).casefold()
                 if query not in haystack:

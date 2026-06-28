@@ -7,7 +7,8 @@ import sys
 import ctypes
 import json
 import math
-import re
+import os
+import shutil
 import threading
 from pathlib import Path
 from typing import Any, Callable
@@ -26,7 +27,14 @@ from app_helpers import (
     runtime_app_dir as _runtime_app_dir,
     tags_to_text as _tags_to_text,
 )
-from dialogs import AboutDialog, OptionsDialog, RecordingDialog, SAMPLE_PAD_BLOCKSIZE_OPTIONS
+from dialogs import (
+    AboutDialog,
+    AudioDiagnosticsDialog,
+    OptionsDialog,
+    SAMPLE_PAD_BLOCKSIZE_OPTIONS,
+    format_audio_device_label as _format_audio_device_label,
+    is_virtual_audio_device_name as _is_virtual_audio_device_name,
+)
 from mainwindow_file_edit_mixin import MainWindowFileEditMixin
 from mainwindow_library_mixin import MainWindowLibraryMixin
 from mainwindow_menu_mixin import MainWindowMenuMixin
@@ -127,6 +135,13 @@ _MOD_NOREPEAT = 0x4000
 _MOD_ALT = 0x0001
 _MOD_CONTROL = 0x0002
 _MOD_SHIFT = 0x0004
+
+
+def _is_wayland_session() -> bool:
+    session_type = os.environ.get("XDG_SESSION_TYPE", "").strip().lower()
+    if session_type == "wayland":
+        return True
+    return bool(os.environ.get("WAYLAND_DISPLAY", "").strip())
 
 
 class _WindowsHotkeyEventFilter(QAbstractNativeEventFilter):
@@ -245,6 +260,22 @@ class MainWindow(
         self._settings = self._create_settings_store()
         self._output_device = str(self._settings.value("options/outputDevice", "")).strip()
         self._preview_output_device = str(self._settings.value("options/previewOutputDevice", "")).strip()
+        self._broadcast_output_device = str(
+            self._settings.value("options/broadcastOutputDevice", "")
+        ).strip()
+        self._mixer_enabled = (
+            str(self._settings.value("options/mixerEnabled", "false")).strip().lower() == "true"
+        )
+        self._microphone_input_device = str(
+            self._settings.value("options/microphoneInputDevice", "")
+        ).strip()
+        try:
+            self._microphone_gain_percent = int(
+                self._settings.value("options/microphoneGainPercent", 100)
+            )
+        except (TypeError, ValueError):
+            self._microphone_gain_percent = 100
+        self._microphone_gain_percent = max(0, min(200, self._microphone_gain_percent))
         self._live_volume_percent = _coerce_volume_percent(
             self._settings.value("options/liveVolumePercent", 100)
         )
@@ -260,6 +291,7 @@ class MainWindow(
         self._sample_pads_last_layout_path = str(
             self._settings.value("samplePads/lastLayoutPath", "")
         ).strip()
+        self._audio_diagnostics_dialog: AudioDiagnosticsDialog | None = None
         self._sample_pad_global_hotkeys_enabled = (
             str(self._settings.value("samplePads/globalHotkeysEnabled", "false")).strip().lower()
             == "true"
@@ -281,6 +313,7 @@ class MainWindow(
         self._sample_pad_hotkey_backend = "none"
         self._sample_pad_win_filter: _WindowsHotkeyEventFilter | None = None
         self._sample_pad_hotkey_id_to_pad: dict[int, int] = {}
+        self._sample_pad_backend_warning_shown = False
         self._sample_pad_looping: bool = False
         self._sample_pad_release_looping: bool = False
         self._sample_pad_native_looping: bool = False
@@ -291,7 +324,12 @@ class MainWindow(
         self._main_playback_meter_loading: bool = False
         # Low-latency engine used for live-mode sample pad playback
         self._sp_engine: _SamplePadAudioEngine = _SamplePadAudioEngine()
+        self._sp_monitor_engine: _SamplePadAudioEngine = _SamplePadAudioEngine()
         self._sp_engine.set_streaming_min_seconds(self._sample_pad_streaming_min_seconds)
+        self._sp_engine.set_mixer_enabled(self._mixer_enabled)
+        self._sp_engine.set_input_gain(self._microphone_gain_percent / 100.0)
+        self._sp_monitor_engine.set_streaming_min_seconds(self._sample_pad_streaming_min_seconds)
+        self._sp_monitor_engine.set_mixer_enabled(False)
         self._sample_pads_dirty: bool = False
         self._sample_pads_last_saved_signature: str = ""
         self._sample_pads_autosave_in_progress: bool = False
@@ -299,14 +337,6 @@ class MainWindow(
         self._auto_folder_tags: bool = self._load_auto_folder_tags()
         self._auto_generate_waveforms: bool = self._load_auto_generate_waveforms()
         self._watch_library_changes: bool = self._load_watch_library_changes()
-        self._recording_input_device: str = str(self._settings.value("recording/inputDevice", "")).strip()
-        self._recording_output_folder: Path | None = self._load_recording_output_folder()
-        self._use_wasapi_loopback: bool = (
-            str(self._settings.value("recording/useWasapiLoopback", "false")).strip().lower() == "true"
-        )
-        self._recording_prompt_filename_on_stop: bool = (
-            str(self._settings.value("recording/promptFilenameOnStop", "false")).strip().lower() == "true"
-        )
         self._default_keyboard_shortcuts = dict(DEFAULT_KEYBOARD_SHORTCUTS)
         self._keyboard_shortcuts = self._load_keyboard_shortcuts()
 
@@ -323,6 +353,8 @@ class MainWindow(
 
         self._player: QMediaPlayer | None = None
         self._audio_output: QAudioOutput | None = None
+        self._broadcast_player: QMediaPlayer | None = None
+        self._broadcast_audio_output: QAudioOutput | None = None
         self._is_muted = False
         self._slider_pressed = False
         self._playback_mode = "off"
@@ -348,6 +380,10 @@ class MainWindow(
             self._player = QMediaPlayer(self)
             self._audio_output = QAudioOutput(self)
             self._player.setAudioOutput(self._audio_output)
+            self._broadcast_player = QMediaPlayer(self)
+            self._broadcast_audio_output = QAudioOutput(self)
+            self._broadcast_player.setAudioOutput(self._broadcast_audio_output)
+            self._apply_output_device()
 
         central = QWidget(self)
         self._central_widget = central
@@ -540,23 +576,13 @@ class MainWindow(
         self._sample_pads_btn.clicked.connect(self._on_sample_pads_btn_clicked)
         playback_row.addWidget(self._sample_pads_btn)
 
-        # --- Sequencer Feature ---
-        self._sequencer_window = None
-        self._sequencer_btn = QPushButton("Show Sequencer")
-        self._sequencer_btn.setCheckable(True)
-        self._sequencer_btn.setToolTip("Show or hide the Sequencer window")
-        self._sequencer_btn.clicked.connect(self._on_sequencer_btn_clicked)
-        playback_row.addWidget(self._sequencer_btn)
-
         self._refresh_volume_controls()
         root.addLayout(playback_row)
 
         self._status = QStatusBar(self)
         self.setStatusBar(self._status)
-
-        if _has_qt_multimedia:
-            self._reconcile_saved_output_devices()
-            self._apply_output_device()
+        self._apply_output_device()
+        self._apply_mixer_input_device(notify_errors=False)
 
         self._library_watcher = QFileSystemWatcher(self)
         self._library_watcher.directoryChanged.connect(self._on_library_watch_path_changed)
@@ -614,46 +640,52 @@ class MainWindow(
             release_mode = pad_mode in ("release_os", "release_l", "release")
             release_loops_at_end = pad_mode in ("release_l", "release")
             loop = (pad_mode == "loop") or release_loops_at_end
+            local_target = (
+                self._output_device
+                if is_live_mode
+                else (self._preview_output_device if self._can_use_preview_mode() else self._output_device)
+            )
+            local_ok = self._trigger_sample_pad_engine(
+                self._sp_monitor_engine,
+                local_target,
+                jingle_data['path'],
+                clip_start,
+                clip_stop,
+                loop,
+                pad_index,
+                pad_volume_percent,
+                pad_pan_percent,
+                pad_is_muted,
+                pad_is_solo,
+                notify_errors=True,
+            )
+
             if is_live_mode:
-                target_device = self._output_device
-            else:
-                target_device = self._preview_output_device if self._can_use_preview_mode() else self._output_device
-            try:
-                stream_needs_reopen = (
-                    self._sp_engine._stream_device != target_device
-                    or self._sp_engine._stream_blocksize != self._sample_pad_blocksize
-                )
-                self._sp_engine.set_device(
-                    target_device,
-                    blocksize=self._sample_pad_blocksize,
-                )
-                if stream_needs_reopen:
-                    # Stream just (re)opened — preload all pads at the new
-                    # samplerate so subsequent triggers are instantaneous.
-                    self._sp_engine_preload_all_pads()
-                self._sync_sample_pad_engine_gain()
-                if pad_index >= 0:
-                    self._sp_engine.set_pad_mix(
+                broadcast_target = self._resolved_mixer_output_device()
+                if (
+                    broadcast_target
+                    and self._normalize_device_key(broadcast_target)
+                    != self._normalize_device_key(local_target)
+                ):
+                    self._trigger_sample_pad_engine(
+                        self._sp_engine,
+                        broadcast_target,
+                        jingle_data['path'],
+                        clip_start,
+                        clip_stop,
+                        loop,
                         pad_index,
                         pad_volume_percent,
                         pad_pan_percent,
                         pad_is_muted,
                         pad_is_solo,
+                        notify_errors=False,
                     )
-                self._sp_engine.trigger(
-                    path=jingle_data['path'],
-                    volume=1.0,
-                    clip_start_seconds=clip_start,
-                    clip_stop_seconds=clip_stop,
-                    loop=loop,
-                    pad_index=pad_index,
-                )
-            except Exception as exc:
-                self._status.showMessage(f"Audio engine error: {exc}")
+
+            if local_ok:
+                name = jingle_data.get('name', Path(jingle_data['path']).name)
+                self._status.showMessage(f"Playing: {name}")
                 return
-            name = jingle_data.get('name', Path(jingle_data['path']).name)
-            self._status.showMessage(f"Playing: {name}")
-            return
 
         # ------------------------------------------------------------------
         # Preview mode (or engine unavailable): use QMediaPlayer as before.
@@ -703,6 +735,58 @@ class MainWindow(
                     self._player.setPosition(max(0, int(round(clip_start * 1000.0))))
                 self._player.play()
                 self._status.showMessage(f"Playing: {jingle_data.get('name', jingle_data['path'])}")
+
+    def _trigger_sample_pad_engine(
+        self,
+        engine: _SamplePadAudioEngine,
+        target_device: str,
+        path: str,
+        clip_start: float,
+        clip_stop: float,
+        loop: bool,
+        pad_index: int,
+        pad_volume_percent: int,
+        pad_pan_percent: int,
+        pad_is_muted: bool,
+        pad_is_solo: bool,
+        *,
+        notify_errors: bool,
+    ) -> bool:
+        try:
+            stream_needs_reopen = (
+                engine._stream_device != target_device
+                or engine._stream_blocksize != self._sample_pad_blocksize
+            )
+            engine.set_device(
+                target_device,
+                blocksize=self._sample_pad_blocksize,
+            )
+            if stream_needs_reopen:
+                self._sp_engine_preload_all_pads()
+            self._sync_sample_pad_engine_gain()
+            if pad_index >= 0:
+                engine.set_pad_mix(
+                    pad_index,
+                    pad_volume_percent,
+                    pad_pan_percent,
+                    pad_is_muted,
+                    pad_is_solo,
+                )
+            engine.trigger(
+                path=path,
+                volume=1.0,
+                clip_start_seconds=clip_start,
+                clip_stop_seconds=clip_stop,
+                loop=loop,
+                pad_index=pad_index,
+            )
+            return True
+        except Exception as exc:
+            if notify_errors:
+                self._status.showMessage(
+                    f"Sample pad low-latency routing unavailable ({exc}); using standard playback path."
+                )
+            return False
 
     def _record_for_sample_pad_jingle(self, jingle_data: dict[str, Any]) -> JingleRecord | None:
         path_text = str(jingle_data.get("path", "")).strip()
@@ -766,6 +850,7 @@ class MainWindow(
         """Stop playback from a sample pad (used by Release mode)."""
         if _sp_engine_mod.is_available():
             self._sp_engine.stop(None if pad_index == -1 else pad_index)
+            self._sp_monitor_engine.stop(None if pad_index == -1 else pad_index)
             return
 
         # Only stop if this pad currently owns playback; ignore stale releases
@@ -787,6 +872,7 @@ class MainWindow(
         """Stop all currently active sample-pad playback voices."""
         if _sp_engine_mod.is_available():
             self._sp_engine.stop(None)
+            self._sp_monitor_engine.stop(None)
             self._status.showMessage("All sample pad playback stopped.")
             return
         self.stop_sample_pad_jingle(-1)
@@ -803,6 +889,13 @@ class MainWindow(
             return
         try:
             self._sp_engine.set_pad_mix(pad_index, volume_percent, pan_percent, is_muted, is_solo)
+            self._sp_monitor_engine.set_pad_mix(
+                pad_index,
+                volume_percent,
+                pan_percent,
+                is_muted,
+                is_solo,
+            )
         except Exception:
             return
 
@@ -810,7 +903,7 @@ class MainWindow(
         if not _sp_engine_mod.is_available():
             return {}
         try:
-            levels = self._sp_engine.meter_levels()
+            levels = self._sp_monitor_engine.meter_levels()
             if isinstance(levels, dict):
                 return levels
         except Exception:
@@ -839,7 +932,7 @@ class MainWindow(
         sample_right = 0.0
         if _sp_engine_mod.is_available():
             try:
-                levels = self._sp_engine.output_meter_levels()
+                levels = self._sp_monitor_engine.output_meter_levels()
                 if isinstance(levels, tuple) and len(levels) == 2:
                     sample_left = max(0.0, min(1.0, float(levels[0])))
                     sample_right = max(0.0, min(1.0, float(levels[1])))
@@ -859,6 +952,88 @@ class MainWindow(
             main_left, main_right = self._main_window_playback_meter_levels()
 
         return max(sample_left, main_left), max(sample_right, main_right)
+
+    def _current_mixer_status_text(self) -> str:
+        if not _sp_engine_mod.is_available():
+            return "Backend unavailable"
+        if not self._mixer_enabled:
+            return "Off"
+
+        try:
+            input_name = self._sp_engine.input_device_name().strip()
+            output_name = self._sp_engine.output_device_name().strip()
+            meter_left, meter_right = self._sp_engine.input_meter_levels()
+        except Exception:
+            return "State unavailable"
+
+        if not input_name:
+            return "Waiting for microphone"
+
+        meter_peak = max(float(meter_left), float(meter_right))
+        activity = "Active" if meter_peak >= 0.01 else "Idle"
+        level_percent = int(round(meter_peak * 100.0))
+        if output_name:
+            return f"{activity} {level_percent:02d}% | Mic {input_name} -> {output_name}"
+        return f"{activity} {level_percent:02d}% | Mic {input_name} -> No output route"
+
+    def _collect_qt_audio_device_names(self, *, inputs: bool) -> list[str]:
+        if not _has_qt_multimedia:
+            return []
+        names: list[str] = []
+        try:
+            devices = QMediaDevices.audioInputs() if inputs else QMediaDevices.audioOutputs()
+            for device in devices:
+                name = device.description().strip()
+                if name and name not in names:
+                    names.append(name)
+        except Exception:
+            return []
+        return names
+
+    def _collect_portaudio_device_names(self, *, inputs: bool) -> list[str]:
+        channel_key = "max_input_channels" if inputs else "max_output_channels"
+        names: list[str] = []
+        for dev in _sp_engine_mod.list_audio_devices(channel_key=channel_key):
+            name = str(dev.get("name", "")).strip()
+            if not name:
+                continue
+            channels = int(dev.get(channel_key, 0) or 0)
+            samplerate = int(round(float(dev.get("default_samplerate", 0.0) or 0.0)))
+            names.append(f"{name} | ch={channels} | {samplerate} Hz")
+        return names
+
+    def _audio_diagnostics_snapshot(self) -> dict[str, Any]:
+        qt_outputs = self._collect_qt_audio_device_names(inputs=False)
+        qt_inputs = self._collect_qt_audio_device_names(inputs=True)
+        portaudio_outputs = self._collect_portaudio_device_names(inputs=False)
+        portaudio_inputs = self._collect_portaudio_device_names(inputs=True)
+        virtual_candidates = self._audio_diagnostics_virtual_candidates()
+
+        qt_output_device = ""
+        if self._audio_output is not None and _has_qt_multimedia:
+            try:
+                qt_output_device = self._audio_output.device().description().strip()
+            except Exception:
+                qt_output_device = ""
+
+        return {
+            "mixer_status": self._current_mixer_status_text(),
+            "active_output_route": self._resolved_mixer_output_device(),
+            "live_output_setting": self._output_device,
+            "preview_output_setting": self._preview_output_device,
+            "broadcast_output_setting": self._broadcast_output_device,
+            "microphone_setting": self._microphone_input_device,
+            "qt_output_device": qt_output_device,
+            "portaudio_output_device": self._sp_engine.output_device_name(),
+            "portaudio_input_device": self._sp_engine.input_device_name(),
+            "qt_output_devices": [_format_audio_device_label(name) for name in qt_outputs],
+            "qt_input_devices": [_format_audio_device_label(name) for name in qt_inputs],
+            "portaudio_output_devices": portaudio_outputs,
+            "portaudio_input_devices": portaudio_inputs,
+            "virtual_candidates": virtual_candidates,
+            "warnings": self._broadcast_route_warnings(),
+            "linux_assistant": self._linux_virtual_sink_assistant(),
+        }
 
     def _sample_pad_mode_output_device_key(self, is_live_mode: bool) -> str:
         device_name = self._output_device
@@ -950,7 +1125,10 @@ class MainWindow(
         if pad_index < 0:
             return False
         if _sp_engine_mod.is_available():
-            return self._sp_engine.is_pad_playing(pad_index)
+            return (
+                self._sp_monitor_engine.is_pad_playing(pad_index)
+                or self._sp_engine.is_pad_playing(pad_index)
+            )
 
         if self._current_sample_pad_index != pad_index:
             return False
@@ -963,6 +1141,7 @@ class MainWindow(
         )
 
     def _on_sample_pads_btn_clicked(self):
+        self._show_sample_pad_backend_warning_if_needed()
         if self._sample_pads_btn.isChecked():
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             try:
@@ -982,66 +1161,25 @@ class MainWindow(
             self._autosave_sample_pad_layout()
             self._sample_pads_btn.setText("Show Sample Pads")
 
-    def _on_sequencer_btn_clicked(self) -> None:
-        """Toggle sequencer window visibility."""
-        if self._sequencer_btn.isChecked():
-            self._ensure_sequencer_window()
-            self._sequencer_window.show()
-            self._sequencer_window.raise_()
-            self._sequencer_window.activateWindow()
-            self._sequencer_btn.setText("Hide Sequencer")
-        else:
-            if self._sequencer_window:
-                self._sequencer_window.hide()
-            self._sequencer_btn.setText("Show Sequencer")
-
-    def _on_sequencer_window_closed(self) -> None:
-        """Handle sequencer window close."""
-        self._sequencer_btn.setChecked(False)
-        self._sequencer_btn.setText("Show Sequencer")
-
-    def _ensure_sequencer_window(self):
-        """Create sequencer window if it doesn't exist."""
-        if self._sequencer_window is None:
-            from sequencer_window import SequencerWindow
-
-            self._sequencer_window = SequencerWindow(
-                app_data_dir=self._app_data_dir,
-                sample_pad_audio_engine=self._sp_engine,
-                ensure_audio_ready=self._prepare_sequencer_audio_engine,
-                can_use_preview_mode=self._can_use_preview_mode,
-                parent=self,
-            )
-            self._sequencer_window.window_closed.connect(self._on_sequencer_window_closed)
-        return self._sequencer_window
-
-    def _prepare_sequencer_audio_engine(self, is_live_mode: bool) -> bool:
-        """Ensure the shared sample-pad engine stream is open before sequencer playback."""
-        if not _sp_engine_mod.is_available():
-            self._status.showMessage("Low-latency audio engine unavailable.")
-            return False
-
-        target_device = self._output_device
-        target_gain_percent = self._live_volume_percent
-        if not is_live_mode and self._can_use_preview_mode():
-            target_device = self._preview_output_device
-            target_gain_percent = self._preview_volume_percent
-
-        try:
-            self._sp_engine.set_device(
-                target_device,
-                blocksize=self._sample_pad_blocksize,
-            )
-            self._sp_engine.set_master_gain(target_gain_percent / 100.0)
-            return True
-        except Exception as exc:
-            self._status.showMessage(f"Sequencer audio setup failed: {exc}")
-            return False
-
     def _on_sample_pads_window_closed(self):
         self._autosave_sample_pad_layout()
         self._sample_pads_btn.setChecked(False)
         self._sample_pads_btn.setText("Show Sample Pads")
+
+    def _show_sample_pad_backend_warning_if_needed(self) -> None:
+        if _sp_engine_mod.is_available() or self._sample_pad_backend_warning_shown:
+            return
+        self._sample_pad_backend_warning_shown = True
+
+        message = (
+            "Sample pad low-latency audio backend is unavailable. "
+            "Sample pads will use the standard playback path instead."
+        )
+        if sys.platform.startswith("linux"):
+            message += "\n\nInstall system packages: libportaudio2 and libsndfile1."
+
+        self._status.showMessage(message)
+        QMessageBox.warning(self, "Sample Pad Audio Backend Unavailable", message)
 
     def _ensure_sample_pads_window(self) -> SamplePadsWindow:
         if self._sample_pads_window is None:
@@ -1182,17 +1320,18 @@ class MainWindow(
                     jobs.append(key)
         if not jobs:
             return
-        engine = self._sp_engine
-        sr = engine._stream_samplerate or 44100
-        ch = engine._stream_channels or 2
+        engines = [self._sp_monitor_engine, self._sp_engine]
 
         def _preload_worker():
-            for path, cs, ce in jobs:
-                try:
-                    engine.preload(path, samplerate=sr, channels=ch,
-                                   clip_start_seconds=cs, clip_stop_seconds=ce)
-                except Exception:
-                    pass
+            for engine in engines:
+                sr = engine._stream_samplerate or 44100
+                ch = engine._stream_channels or 2
+                for path, cs, ce in jobs:
+                    try:
+                        engine.preload(path, samplerate=sr, channels=ch,
+                                       clip_start_seconds=cs, clip_stop_seconds=ce)
+                    except Exception:
+                        pass
 
         import threading as _threading
         _threading.Thread(target=_preload_worker, daemon=True).start()
@@ -1207,21 +1346,22 @@ class MainWindow(
 
         record = self._record_for_sample_pad_jingle(jingle_data)
         cs, ce = self._resolved_sample_pad_clip_seconds(jingle_data, record)
-        engine = self._sp_engine
-        sr = engine._stream_samplerate or 44100
-        ch = engine._stream_channels or 2
+        engines = [self._sp_monitor_engine, self._sp_engine]
 
         def _preload_one() -> None:
-            try:
-                engine.preload(
-                    path,
-                    samplerate=sr,
-                    channels=ch,
-                    clip_start_seconds=cs,
-                    clip_stop_seconds=ce,
-                )
-            except Exception:
-                pass
+            for engine in engines:
+                sr = engine._stream_samplerate or 44100
+                ch = engine._stream_channels or 2
+                try:
+                    engine.preload(
+                        path,
+                        samplerate=sr,
+                        channels=ch,
+                        clip_start_seconds=cs,
+                        clip_stop_seconds=ce,
+                    )
+                except Exception:
+                    pass
 
         import threading as _threading
         _threading.Thread(target=_preload_one, daemon=True).start()
@@ -1270,16 +1410,27 @@ class MainWindow(
         )
         try:
             stream_needs_reopen = (
-                self._sp_engine._stream_device != target_device
-                or self._sp_engine._stream_blocksize != self._sample_pad_blocksize
+                self._sp_monitor_engine._stream_device != target_device
+                or self._sp_monitor_engine._stream_blocksize != self._sample_pad_blocksize
             )
-            self._sp_engine.set_device(
+            self._sp_monitor_engine.set_device(
                 target_device,
                 blocksize=self._sample_pad_blocksize,
             )
             self._sync_sample_pad_engine_gain()
             if stream_needs_reopen:
                 self._sp_engine_preload_all_pads()
+            if is_live_mode:
+                broadcast_target = self._resolved_mixer_output_device()
+                if (
+                    broadcast_target
+                    and self._normalize_device_key(broadcast_target)
+                    != self._normalize_device_key(target_device)
+                ):
+                    self._sp_engine.set_device(
+                        broadcast_target,
+                        blocksize=self._sample_pad_blocksize,
+                    )
         except Exception:
             # Playback path already handles/report errors at trigger time.
             pass
@@ -1318,9 +1469,10 @@ class MainWindow(
         global_hotkeys_available = _has_windows_native_hotkeys or _has_pynput
         if target_enabled and not global_hotkeys_available:
             target_enabled = False
-            self._status.showMessage(
-                "Global sample pad hotkeys unavailable on this system."
-            )
+            message = "Global sample pad hotkeys unavailable on this system."
+            if _is_wayland_session():
+                message += " On Wayland, desktop security rules may block global keyboard hooks."
+            self._status.showMessage(message)
 
         if target_enabled:
             self._start_sample_pad_global_hotkeys()
@@ -1357,7 +1509,10 @@ class MainWindow(
         self._settings.setValue("samplePads/globalHotkeysEnabled", "false")
         if self._sample_pads_window is not None:
             self._sample_pads_window.set_global_hotkeys_enabled(False)
-        self._status.showMessage("Could not start global hotkeys listener.")
+        message = "Could not start global hotkeys listener."
+        if _is_wayland_session():
+            message += " On Wayland, try X11 or ensure the listener backend is permitted."
+        self._status.showMessage(message)
 
     def _start_pynput_hotkeys(self) -> bool:
         if not _has_pynput or _pynput_keyboard is None:
@@ -1815,10 +1970,12 @@ class MainWindow(
         state = self._player.playbackState()
         if state == QMediaPlayer.PlaybackState.PlayingState:
             self._player.pause()
+            self._sync_broadcast_player_to_main()
             self._status.showMessage("Playback paused.")
             return
         if state == QMediaPlayer.PlaybackState.PausedState:
             self._player.play()
+            self._sync_broadcast_player_to_main()
             self._status.showMessage("Playback resumed.")
             return
         self._on_play_clicked()
@@ -1828,6 +1985,7 @@ class MainWindow(
             return
         if self._player.playbackState() == QMediaPlayer.PlaybackState.PausedState:
             self._player.play()
+            self._sync_broadcast_player_to_main()
             self._status.showMessage("Playback resumed.")
             return
         if self._player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
@@ -1838,6 +1996,7 @@ class MainWindow(
             return
         if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self._player.pause()
+            self._sync_broadcast_player_to_main()
             self._status.showMessage("Playback paused.")
 
     def _refresh_mute_button_state(self) -> None:
@@ -1861,6 +2020,11 @@ class MainWindow(
                 self._audio_output.setMuted(True)
             else:
                 self._audio_output.setMuted(muted)
+        if self._broadcast_audio_output is not None:
+            if self._clip_seek_muted_temporarily and not muted:
+                self._broadcast_audio_output.setMuted(True)
+            else:
+                self._broadcast_audio_output.setMuted(muted)
         self._refresh_mute_button_state()
 
     def _on_mute_clicked(self) -> None:
@@ -1916,14 +2080,59 @@ class MainWindow(
         mode_is_live = bool(self._sample_pads_window.is_live_mode)
         mode_percent = self._live_volume_percent if mode_is_live else self._preview_volume_percent
         try:
-            self._sp_engine.set_master_gain(mode_percent / 100.0)
+            self._sp_monitor_engine.set_master_gain(mode_percent / 100.0)
+        except Exception:
+            pass
+        try:
+            self._sp_engine.set_master_gain(self._live_volume_percent / 100.0)
         except Exception:
             pass
 
     def _apply_active_volume(self) -> None:
         if self._audio_output is None:
+            if self._broadcast_audio_output is None:
+                return
+        volume = self._active_volume_percent() / 100.0
+        if self._audio_output is not None:
+            self._audio_output.setVolume(volume)
+        if self._broadcast_audio_output is not None:
+            self._broadcast_audio_output.setVolume(volume)
+
+    def _broadcast_route_enabled(self) -> bool:
+        return bool(self._broadcast_output_device.strip())
+
+    def _sync_broadcast_player_to_main(self) -> None:
+        if (
+            self._player is None
+            or self._broadcast_player is None
+            or self._broadcast_audio_output is None
+        ):
             return
-        self._audio_output.setVolume(self._active_volume_percent() / 100.0)
+
+        if not self._broadcast_route_enabled():
+            self._broadcast_player.stop()
+            self._broadcast_player.setSource(QUrl())
+            return
+
+        source = self._player.source()
+        if source is None or source.isEmpty():
+            self._broadcast_player.stop()
+            return
+
+        if self._broadcast_player.source() != source:
+            self._broadcast_player.setSource(source)
+
+        main_pos = int(self._player.position())
+        if abs(int(self._broadcast_player.position()) - main_pos) > 150:
+            self._broadcast_player.setPosition(main_pos)
+
+        state = self._player.playbackState()
+        if state == QMediaPlayer.PlaybackState.PlayingState:
+            self._broadcast_player.play()
+        elif state == QMediaPlayer.PlaybackState.PausedState:
+            self._broadcast_player.pause()
+        else:
+            self._broadcast_player.stop()
 
     def _refresh_volume_controls(self) -> None:
         if not hasattr(self, "_volume_slider"):
@@ -2094,28 +2303,15 @@ class MainWindow(
         super().keyReleaseEvent(event)
 
     def closeEvent(self, event: QEvent | None) -> None:
-        if self._sequencer_window is not None:
-            try:
-                if not self._sequencer_window.confirm_close_for_application():
-                    if event is not None:
-                        event.ignore()
-                    return
-            except Exception:
-                pass
         self._autosave_sample_pad_layout()
         if self._sample_pads_window is not None:
             try:
                 self._sample_pads_window.close()
             except Exception:
                 pass
-        if self._sequencer_window is not None:
-            try:
-                self._sequencer_window.prepare_for_application_close()
-                self._sequencer_window.close()
-            except Exception:
-                pass
         self._stop_sample_pad_global_hotkeys()
         self._sp_engine.close()
+        self._sp_monitor_engine.close()
         super().closeEvent(event)
 
     def _skip_to_previous(self) -> None:
@@ -2259,6 +2455,17 @@ class MainWindow(
         )
         dialog.exec()
 
+    def _on_help_audio_diagnostics(self) -> None:
+        if self._audio_diagnostics_dialog is None:
+            self._audio_diagnostics_dialog = AudioDiagnosticsDialog(
+                snapshot_provider=self._audio_diagnostics_snapshot,
+                parent=self,
+            )
+        self._audio_diagnostics_dialog.refresh_report()
+        self._audio_diagnostics_dialog.show()
+        self._audio_diagnostics_dialog.raise_()
+        self._audio_diagnostics_dialog.activateWindow()
+
     def _connect_player_signals(self) -> None:
         if self._player is None:
             self._play_btn.setEnabled(False)
@@ -2294,19 +2501,6 @@ class MainWindow(
     def _save_samples_dir(self) -> None:
         if self._samples_dir is not None:
             self._settings.setValue("library/samplesDir", str(self._samples_dir))
-
-    def _load_recording_output_folder(self) -> Path | None:
-        raw = str(self._settings.value("recording/outputFolder", "")).strip()
-        if raw:
-            candidate = Path(raw)
-            if candidate.exists() and candidate.is_dir():
-                return candidate
-        return None
-
-    def _save_recording_output_folder(self) -> None:
-        if self._recording_output_folder is not None:
-            self._settings.setValue("recording/outputFolder", str(self._recording_output_folder))
-            self._settings.sync()  # Force flush to disk
 
     def _load_auto_folder_tags(self) -> bool:
         return str(self._settings.value("library/autoFolderTags", "")).strip().lower() == "true"
@@ -2522,11 +2716,6 @@ class MainWindow(
         edit_jingle_action.triggered.connect(self._on_edit_jingle)
 
         menu.addSeparator()
-        # --- Sequencer track assignment ---
-        send_to_seq_action = menu.addAction("Send to Sequencer as New Track")
-        send_to_seq_action.setEnabled(selected_count == 1)
-        send_to_seq_action.triggered.connect(self._on_send_selected_to_sequencer)
-        menu.addSeparator()
 
         # --- Sample Pad assignment ---
         pads_window = self._ensure_sample_pads_window()
@@ -2588,10 +2777,6 @@ class MainWindow(
         rename_action.setEnabled(selected_count == 1)
         rename_action.triggered.connect(self._on_edit_rename)
 
-        move_action = menu.addAction("Move To...")
-        move_action.setEnabled(selected_count == 1)
-        move_action.triggered.connect(self._on_edit_move_to)
-
         delete_action = menu.addAction("Delete")
         delete_action.setEnabled(selected_count > 0)
         delete_action.triggered.connect(self._on_edit_delete)
@@ -2640,53 +2825,6 @@ class MainWindow(
             self._sample_pads_window.assign_jingle_to_board_pad(board_index, pad_index, jingle_data)
         # Preload the newly assigned audio so the first trigger is instant.
         self._sp_engine_preload_all_pads()
-
-    def _on_send_selected_to_sequencer(self) -> None:
-        """Add selected jingle as a new track in the sequencer."""
-        sequencer_window = self._ensure_sequencer_window()
-        selected_indices = self._selected_record_indices()
-        if not selected_indices:
-            return
-
-        record_index = selected_indices[0]
-        record = self._records[record_index]
-        clip_profiles, active_profile_index = self._store.get_clip_profiles(
-            record.path,
-            record.duration_seconds,
-        )
-        clip_start, clip_stop = clip_profiles[active_profile_index]
-        clip_length_seconds = max(0.0, float(clip_stop) - float(clip_start))
-
-        sequence = sequencer_window.get_sequence()
-        bpm = max(1.0, float(sequence.bpm))
-        # Convert active clip length in seconds to sequencer beats.
-        if clip_length_seconds > 0.0:
-            default_duration_beats = max(0.1, clip_length_seconds * (bpm / 60.0))
-        else:
-            default_duration_beats = 4.0
-
-        # Create a new sequencer track with a default trigger at beat 0.
-        from sequencer_model import SequenceTrack, TriggerEvent
-
-        track = SequenceTrack(
-            name=record.name,
-            source_path=str(record.path),
-            is_jingle=True,
-            triggers=[TriggerEvent(beat_position=0.0, duration_beats=default_duration_beats)],
-        )
-        sequence.add_track(track)
-        sequencer_window._update_track_list()
-        sequencer_window.sequence_changed.emit()
-
-        # Ensure sequencer is visible
-        if not self._sequencer_btn.isChecked():
-            self._sequencer_btn.setChecked(True)
-            self._on_sequencer_btn_clicked()
-        else:
-            sequencer_window.raise_()
-            sequencer_window.activateWindow()
-
-        self._status.showMessage(f"Added '{record.name}' to sequencer as new track")
 
     def _on_table_item_double_clicked(self, item: QTableWidgetItem) -> None:
         if item.column() != 0:
@@ -2751,6 +2889,11 @@ class MainWindow(
             else:
                 self._clip_seek_muted_temporarily = False
                 self._audio_output.setMuted(self._is_muted)
+        if self._broadcast_audio_output is not None:
+            if temporary_mute_for_seek and not self._is_muted:
+                self._broadcast_audio_output.setMuted(True)
+            else:
+                self._broadcast_audio_output.setMuted(self._is_muted)
         return start_ms
 
     def _restart_current_clip_from_start(self, temporary_mute_for_seek: bool) -> None:
@@ -2759,6 +2902,7 @@ class MainWindow(
         start_ms = self._prepare_clip_start_seek(temporary_mute_for_seek)
         self._player.setPosition(start_ms)
         self._player.play()
+        self._sync_broadcast_player_to_main()
 
     def _clip_window_for_record(self, record: JingleRecord) -> tuple[int, int]:
         duration_ms = max(0, int(round(record.duration_seconds * 1000.0)))
@@ -2824,6 +2968,7 @@ class MainWindow(
             self._player.play()
             if start_ms > 0:
                 self._player.setPosition(start_ms)
+        self._sync_broadcast_player_to_main()
         self._current_playing_name = record.path.name
         self._select_record_row(record_index)
 
@@ -2888,11 +3033,13 @@ class MainWindow(
 
         if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self._player.pause()
+            self._sync_broadcast_player_to_main()
             self._status.showMessage("Playback paused.")
             return
 
         if self._player.playbackState() == QMediaPlayer.PlaybackState.PausedState:
             self._player.play()
+            self._sync_broadcast_player_to_main()
             self._status.showMessage("Playback resumed.")
             return
 
@@ -2929,6 +3076,9 @@ class MainWindow(
         ):
             self._player.stop()
             self._player.setPosition(self._current_clip_start_ms)
+            if self._broadcast_player is not None:
+                self._broadcast_player.stop()
+                self._broadcast_player.setPosition(self._current_clip_start_ms)
             self._reset_continuous_queue()
             self._reset_clip_playback_window()
             self._sample_pad_looping = False
@@ -2937,6 +3087,8 @@ class MainWindow(
             self._current_sample_pad_index = -1
             if self._audio_output is not None:
                 self._audio_output.setMuted(self._is_muted)
+            if self._broadcast_audio_output is not None:
+                self._broadcast_audio_output.setMuted(self._is_muted)
             self._current_playing_name = ""
             self._status.showMessage("Playback stopped.")
 
@@ -2963,6 +3115,8 @@ class MainWindow(
                     self._clip_seek_muted_temporarily = False
                     if self._audio_output is not None:
                         self._audio_output.setMuted(self._is_muted)
+                    if self._broadcast_audio_output is not None:
+                        self._broadcast_audio_output.setMuted(self._is_muted)
 
             clip_stop_ms = self._current_clip_stop_ms
             if (
@@ -2993,6 +3147,9 @@ class MainWindow(
                 self._sample_pad_native_looping = False
                 self._current_playing_name = ""
                 self._clip_boundary_handling = False
+                if self._broadcast_player is not None:
+                    self._broadcast_player.stop()
+                    self._broadcast_player.setPosition(self._current_clip_start_ms)
                 if ended_name:
                     self._status.showMessage(f"Playback finished: {ended_name}")
                 else:
@@ -3017,6 +3174,8 @@ class MainWindow(
                 self._clip_seek_muted_temporarily = False
                 if self._audio_output is not None:
                     self._audio_output.setMuted(self._is_muted)
+                if self._broadcast_audio_output is not None:
+                    self._broadcast_audio_output.setMuted(self._is_muted)
         # Make stop button breathe when playing or paused
         is_active = self._player.playbackState() in (
             QMediaPlayer.PlaybackState.PlayingState,
@@ -3046,6 +3205,10 @@ class MainWindow(
             self._current_sample_pad_index = -1
             if self._audio_output is not None:
                 self._audio_output.setMuted(self._is_muted)
+            if self._broadcast_player is not None:
+                self._broadcast_player.stop()
+            if self._broadcast_audio_output is not None:
+                self._broadcast_audio_output.setMuted(self._is_muted)
             self._current_playing_name = ""
             if ended_name:
                 self._status.showMessage(f"Playback finished: {ended_name}")
@@ -3119,9 +3282,13 @@ class MainWindow(
         if self._should_use_native_looping():
             # Seamless native looping — no seek/buffer-flush gap between iterations.
             self._player.setLoops(QMediaPlayer.Loops.Infinite)
+            if self._broadcast_player is not None:
+                self._broadcast_player.setLoops(QMediaPlayer.Loops.Infinite)
         else:
             # Manual loop control keeps clip offsets consistent across backends.
             self._player.setLoops(1)
+            if self._broadcast_player is not None:
+                self._broadcast_player.setLoops(1)
 
     def _set_loop_breathing(self, enabled: bool) -> None:
         if not enabled:
@@ -3260,6 +3427,7 @@ class MainWindow(
         self._slider_pressed = False
         if self._player is not None:
             self._player.setPosition(int(self._position_slider.value()))
+            self._sync_broadcast_player_to_main()
 
     def _update_time_label(self, position_ms: int, duration_ms: int) -> None:
         self._time_label.setText(
@@ -3279,21 +3447,30 @@ class MainWindow(
         dialog = OptionsDialog(
             self._output_device,
             self._preview_output_device,
+            self._broadcast_output_device,
+            self._mixer_enabled,
+            self._microphone_input_device,
+            self._microphone_gain_percent,
             self._live_volume_percent,
             self._preview_volume_percent,
             self._sample_pad_blocksize,
             self._sample_pad_streaming_min_seconds,
             self._samples_dir,
-            self._recording_input_device,
-            self._recording_output_folder,
-            self._use_wasapi_loopback,
-            self._recording_prompt_filename_on_stop,
             self,
         )
         if dialog.exec() != int(QDialog.DialogCode.Accepted):
             return
 
-        self._output_device, self._preview_output_device = dialog.selected_devices()
+        (
+            self._output_device,
+            self._preview_output_device,
+            self._broadcast_output_device,
+        ) = dialog.selected_devices()
+        (
+            self._mixer_enabled,
+            self._microphone_input_device,
+            self._microphone_gain_percent,
+        ) = dialog.selected_mixer_config()
         self._live_volume_percent, self._preview_volume_percent = dialog.selected_volumes()
         self._sample_pad_blocksize = dialog.selected_sample_pad_blocksize()
         self._sample_pad_streaming_min_seconds = (
@@ -3301,12 +3478,25 @@ class MainWindow(
         )
         self._settings.setValue("options/outputDevice", self._output_device)
         self._settings.setValue("options/previewOutputDevice", self._preview_output_device)
+        self._settings.setValue("options/broadcastOutputDevice", self._broadcast_output_device)
+        self._settings.setValue(
+            "options/mixerEnabled", "true" if self._mixer_enabled else "false"
+        )
+        self._settings.setValue(
+            "options/microphoneInputDevice", self._microphone_input_device
+        )
+        self._settings.setValue(
+            "options/microphoneGainPercent", self._microphone_gain_percent
+        )
         self._settings.setValue("options/samplePadBlocksize", self._sample_pad_blocksize)
         self._settings.setValue(
             "options/samplePadStreamingMinSeconds",
             self._sample_pad_streaming_min_seconds,
         )
         self._sp_engine.set_streaming_min_seconds(self._sample_pad_streaming_min_seconds)
+        self._sp_engine.set_mixer_enabled(self._mixer_enabled)
+        self._sp_engine.set_input_gain(self._microphone_gain_percent / 100.0)
+        self._apply_mixer_input_device(notify_errors=True)
         self._save_volume_settings()
         self._refresh_mode_toggle_state(notify_if_disabled=True)
         self._refresh_volume_controls()
@@ -3318,28 +3508,6 @@ class MainWindow(
             self._save_samples_dir()
             self._rescan_library()
 
-        # Recording settings
-        self._recording_input_device = dialog.selected_recording_device()
-        self._recording_output_folder = dialog.selected_recording_folder()
-        self._use_wasapi_loopback = dialog.selected_use_wasapi_loopback()
-        self._recording_prompt_filename_on_stop = dialog.selected_prompt_filename_on_stop()
-        self._settings.setValue("recording/inputDevice", self._recording_input_device)
-        self._settings.setValue("recording/useWasapiLoopback", "true" if self._use_wasapi_loopback else "false")
-        self._settings.setValue(
-            "recording/promptFilenameOnStop",
-            "true" if self._recording_prompt_filename_on_stop else "false",
-        )
-        self._save_recording_output_folder()
-        self._settings.sync()  # Ensure all settings are written to disk
-
-        record_dialog = getattr(self, "_recording_dialog", None)
-        if record_dialog is not None:
-            record_dialog.sync_recording_settings(
-                recording_device=self._recording_input_device,
-                use_wasapi_loopback=self._use_wasapi_loopback,
-                prompt_filename_on_stop=self._recording_prompt_filename_on_stop,
-            )
-
         if not self._can_use_preview_mode():
             QMessageBox.information(
                 self,
@@ -3347,105 +3515,226 @@ class MainWindow(
                 "Live and Preview devices are currently the same.\n\n"
                 "Preview/Live switching is disabled until the Preview device is set to a different output.",
             )
+        route_warnings = self._broadcast_route_warnings()
+        if route_warnings:
+            QMessageBox.information(
+                self,
+                "Broadcast Routing Notes",
+                "\n\n".join(route_warnings),
+            )
         self._status.showMessage("Options saved.")
 
-    def _apply_output_device(self) -> None:
-        if self._audio_output is None or not _has_qt_multimedia:
+    def _resolved_microphone_input_device(self) -> str:
+        selected = self._microphone_input_device.strip()
+        if selected:
+            return selected
+        if not _has_qt_multimedia:
+            return ""
+        try:
+            return QMediaDevices.defaultAudioInput().description().strip()
+        except Exception:
+            return ""
+
+    def _resolved_live_engine_output_device(self) -> str:
+        selected = self._broadcast_output_device.strip() or self._output_device.strip()
+        if selected:
+            return selected
+        if not _has_qt_multimedia:
+            return ""
+        try:
+            return QMediaDevices.defaultAudioOutput().description().strip()
+        except Exception:
+            return ""
+
+    def _resolved_mixer_output_device(self) -> str:
+        return self._resolved_live_engine_output_device()
+
+    def _broadcast_route_warnings(self) -> list[str]:
+        warnings: list[str] = []
+        live_device = self._output_device.strip()
+        broadcast_device = self._broadcast_output_device.strip()
+        if not self._mixer_enabled:
+            warnings.append(
+                "Mixer mode is off, so microphone audio will not be sent to the Broadcast Device until mixer mode is enabled."
+            )
+        if not broadcast_device:
+            if live_device and not _is_virtual_audio_device_name(live_device):
+                warnings.append(
+                    "No Broadcast Device is selected. Microphone broadcast and mirrored main-window playback will follow the Live Device, which may not be suitable for Discord/OBS style capture unless it is a virtual sink."
+                )
+        else:
+            if not _is_virtual_audio_device_name(broadcast_device):
+                warnings.append(
+                    "Broadcast Device does not look like a virtual or loopback device. Physical playback devices usually do not behave like isolated broadcast feeds."
+                )
+            if self._normalize_device_key(broadcast_device) == self._normalize_device_key(live_device):
+                warnings.append(
+                    "Broadcast Device matches the Live Device, so local monitoring and broadcast routing are not isolated from each other."
+                )
+        warnings.append(
+            "Main library jingles are mirrored to the Broadcast Device. Sample-pad jingles continue to follow the current Live/Preview monitor route, and live-mode sample pads are also duplicated to the Broadcast Device when it differs from the monitor route."
+        )
+        return warnings
+
+    def _linux_virtual_sink_assistant(self) -> list[str]:
+        if not sys.platform.startswith("linux"):
+            return ["Linux assistant is only available on Linux systems."]
+        lines: list[str] = []
+        if shutil.which("pactl"):
+            lines.extend(
+                [
+                    "Create both the broadcast sink and a Discord-friendly source:",
+                    'pactl load-module module-null-sink sink_name=JingleBroadcast sink_properties=device.description="Jingle Broadcast"',
+                    'pactl load-module module-remap-source master=JingleBroadcast.monitor source_name=JingleMic source_properties=device.description="Jingle Mic"',
+                    "List sinks and sources after creating them:",
+                    "pactl list short sinks",
+                    "pactl list short sources",
+                    "In Discord, select Jingle Mic as the input device. In Audacity, Jingle Mic or JingleBroadcast.monitor should work.",
+                    "If Discord was already open, fully quit and reopen it after creating the new source so it refreshes its device list.",
+                    "Delete the devices later with the Copy Delete Broadcast Devices button in Audio Diagnostics.",
+                ]
+            )
+        else:
+            lines.append("`pactl` was not found. Install PulseAudio/PipeWire user tools to create and inspect null sinks.")
+        virtual_candidates = self._audio_diagnostics_virtual_candidates()
+        if virtual_candidates:
+            lines.append("Existing virtual-looking devices are already visible below in the diagnostics report.")
+        return lines
+
+    def _audio_diagnostics_virtual_candidates(self) -> list[str]:
+        qt_outputs = self._collect_qt_audio_device_names(inputs=False)
+        qt_inputs = self._collect_qt_audio_device_names(inputs=True)
+        portaudio_outputs = self._collect_portaudio_device_names(inputs=False)
+        portaudio_inputs = self._collect_portaudio_device_names(inputs=True)
+
+        virtual_candidates: list[str] = []
+        seen_virtuals: set[str] = set()
+        for name in qt_outputs + qt_inputs:
+            if not _is_virtual_audio_device_name(name):
+                continue
+            display = f"Qt: {_format_audio_device_label(name)}"
+            if display not in seen_virtuals:
+                seen_virtuals.add(display)
+                virtual_candidates.append(display)
+        for item in portaudio_outputs + portaudio_inputs:
+            raw_name = item.split(" | ", 1)[0].strip()
+            if not _is_virtual_audio_device_name(raw_name):
+                continue
+            display = f"PortAudio: {_format_audio_device_label(raw_name)}"
+            if display not in seen_virtuals:
+                seen_virtuals.add(display)
+                virtual_candidates.append(display)
+        return virtual_candidates
+
+    def _apply_mixer_input_device(self, *, notify_errors: bool) -> None:
+        if not _sp_engine_mod.is_available():
+            return
+        if not self._mixer_enabled:
+            self._sp_engine.disable_input_device()
             return
 
-        selected = self._active_output_device().strip()
-        target_device = QMediaDevices.defaultAudioOutput()
-
-        if selected:
-            matched = self._find_output_device_by_name(selected)
-            if matched is not None:
-                target_device = matched
-            elif hasattr(self, "_status"):
+        target_input = self._resolved_microphone_input_device()
+        if not target_input:
+            self._sp_engine.disable_input_device()
+            if notify_errors:
                 self._status.showMessage(
-                    f"Selected device unavailable. Using system default: {target_device.description()}"
+                    "Mixer mode enabled, but no microphone input device is available."
+                )
+            return
+
+        try:
+            self._sp_engine.set_input_device(
+                target_input,
+                channels=1,
+                blocksize=self._sample_pad_blocksize,
+            )
+            self._apply_mixer_engine_output_route(notify_errors=notify_errors)
+        except Exception as exc:
+            self._sp_engine.disable_input_device()
+            if notify_errors:
+                self._status.showMessage(
+                    f"Could not start microphone capture for mixer mode: {exc}"
                 )
 
-        # Only switch the device when it actually changes; calling setDevice()
-        # unnecessarily flushes/resets the audio pipeline mid-stream and can
-        # produce clicks or pops even when the same device is re-selected.
-        if self._audio_output.device().id() != target_device.id():
-            self._audio_output.setDevice(target_device)
-        # Respect any temporary seek-mute that is still active.  A back-to-back
-        # one-shot retrigger calls _apply_output_device before the first
-        # position callback has cleared _clip_seek_muted_temporarily, so
-        # blindly applying self._is_muted would briefly unmute the output while
-        # the new media source is being swapped in, causing an audible pop.
-        effective_muted = self._is_muted or self._clip_seek_muted_temporarily
-        self._audio_output.setMuted(effective_muted)
-        self._apply_active_volume()
-
-    def _normalize_device_key(self, value: str) -> str:
-        # Normalize legacy Windows endpoint labels that may include instance
-        # counters like "(2- Device Name)" on one machine but "(Device Name)"
-        # on another.
-        key = " ".join(value.strip().split()).casefold()
-        key = re.sub(r"\(\s*\d+\s*-\s*", "(", key)
-        return key
-
-    def _find_output_device_by_name(self, selected_name: str):
-        target_key = self._normalize_device_key(selected_name)
-        if not target_key:
-            return None
-
-        devices = list(QMediaDevices.audioOutputs())
-
-        for device in devices:
-            if self._normalize_device_key(device.description()) == target_key:
-                return device
-
-        # As a last resort, allow partial matching for renamed endpoints.
-        for device in devices:
-            device_key = self._normalize_device_key(device.description())
-            if device_key and (device_key in target_key or target_key in device_key):
-                return device
-
-        return None
-
-    def _reconcile_saved_output_devices(self) -> None:
-        unavailable: list[tuple[str, str]] = []
-
-        live_saved = self._output_device.strip()
-        if live_saved:
-            live_match = self._find_output_device_by_name(live_saved)
-            if live_match is None:
-                unavailable.append(("Live", live_saved))
-                self._output_device = ""
-            else:
-                self._output_device = live_match.description().strip()
-
-        preview_saved = self._preview_output_device.strip()
-        if preview_saved:
-            preview_match = self._find_output_device_by_name(preview_saved)
-            if preview_match is None:
-                unavailable.append(("Preview", preview_saved))
-                self._preview_output_device = ""
-            else:
-                self._preview_output_device = preview_match.description().strip()
-
-        if not unavailable:
+    def _apply_mixer_engine_output_route(self, *, notify_errors: bool) -> None:
+        if not _sp_engine_mod.is_available() or not self._mixer_enabled:
             return
 
-        self._settings.setValue("options/outputDevice", self._output_device)
-        self._settings.setValue("options/previewOutputDevice", self._preview_output_device)
-        self._settings.sync()
+        target_output = self._resolved_mixer_output_device()
+        if not target_output:
+            if notify_errors:
+                self._status.showMessage(
+                    "Mixer mode enabled, but no output device is available for the engine route."
+                )
+            return
+        try:
+            self._sp_engine.set_device(
+                target_output,
+                blocksize=self._sample_pad_blocksize,
+            )
+            self._sync_sample_pad_engine_gain()
+        except Exception as exc:
+            if notify_errors:
+                self._status.showMessage(
+                    f"Could not start mixer output route: {exc}"
+                )
 
-        default_name = QMediaDevices.defaultAudioOutput().description().strip()
-        unavailable_text = "\n".join(f"- {role}: {name}" for role, name in unavailable)
-        message = (
-            "One or more previously saved audio output devices are unavailable.\n\n"
-            f"{unavailable_text}\n\n"
-            f"Live and Preview outputs were reset to System Default ({default_name})."
-        )
-        self._status.showMessage(
-            f"Saved output device missing; using system default ({default_name}).",
-            12000,
-        )
-        QMessageBox.information(self, "Audio Output Device Updated", message)
+    def _apply_output_device(self) -> None:
+        if self._audio_output is not None and _has_qt_multimedia:
+            selected = self._active_output_device().strip()
+            target_device = QMediaDevices.defaultAudioOutput()
+
+            if selected:
+                matched = None
+                for device in QMediaDevices.audioOutputs():
+                    if device.description().strip() == selected:
+                        matched = device
+                        break
+                if matched is not None:
+                    target_device = matched
+                else:
+                    self._status.showMessage(
+                        f"Selected device unavailable. Using system default: {target_device.description()}"
+                    )
+
+            # Only switch the device when it actually changes; calling setDevice()
+            # unnecessarily flushes/resets the audio pipeline mid-stream and can
+            # produce clicks or pops even when the same device is re-selected.
+            if self._audio_output.device().id() != target_device.id():
+                self._audio_output.setDevice(target_device)
+            # Respect any temporary seek-mute that is still active.  A back-to-back
+            # one-shot retrigger calls _apply_output_device before the first
+            # position callback has cleared _clip_seek_muted_temporarily, so
+            # blindly applying self._is_muted would briefly unmute the output while
+            # the new media source is being swapped in, causing an audible pop.
+            effective_muted = self._is_muted or self._clip_seek_muted_temporarily
+            self._audio_output.setMuted(effective_muted)
+            self._apply_active_volume()
+
+        if self._broadcast_audio_output is not None and _has_qt_multimedia:
+            selected = self._broadcast_output_device.strip()
+            if selected:
+                target_device = QMediaDevices.defaultAudioOutput()
+                matched = None
+                for device in QMediaDevices.audioOutputs():
+                    if device.description().strip() == selected:
+                        matched = device
+                        break
+                if matched is not None:
+                    target_device = matched
+                    if self._broadcast_audio_output.device().id() != target_device.id():
+                        self._broadcast_audio_output.setDevice(target_device)
+                effective_muted = self._is_muted or self._clip_seek_muted_temporarily
+                self._broadcast_audio_output.setMuted(effective_muted)
+                self._apply_active_volume()
+            elif self._broadcast_player is not None:
+                self._broadcast_player.stop()
+
+        self._apply_mixer_engine_output_route(notify_errors=hasattr(self, "_status"))
+        self._sync_broadcast_player_to_main()
+
+    def _normalize_device_key(self, value: str) -> str:
+        return value.strip().casefold()
 
     def _can_use_preview_mode(self) -> bool:
         return self._normalize_device_key(self._output_device) != self._normalize_device_key(

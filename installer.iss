@@ -1,7 +1,7 @@
 #define MyAppId "{{CB8F471A-B9B6-49D6-A975-FC0F9FF7C67F}}"
 #define MyAppName "JingleAllTheDay"
 #ifndef MyAppVersion
-  #define MyAppVersion "1.7.2.06182026"
+  #define MyAppVersion "1.0.0"
 #endif
 #define MyAppPublisher "JingleAllTheDay"
 #define MyAppExeName "JingleAllTheDay.exe"

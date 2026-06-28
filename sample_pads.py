@@ -7,7 +7,6 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 
 from app_helpers import chip_palette_for_tag_seed as _chip_palette_for_tag_seed
 from app_helpers import coerce_volume_percent as _coerce_volume_percent
-from mixer_strip_builder import create_channel_strip
 
 _PAD_MODES = ("one_shot", "loop", "release_os", "release_l")
 _PAD_MODE_LABELS = {
@@ -534,49 +533,130 @@ class SamplePadMixerDialog(QtWidgets.QDialog):
         channels_row.setSpacing(self._strip_spacing)
 
         for slot_index in range(self._pads_window._num_pads):
-            meter_bar = _PeakMeterWidget(self._strip_height, "#26a69a")
-            db_scale_widget = _DbScaleWidget(self._strip_height)
-            strip = create_channel_strip(
-                parent_layout=channels_row,
-                index_text=f"Pad {slot_index + 1}",
-                name_text=f"Pad {slot_index + 1}",
-                channel_width=self._strip_width,
-                strip_height=self._strip_height,
-                top_to_strip_gap=self._top_to_strip_gap,
-                strip_to_bottom_gap=self._strip_to_bottom_gap,
-                pan_slider_width=max(34, self._strip_width - 30),
-                meter_widget=meter_bar,
-                db_scale_widget=db_scale_widget,
-                volume_value=100,
-                pan_value=0,
-                muted=False,
-                solo=False,
-                on_volume_changed=lambda value, idx=slot_index: self._on_volume_changed(idx, value),
-                on_volume_dragged=lambda value, idx=slot_index: self._on_volume_dragged(idx, value),
-                on_pan_changed=lambda value, idx=slot_index: self._on_pan_changed(idx, value),
-                on_pan_dragged=lambda value, idx=slot_index: self._on_pan_dragged(idx, value),
-                on_mute_toggled=lambda checked, idx=slot_index: self._on_mute_toggled(idx, checked),
-                on_solo_toggled=lambda checked, idx=slot_index: self._on_solo_toggled(idx, checked),
-                channel_object_name="mixerChannel",
-                channel_stylesheet=(
-                    "#mixerChannel {"
-                    " border: 1px solid #3a464d;"
-                    " border-radius: 4px;"
-                    " background: #161c21;"
-                    "}"
-                ),
+            channel = QtWidgets.QFrame()
+            channel.setObjectName("mixerChannel")
+            channel.setStyleSheet(
+                "#mixerChannel {"
+                " border: 1px solid #3a464d;"
+                " border-radius: 4px;"
+                " background: #161c21;"
+                "}"
             )
-            strip.pan_slider.setToolTip("Center")
+            channel.setFixedWidth(self._strip_width)
+            channel.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Fixed,
+                QtWidgets.QSizePolicy.Policy.Expanding,
+            )
+            channel_layout = QtWidgets.QVBoxLayout(channel)
+            channel_layout.setContentsMargins(4, 4, 4, 4)
+            channel_layout.setSpacing(0)
 
-            self._name_labels.append(strip.name_label)
-            self._volume_sliders.append(strip.volume_slider)
-            self._pan_sliders.append(strip.pan_slider)
-            self._mute_buttons.append(strip.mute_button)
-            self._solo_buttons.append(strip.solo_button)
+            pad_label = QtWidgets.QLabel(f"Pad {slot_index + 1}")
+            pad_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            pad_label.setStyleSheet("color: #b0bec5;")
+            pad_label.setMinimumHeight(14)
+            pad_label.setMaximumHeight(14)
+            channel_layout.addWidget(pad_label)
+
+            name_label = QtWidgets.QLabel(f"Pad {slot_index + 1}")
+            name_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            name_label.setWordWrap(False)
+            name_label.setMinimumHeight(16)
+            name_label.setMaximumHeight(16)
+            channel_layout.addWidget(name_label)
+            channel_layout.addSpacing(self._top_to_strip_gap)
+
+            strip_lane_widget = QtWidgets.QWidget()
+            strip_lane_widget.setFixedHeight(self._strip_height)
+            strip_row = QtWidgets.QHBoxLayout(strip_lane_widget)
+            strip_row.setContentsMargins(0, 0, 0, 0)
+            strip_row.setSpacing(4)
+
+            meter_bar = _PeakMeterWidget(self._strip_height, "#26a69a")
+            strip_row.addWidget(meter_bar, 0, QtCore.Qt.AlignmentFlag.AlignTop)
+
+            db_scale_widget = _DbScaleWidget(self._strip_height)
+            strip_row.addWidget(db_scale_widget, 0, QtCore.Qt.AlignmentFlag.AlignTop)
+
+            volume_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Vertical)
+            volume_slider.setRange(0, 100)
+            volume_slider.setValue(100)
+            volume_slider.setPageStep(5)
+            volume_slider.setFixedHeight(self._strip_height)
+            volume_slider.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Fixed,
+                QtWidgets.QSizePolicy.Policy.Expanding,
+            )
+            volume_slider.valueChanged.connect(
+                lambda value, idx=slot_index: self._on_volume_changed(idx, value)
+            )
+            volume_slider.sliderMoved.connect(
+                lambda value, idx=slot_index: self._on_volume_dragged(idx, value)
+            )
+            strip_row.addWidget(volume_slider, 0, QtCore.Qt.AlignmentFlag.AlignTop)
+            channel_layout.addWidget(strip_lane_widget, 0, QtCore.Qt.AlignmentFlag.AlignTop)
+            channel_layout.addSpacing(self._strip_to_bottom_gap)
+
+            pan_row = QtWidgets.QHBoxLayout()
+            pan_row.setSpacing(4)
+
+            pan_left_label = QtWidgets.QLabel("L")
+            pan_left_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            pan_left_label.setStyleSheet("color: #90a4ae;")
+            pan_left_label.setFixedWidth(10)
+            pan_row.addWidget(pan_left_label)
+
+            pan_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+            pan_slider.setRange(-100, 100)
+            pan_slider.setValue(0)
+            pan_slider.setPageStep(10)
+            pan_slider.setFixedWidth(max(34, self._strip_width - 30))
+            pan_slider.setToolTip("Center")
+            pan_slider.valueChanged.connect(
+                lambda value, idx=slot_index: self._on_pan_changed(idx, value)
+            )
+            pan_slider.sliderMoved.connect(
+                lambda value, idx=slot_index: self._on_pan_dragged(idx, value)
+            )
+            pan_row.addWidget(pan_slider)
+
+            pan_right_label = QtWidgets.QLabel("R")
+            pan_right_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            pan_right_label.setStyleSheet("color: #90a4ae;")
+            pan_right_label.setFixedWidth(10)
+            pan_row.addWidget(pan_right_label)
+
+            channel_layout.addLayout(pan_row)
+            channel_layout.addSpacing(4)
+
+            buttons_row = QtWidgets.QHBoxLayout()
+            buttons_row.setSpacing(4)
+
+            mute_btn = QtWidgets.QPushButton("M")
+            mute_btn.setCheckable(True)
+            mute_btn.toggled.connect(lambda checked, idx=slot_index: self._on_mute_toggled(idx, checked))
+            mute_btn.setFixedWidth(34)
+            buttons_row.addWidget(mute_btn)
+
+            solo_btn = QtWidgets.QPushButton("S")
+            solo_btn.setCheckable(True)
+            solo_btn.toggled.connect(lambda checked, idx=slot_index: self._on_solo_toggled(idx, checked))
+            solo_btn.setFixedWidth(34)
+            buttons_row.addWidget(solo_btn)
+
+            channel_layout.addLayout(buttons_row)
+
+            self._name_labels.append(name_label)
+            self._volume_sliders.append(volume_slider)
+            self._pan_sliders.append(pan_slider)
+            self._mute_buttons.append(mute_btn)
+            self._solo_buttons.append(solo_btn)
             self._meter_bars.append(meter_bar)
             self._db_scale_widgets.append(db_scale_widget)
-            self._strip_lane_widgets.append(strip.strip_lane)
-            self._channel_boxes.append(strip.channel_box)
+            self._strip_lane_widgets.append(strip_lane_widget)
+            self._channel_boxes.append(channel)
+
+            channels_row.addWidget(channel)
 
         separator = QtWidgets.QFrame()
         separator.setFrameShape(QtWidgets.QFrame.Shape.VLine)

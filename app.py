@@ -18,7 +18,7 @@ from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 APP_NAME = "JingleAllTheDay"
-APP_VERSION = "1.7.2.061826"
+APP_VERSION = "1.8.0.062726"
 APP_ID = "JingleAllTheDay.App"
 _INSTANCE_LOCK_NAME = "single_instance.lock"
 
@@ -31,7 +31,13 @@ class _SingleInstanceGuard:
         app_data_location = QStandardPaths.writableLocation(
             QStandardPaths.StandardLocation.AppDataLocation
         )
-        self._lock_path = Path(app_data_location) / _INSTANCE_LOCK_NAME
+        if app_data_location.strip():
+            base_dir = Path(app_data_location)
+        else:
+            # Defensive fallback: Qt should usually provide AppDataLocation,
+            # but keep single-instance protection alive if it does not.
+            base_dir = Path.home() / ".local" / "share" / APP_NAME
+        self._lock_path = base_dir / _INSTANCE_LOCK_NAME
         self._lock_path.parent.mkdir(parents=True, exist_ok=True)
         self._acquired = False
 
@@ -162,7 +168,11 @@ class _SingleInstanceGuard:
 
 def main() -> None:
     if sys.platform == "win32":
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
+        except (AttributeError, OSError):
+            # Keep startup resilient if Win32 shell integration is unavailable.
+            pass
 
     app = QApplication(sys.argv)
     # Keep historical storage path stable for QStandardPaths.AppDataLocation.

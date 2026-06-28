@@ -33,28 +33,32 @@ def ensure_qt_logging_rules() -> None:
 def apply_windows_taskbar_icon(window: Any) -> None:
     if sys.platform != "win32":
         return
-    icon_source = Path(sys.executable) if getattr(sys, "frozen", False) else (_HERE / "icon.ico")
-    if not icon_source.exists():
+    try:
+        icon_source = Path(sys.executable) if getattr(sys, "frozen", False) else (_HERE / "icon.ico")
+        if not icon_source.exists():
+            return
+        hwnd = int(window.winId())
+        shell32 = ctypes.windll.shell32
+        user32 = ctypes.windll.user32
+        large = ctypes.c_void_p()
+        small = ctypes.c_void_p()
+        extracted = shell32.ExtractIconExW(str(icon_source), 0, ctypes.byref(large), ctypes.byref(small), 1)
+        if extracted <= 0:
+            return
+        WM_SETICON = 0x0080
+        ICON_SMALL = 0
+        ICON_BIG = 1
+        GCLP_HICON = -14
+        GCLP_HICONSM = -34
+        if small.value:
+            user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, small.value)
+            user32.SetClassLongPtrW(hwnd, GCLP_HICONSM, small.value)
+        if large.value:
+            user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, large.value)
+            user32.SetClassLongPtrW(hwnd, GCLP_HICON, large.value)
+    except Exception:
+        # Taskbar icon integration is optional; never block app startup on it.
         return
-    hwnd = int(window.winId())
-    shell32 = ctypes.windll.shell32
-    user32 = ctypes.windll.user32
-    large = ctypes.c_void_p()
-    small = ctypes.c_void_p()
-    extracted = shell32.ExtractIconExW(str(icon_source), 0, ctypes.byref(large), ctypes.byref(small), 1)
-    if extracted <= 0:
-        return
-    WM_SETICON = 0x0080
-    ICON_SMALL = 0
-    ICON_BIG = 1
-    GCLP_HICON = -14
-    GCLP_HICONSM = -34
-    if small.value:
-        user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, small.value)
-        user32.SetClassLongPtrW(hwnd, GCLP_HICONSM, small.value)
-    if large.value:
-        user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, large.value)
-        user32.SetClassLongPtrW(hwnd, GCLP_HICON, large.value)
 
 
 def runtime_app_dir() -> Path:

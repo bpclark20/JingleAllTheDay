@@ -17,10 +17,12 @@ callback reads is protected by a threading.Lock.
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 from collections import deque
 import math
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -32,12 +34,37 @@ try:
     import sounddevice as sd
     import soundfile as sf
     _AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
     _AVAILABLE = False
 
 
 def is_available() -> bool:
     return _AVAILABLE
+
+
+def list_audio_devices(*, channel_key: str | None = None) -> list[dict[str, object]]:
+    """Return PortAudio devices as simple dictionaries for UI diagnostics."""
+    if not _AVAILABLE:
+        return []
+    try:
+        devices = sd.query_devices()
+    except Exception:
+        return []
+
+    results: list[dict[str, object]] = []
+    for idx, dev in enumerate(devices):
+        if channel_key and dev.get(channel_key, 0) <= 0:
+            continue
+        results.append(
+            {
+                "index": idx,
+                "name": str(dev.get("name", "")),
+                "max_input_channels": int(dev.get("max_input_channels", 0) or 0),
+                "max_output_channels": int(dev.get("max_output_channels", 0) or 0),
+                "default_samplerate": float(dev.get("default_samplerate", 0.0) or 0.0),
+            }
+        )
+    return results
 
 
 def _get_ffmpeg_path() -> str | None:
@@ -164,6 +191,15 @@ class SamplePadAudioEngine:
         self._stream_samplerate: int = 0
         self._stream_channels: int = 2
         self._stream_blocksize: int = _LOW_LATENCY_BLOCKSIZE
+        self._input_stream: Optional["sd.InputStream"] = None
+        self._input_device: str = ""
+        self._input_samplerate: int = 0
+        self._input_channels: int = 1
+        self._input_blocksize: int = _LOW_LATENCY_BLOCKSIZE
+        self._input_meter_levels: tuple[float, float] = (0.0, 0.0)
+        self._input_buffer: deque[np.ndarray] = deque()
+        self._input_buffer_frames: int = 0
+        self._input_buffer_max_frames: int = 0
 
         # PCM cache: keyed by (str(path), clip_start_seconds, clip_stop_seconds)
         # Stores already-decoded, resampled, channel-matched float32 numpy arrays
@@ -184,6 +220,8 @@ class SamplePadAudioEngine:
         self._pending_pad_triggers: dict[int, tuple[tuple, float, bool]] = {}
         self._streaming_min_seconds: float = _STREAMING_MIN_SECONDS
         self._master_gain: float = 1.0
+        self._mixer_enabled: bool = False
+        self._input_gain: float = 1.0
 
     # ------------------------------------------------------------------
     # Public API (called from Qt main thread)
@@ -231,6 +269,10 @@ class SamplePadAudioEngine:
                 self._pad_meter_levels.clear()
                 self._output_meter_levels = (0.0, 0.0)
         device_index = self._find_device(device_name)
+        if device_name and device_index is None:
+            raise RuntimeError(
+                "SamplePadAudioEngine: selected output device is unavailable in PortAudio"
+            )
         self._stream_samplerate = samplerate
         self._stream_channels = channels
         self._stream_device = device_name
@@ -267,6 +309,89 @@ class SamplePadAudioEngine:
         except Exception as exc:
             self._stream = None
             raise RuntimeError(f"SamplePadAudioEngine: could not open device '{device_name}': {exc}") from exc
+
+    def set_input_device(
+        self,
+        device_name: str,
+        samplerate: int = 44100,
+        channels: int = 1,
+        blocksize: int = _LOW_LATENCY_BLOCKSIZE,
+    ) -> None:
+        """Open (or reopen) the PortAudio microphone capture stream.
+
+        This only captures and buffers microphone PCM for future mixer work; it
+        does not yet route microphone audio into the output mix.
+        """
+        if not _AVAILABLE:
+            return
+
+        normalized_name = device_name.strip()
+        channels = max(1, int(channels))
+        blocksize = max(64, int(blocksize))
+        if (
+            self._input_stream is not None
+            and self._input_stream.active
+            and self._input_device == normalized_name
+            and self._input_samplerate == int(samplerate)
+            and self._input_channels == channels
+            and self._input_blocksize == blocksize
+        ):
+            return
+
+        if not normalized_name:
+            self.disable_input_device()
+            return
+
+        device_index = self._find_input_device(normalized_name)
+        if device_index is None:
+            raise RuntimeError(
+                "SamplePadAudioEngine: selected input device is unavailable in PortAudio"
+            )
+
+        self._close_input_stream()
+        self._input_samplerate = int(samplerate)
+        self._input_channels = channels
+        self._input_device = normalized_name
+        self._input_blocksize = blocksize
+        self._input_buffer_max_frames = max(self._input_samplerate * 2, blocksize * 32)
+        try:
+            self._input_stream = sd.InputStream(
+                device=device_index,
+                samplerate=self._input_samplerate,
+                channels=self._input_channels,
+                dtype="float32",
+                blocksize=self._input_blocksize,
+                latency="low",
+                callback=self._input_callback,
+            )
+            self._input_stream.start()
+        except Exception as exc:
+            self._input_stream = None
+            self._input_device = ""
+            self._input_samplerate = 0
+            self._input_channels = 1
+            self._input_blocksize = _LOW_LATENCY_BLOCKSIZE
+            self._input_buffer_max_frames = 0
+            raise RuntimeError(
+                f"SamplePadAudioEngine: could not open input device '{normalized_name}': {exc}"
+            ) from exc
+
+    def disable_input_device(self) -> None:
+        self._close_input_stream()
+
+    def input_meter_levels(self) -> tuple[float, float]:
+        with self._lock:
+            return self._input_meter_levels
+
+    def input_device_name(self) -> str:
+        return self._input_device
+
+    def output_device_name(self) -> str:
+        return self._stream_device
+
+    def mixer_enabled(self) -> bool:
+        with self._lock:
+            return self._mixer_enabled
 
     def preload(
         self,
@@ -442,6 +567,18 @@ class SamplePadAudioEngine:
             parsed = _STREAMING_MIN_SECONDS
         self._streaming_min_seconds = max(0.0, min(3600.0, parsed))
 
+    def set_mixer_enabled(self, enabled: bool) -> None:
+        with self._lock:
+            self._mixer_enabled = bool(enabled)
+
+    def set_input_gain(self, gain: float) -> None:
+        try:
+            parsed = float(gain)
+        except (TypeError, ValueError):
+            parsed = 1.0
+        with self._lock:
+            self._input_gain = max(0.0, min(2.0, parsed))
+
     def meter_levels(self) -> dict[int, float]:
         """Return normalized post-fader meter levels keyed by pad index."""
         with self._lock:
@@ -481,6 +618,7 @@ class SamplePadAudioEngine:
             self._pad_meter_levels.clear()
             self._output_meter_levels = (0.0, 0.0)
         self._close_stream()
+        self._close_input_stream()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -509,6 +647,56 @@ class SamplePadAudioEngine:
             except Exception:
                 pass
             self._stream = None
+
+    def _close_input_stream(self) -> None:
+        if self._input_stream is not None:
+            try:
+                self._input_stream.stop(ignore_errors=True)
+                self._input_stream.close(ignore_errors=True)
+            except Exception:
+                pass
+            self._input_stream = None
+        with self._lock:
+            self._input_device = ""
+            self._input_samplerate = 0
+            self._input_channels = 1
+            self._input_blocksize = _LOW_LATENCY_BLOCKSIZE
+            self._input_meter_levels = (0.0, 0.0)
+            self._input_buffer.clear()
+            self._input_buffer_frames = 0
+            self._input_buffer_max_frames = 0
+
+    def _pop_input_chunk(self, frames: int, channels: int) -> np.ndarray:
+        with self._lock:
+            if frames <= 0 or not self._input_buffer:
+                return np.zeros((0, channels), dtype=np.float32)
+
+            pieces: list[np.ndarray] = []
+            frames_needed = int(frames)
+            while self._input_buffer and frames_needed > 0:
+                chunk = self._input_buffer[0]
+                available = chunk.shape[0]
+                if available <= frames_needed:
+                    pieces.append(self._input_buffer.popleft())
+                    self._input_buffer_frames -= available
+                    frames_needed -= available
+                    continue
+                pieces.append(chunk[:frames_needed].copy())
+                self._input_buffer[0] = chunk[frames_needed:].copy()
+                self._input_buffer_frames -= frames_needed
+                frames_needed = 0
+
+        if not pieces:
+            return np.zeros((0, channels), dtype=np.float32)
+
+        combined = np.concatenate(pieces, axis=0)
+        source_channels = combined.shape[1]
+        if source_channels < channels:
+            reps = -(-channels // source_channels)
+            combined = np.tile(combined, (1, reps))[:, :channels]
+        elif source_channels > channels:
+            combined = combined[:, :channels]
+        return combined
 
     @staticmethod
     def _close_voice_stream(voice: _Voice | _StreamingVoice) -> None:
@@ -1017,23 +1205,155 @@ class SamplePadAudioEngine:
     @staticmethod
     def _find_device(name: str) -> Optional[int]:
         """Return the sounddevice output device index for *name*, or None."""
+        return SamplePadAudioEngine._find_device_by_channel_key(
+            name,
+            "max_output_channels",
+            prefer_non_monitor=False,
+        )
+
+    @staticmethod
+    def _find_input_device(name: str) -> Optional[int]:
+        """Return the sounddevice input device index for *name*, or None."""
+        return SamplePadAudioEngine._find_device_by_channel_key(
+            name,
+            "max_input_channels",
+            prefer_non_monitor=True,
+        )
+
+    @staticmethod
+    def _find_device_by_channel_key(
+        name: str,
+        channel_key: str,
+        *,
+        prefer_non_monitor: bool,
+    ) -> Optional[int]:
         if not name:
             return None
         name_cf = name.casefold()
+        normalized_target = SamplePadAudioEngine._normalize_device_label(name)
+        target_tokens = SamplePadAudioEngine._meaningful_device_tokens(name)
         try:
             devices = sd.query_devices()
         except Exception:
             return None
         for idx, dev in enumerate(devices):
-            if dev.get("max_output_channels", 0) > 0:
-                if dev.get("name", "").casefold() == name_cf:
+            if dev.get(channel_key, 0) > 0:
+                dev_name = str(dev.get("name", ""))
+                dev_name_cf = dev_name.casefold()
+                if dev_name_cf == name_cf:
                     return idx
-        # Partial match fallback
+
+        # Partial match fallback in both directions.
         for idx, dev in enumerate(devices):
-            if dev.get("max_output_channels", 0) > 0:
-                if name_cf in dev.get("name", "").casefold():
+            if dev.get(channel_key, 0) > 0:
+                dev_name_cf = str(dev.get("name", "")).casefold()
+                if name_cf in dev_name_cf or dev_name_cf in name_cf:
                     return idx
+
+        # Normalized matching tolerates punctuation/host API suffix differences
+        # between Qt device labels and PortAudio device labels.
+        best_idx: Optional[int] = None
+        best_score = 0.0
+        for idx, dev in enumerate(devices):
+            if dev.get(channel_key, 0) <= 0:
+                continue
+            dev_name = str(dev.get("name", ""))
+            normalized_dev = SamplePadAudioEngine._normalize_device_label(dev_name)
+            if not normalized_dev:
+                continue
+            if normalized_target and normalized_target == normalized_dev:
+                return idx
+            if normalized_target and (
+                normalized_target in normalized_dev or normalized_dev in normalized_target
+            ):
+                return idx
+
+            score = SamplePadAudioEngine._device_match_score(
+                name,
+                dev_name,
+                channel_key=channel_key,
+                prefer_non_monitor=prefer_non_monitor,
+                target_tokens=target_tokens,
+            )
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+
+        if best_idx is not None and best_score >= 0.55:
+            return best_idx
         return None
+
+    @staticmethod
+    def _normalize_device_label(value: str) -> str:
+        cleaned = re.sub(r"[^a-z0-9]+", " ", value.casefold())
+        return " ".join(cleaned.split())
+
+    @staticmethod
+    def _meaningful_device_tokens(value: str) -> set[str]:
+        tokens = set(SamplePadAudioEngine._normalize_device_label(value).split())
+        ignored = {
+            "alsa",
+            "audio",
+            "built",
+            "default",
+            "device",
+            "in",
+            "input",
+            "output",
+            "pci",
+            "pipewire",
+            "pulse",
+            "sink",
+            "source",
+            "sysdefault",
+            "usb",
+        }
+        filtered = {
+            token
+            for token in tokens
+            if token not in ignored and not token.isdigit() and len(token) > 1
+        }
+        return filtered or {
+            token for token in tokens if not token.isdigit() and len(token) > 1
+        }
+
+    @staticmethod
+    def _device_match_score(
+        target_name: str,
+        device_name: str,
+        *,
+        channel_key: str,
+        prefer_non_monitor: bool,
+        target_tokens: set[str],
+    ) -> float:
+        normalized_target = SamplePadAudioEngine._normalize_device_label(target_name)
+        normalized_device = SamplePadAudioEngine._normalize_device_label(device_name)
+        if not normalized_target or not normalized_device:
+            return 0.0
+
+        device_tokens = SamplePadAudioEngine._meaningful_device_tokens(device_name)
+        overlap = target_tokens.intersection(device_tokens)
+        score = 0.0
+        if target_tokens and overlap:
+            coverage = len(overlap) / float(len(target_tokens))
+            precision = len(overlap) / float(len(device_tokens) or 1)
+            score = max(score, coverage * 0.75 + precision * 0.25)
+
+        if normalized_target in normalized_device:
+            score = max(score, 0.95)
+        if normalized_device in normalized_target:
+            score = max(score, 0.90)
+
+        has_monitor = "monitor" in normalized_device
+        target_mentions_monitor = "monitor" in normalized_target
+        if prefer_non_monitor and has_monitor and not target_mentions_monitor:
+            score -= 0.35
+        if channel_key == "max_input_channels" and "output" in normalized_device and not target_mentions_monitor:
+            score -= 0.15
+        if "default" in normalized_device and target_tokens:
+            score -= 0.05
+
+        return score
 
     @staticmethod
     def _begin_voice_fade(voice: _Voice | _StreamingVoice, fade_samples: int) -> None:
@@ -1077,7 +1397,10 @@ class SamplePadAudioEngine:
                 for pad_index in stale_pads:
                     self._pad_meter_levels.pop(pad_index, None)
 
-            if not self._voices:
+            mixer_enabled = self._mixer_enabled
+            input_gain = self._input_gain
+
+            if not self._voices and not mixer_enabled:
                 outdata[:] = 0
                 return
 
@@ -1192,6 +1515,12 @@ class SamplePadAudioEngine:
                     if voice.pad_index >= 0 and self._pad_to_voice.get(voice.pad_index) == voice_id:
                         self._pad_to_voice.pop(voice.pad_index, None)
 
+        if mixer_enabled:
+            mic_chunk = self._pop_input_chunk(frames, outdata.shape[1])
+            if mic_chunk.shape[0] > 0 and input_gain > 0.0:
+                mic_frames = min(frames, mic_chunk.shape[0])
+                out[:mic_frames] += mic_chunk[:mic_frames] * input_gain
+
         peak = float(np.max(np.abs(out))) if out.size else 0.0
         if peak > 1.0:
             out *= (_MIX_HEADROOM / peak)
@@ -1214,6 +1543,41 @@ class SamplePadAudioEngine:
             )
 
         outdata[:] = out
+
+    def _input_callback(
+        self,
+        indata: np.ndarray,
+        frames: int,
+        _time,
+        _status,
+    ) -> None:
+        if frames <= 0:
+            return
+        chunk = np.array(indata[:frames], copy=True, dtype=np.float32)
+        if chunk.ndim == 1:
+            chunk = chunk[:, np.newaxis]
+
+        left_level = 0.0
+        right_level = 0.0
+        if chunk.size:
+            left_level = float(np.max(np.abs(chunk[:, 0])))
+            if chunk.shape[1] >= 2:
+                right_level = float(np.max(np.abs(chunk[:, 1])))
+            else:
+                right_level = left_level
+
+        with self._lock:
+            prev_left, prev_right = self._input_meter_levels
+            self._input_meter_levels = (
+                max(prev_left * 0.82, left_level),
+                max(prev_right * 0.82, right_level),
+            )
+            self._input_buffer.append(chunk)
+            self._input_buffer_frames += chunk.shape[0]
+            max_frames = max(0, int(self._input_buffer_max_frames))
+            while self._input_buffer and self._input_buffer_frames > max_frames:
+                old_chunk = self._input_buffer.popleft()
+                self._input_buffer_frames -= old_chunk.shape[0]
 
 
 # ---------------------------------------------------------------------------
