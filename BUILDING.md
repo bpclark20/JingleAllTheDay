@@ -6,21 +6,21 @@ This file is the dedicated reference for controlling build inputs and outputs.
 
 1. Build the app bundle:
 
-```powershell
-.\build_exe.ps1
+```bat
+build_exe.bat
 ```
 
 2. Build the installer from that bundle:
 
-```powershell
-.\build_installer.ps1
+```bat
+build_installer.bat
 ```
 
 Default result:
 - App bundle output: `%LOCALAPPDATA%\JingleAllTheDay\pyinstaller\dist`
 - Installer output folder: `./installer`
 
-## Script 1: build_exe.ps1
+## Script 1: build_exe.bat
 
 Purpose:
 - Runs PyInstaller with `JingleAllTheDay.spec` using project virtualenv Python.
@@ -53,17 +53,17 @@ Given `OutRoot = X`:
 
 Default:
 
-```powershell
-.\build_exe.ps1
+```bat
+build_exe.bat
 ```
 
 Custom output root:
 
-```powershell
-.\build_exe.ps1 -OutRoot "D:\build-cache\JATD"
+```bat
+build_exe.bat -OutRoot "D:\build-cache\JATD"
 ```
 
-## Script 2: build_installer.ps1
+## Script 2: build_installer.bat
 
 Purpose:
 - Compiles `installer.iss` with Inno Setup (`ISCC.exe`).
@@ -116,51 +116,51 @@ Environment variable set by script before invoking Inno Setup:
 
 Default (uses `%LOCALAPPDATA%\JingleAllTheDay\pyinstaller\dist`):
 
-```powershell
-.\build_installer.ps1
+```bat
+build_installer.bat
 ```
 
 Use custom source dir:
 
-```powershell
-.\build_installer.ps1 -SourceDir "D:\build-cache\JATD\dist"
+```bat
+build_installer.bat -SourceDir "D:\build-cache\JATD\dist"
 ```
 
 Set version manually:
 
-```powershell
-.\build_installer.ps1 -AppVersion "1.2.3-custom"
+```bat
+build_installer.bat -AppVersion "1.2.3-custom"
 ```
 
 Set custom output folder:
 
-```powershell
-.\build_installer.ps1 -OutputDir "D:\releases\JATD"
+```bat
+build_installer.bat -OutputDir "D:\releases\JATD"
 ```
 
 Provide explicit Inno Setup compiler path:
 
-```powershell
-.\build_installer.ps1 -IsccPath "C:\Program Files\Inno Setup 6\ISCC.exe"
+```bat
+build_installer.bat -IsccPath "C:\Program Files\Inno Setup 6\ISCC.exe"
 ```
 
 Full custom example:
 
-```powershell
-.\build_installer.ps1 -OutRoot "D:\build-cache\JATD" -SourceDir "D:\build-cache\JATD\dist" -ScriptPath ".\installer.iss" -AppVersion "1.2.3" -OutputDir "D:\releases\JATD"
+```bat
+build_installer.bat -OutRoot "D:\build-cache\JATD" -SourceDir "D:\build-cache\JATD\dist" -ScriptPath ".\installer.iss" -AppVersion "1.2.3" -OutputDir "D:\releases\JATD"
 ```
 
 ## Recommended Release Flow
 
-```powershell
-.\build_exe.ps1 -OutRoot "D:\build-cache\JATD"
-.\build_installer.ps1 -OutRoot "D:\build-cache\JATD" -OutputDir "D:\releases\JATD"
+```bat
+build_exe.bat -OutRoot "D:\build-cache\JATD"
+build_installer.bat -OutRoot "D:\build-cache\JATD" -OutputDir "D:\releases\JATD"
 ```
 
 ## Troubleshooting
 
 If installer build says source directory not found:
-- Run `./build_exe.ps1` first, or pass `-SourceDir` explicitly.
+- Run `build_exe.bat` first, or pass `-SourceDir` explicitly.
 
 If installer build says expected EXE not found:
 - Verify `JingleAllTheDay.exe` exists in your `SourceDir`.
@@ -168,7 +168,7 @@ If installer build says expected EXE not found:
 If Inno Setup compiler not found:
 - Install Inno Setup:
 
-```powershell
+```bat
 winget install --exact --id JRSoftware.InnoSetup
 ```
 

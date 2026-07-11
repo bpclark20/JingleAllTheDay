@@ -76,6 +76,14 @@ class MainWindowFileEditMixin:
         for record in self._records:
             record.categories = self._store.get(record.path)
 
+        sanitized_count = self._store.last_reserved_tag_sanitized_count()
+        if sanitized_count > 0:
+            QMessageBox.warning(
+                self,
+                "Reserved Tag Sanitized",
+                f"Removed {sanitized_count} reserved 'Recent' tag value(s) from the imported database.",
+            )
+
         self._store.save()
         self._apply_filters()
         self._status.showMessage(f"Imported tag database from {source_path.name}")

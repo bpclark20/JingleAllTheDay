@@ -5,22 +5,20 @@ from __future__ import annotations
 
 import ctypes
 import os
-import signal
-import subprocess
 import sys
-import time
 from pathlib import Path
 
 from app_helpers import apply_windows_taskbar_icon as _apply_windows_taskbar_icon
 from gui import MainWindow
-from PyQt6.QtCore import QStandardPaths
+from PyQt6.QtCore import QLockFile, QStandardPaths
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 APP_NAME = "JingleAllTheDay"
-APP_VERSION = "1.8.0.062726"
+APP_VERSION = "1.8.5.070626"
 APP_ID = "JingleAllTheDay.App"
 _INSTANCE_LOCK_NAME = "single_instance.lock"
+_QT_LOCK_NAME = "single_instance.qtlock"
 
 _HERE = Path(sys._MEIPASS) if hasattr(sys, "_MEIPASS") else Path(__file__).resolve().parent  # type: ignore[attr-defined]
 
@@ -28,85 +26,59 @@ _HERE = Path(sys._MEIPASS) if hasattr(sys, "_MEIPASS") else Path(__file__).resol
 class _SingleInstanceGuard:
     def __init__(self, app: QApplication) -> None:
         self._app = app
-        app_data_location = QStandardPaths.writableLocation(
-            QStandardPaths.StandardLocation.AppDataLocation
+        lock_root = QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.TempLocation
         )
-        if app_data_location.strip():
-            base_dir = Path(app_data_location)
+        if lock_root.strip():
+            base_dir = Path(lock_root) / APP_NAME
         else:
-            # Defensive fallback: Qt should usually provide AppDataLocation,
-            # but keep single-instance protection alive if it does not.
-            base_dir = Path.home() / ".local" / "share" / APP_NAME
+            # Defensive fallback when Qt cannot resolve temp location.
+            base_dir = Path.home() / ".cache" / APP_NAME
         self._lock_path = base_dir / _INSTANCE_LOCK_NAME
+        self._qt_lock_path = base_dir / _QT_LOCK_NAME
         self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self._qt_lock = QLockFile(str(self._qt_lock_path))
+        # Disable time-based stale detection for strict single-instance behavior.
+        self._qt_lock.setStaleLockTime(0)
         self._acquired = False
 
     def acquire_or_prompt(self) -> bool:
-        if self._try_acquire():
+        if not self._qt_lock.tryLock(0):
+            return False
+
+        if self._try_acquire_pid_lock():
             return True
 
-        owner_pid = self._read_owner_pid()
-        if owner_pid is None:
-            self._remove_stale_lock()
-            return self._try_acquire()
-
-        if not self._is_pid_alive(owner_pid):
-            self._remove_stale_lock()
-            return self._try_acquire()
-
-        response = QMessageBox.question(
-            None,
-            "JingleAllTheDay Already Running",
-            (
-                "Another instance of JingleAllTheDay is already running.\n\n"
-                "Would you like this instance to terminate the first one and continue?"
-            ),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if response != QMessageBox.StandardButton.Yes:
-            return False
-
-        if not self._terminate_pid(owner_pid):
-            QMessageBox.warning(
-                None,
-                "Could Not Terminate First Instance",
-                "The existing instance could not be terminated. This launch will now exit.",
-            )
-            return False
-
-        if not self._wait_for_pid_exit(owner_pid, timeout_seconds=4.0):
-            QMessageBox.warning(
-                None,
-                "Existing Instance Still Running",
-                "The existing instance did not exit in time. This launch will now exit.",
-            )
-            return False
-
-        self._remove_stale_lock()
-        if self._try_acquire():
-            return True
-
-        QMessageBox.warning(
-            None,
-            "Could Not Acquire Instance Lock",
-            "Could not acquire the single-instance lock after terminating the first instance.",
-        )
+        self._qt_lock.unlock()
         return False
 
     def release(self) -> None:
         if not self._acquired:
+            if self._qt_lock.isLocked():
+                self._qt_lock.unlock()
             return
         self._remove_stale_lock()
+        if self._qt_lock.isLocked():
+            self._qt_lock.unlock()
         self._acquired = False
 
-    def _try_acquire(self) -> bool:
+    def _try_acquire_pid_lock(self) -> bool:
         try:
             with self._lock_path.open("x", encoding="utf-8") as handle:
                 handle.write(str(os.getpid()))
             self._acquired = True
             return True
         except FileExistsError:
+            owner_pid = self._read_owner_pid()
+            if owner_pid is None or not self._is_pid_alive(owner_pid):
+                self._remove_stale_lock()
+                try:
+                    with self._lock_path.open("x", encoding="utf-8") as handle:
+                        handle.write(str(os.getpid()))
+                    self._acquired = True
+                    return True
+                except Exception:
+                    return False
             return False
         except Exception:
             return False
@@ -129,42 +101,23 @@ class _SingleInstanceGuard:
     def _is_pid_alive(pid: int) -> bool:
         if pid <= 0:
             return False
+        if sys.platform == "win32":
+            process_query_limited_information = 0x1000
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(process_query_limited_information, False, int(pid))
+            if handle:
+                kernel32.CloseHandle(handle)
+                return True
+            # Access denied can still mean the process exists.
+            last_error = ctypes.get_last_error()
+            if last_error == 5:
+                return True
+            return False
         try:
             os.kill(pid, 0)
         except OSError:
             return False
         return True
-
-    @staticmethod
-    def _terminate_pid(pid: int) -> bool:
-        if pid <= 0:
-            return False
-        if sys.platform == "win32":
-            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            result = subprocess.run(
-                ["taskkill", "/PID", str(pid), "/T", "/F"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=creation_flags,
-                check=False,
-            )
-            return result.returncode == 0
-
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except Exception:
-            return False
-        return True
-
-    def _wait_for_pid_exit(self, pid: int, timeout_seconds: float) -> bool:
-        deadline = time.monotonic() + max(0.2, timeout_seconds)
-        while time.monotonic() < deadline:
-            if not self._is_pid_alive(pid):
-                return True
-            self._app.processEvents()
-            time.sleep(0.05)
-        return not self._is_pid_alive(pid)
-
 
 def main() -> None:
     if sys.platform == "win32":
@@ -186,6 +139,12 @@ def main() -> None:
 
     instance_guard = _SingleInstanceGuard(app)
     if not instance_guard.acquire_or_prompt():
+        QMessageBox.information(
+            None,
+            "JingleAllTheDay Already Running",
+            "Another instance of JingleAllTheDay is already running.\n\n"
+            "This launch will now exit to prevent concurrent access.",
+        )
         sys.exit(0)
 
     window = MainWindow(app_name=APP_NAME, app_version=APP_VERSION)
