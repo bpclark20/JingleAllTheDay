@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import json
 from typing import Callable
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QDrag, QKeyEvent, QMouseEvent
-from PyQt6.QtCore import QMimeData
+from PyQt6.QtGui import QKeyEvent, QMouseEvent
 from PyQt6.QtWidgets import QTableWidget
 
 
@@ -15,19 +13,9 @@ class DeselectableTableWidget(QTableWidget):
     def __init__(self, rows: int, columns: int) -> None:
         super().__init__(rows, columns)
         self._preserve_selection_callback: Callable[[], bool] | None = None
-        self._drag_payload_callback: Callable[[], list[dict[str, str]]] | None = None
-        self._drag_mime_type = ""
 
     def set_preserve_selection_callback(self, callback: Callable[[], bool]) -> None:
         self._preserve_selection_callback = callback
-
-    def set_drag_payload_callback(
-        self,
-        callback: Callable[[], list[dict[str, str]]],
-        mime_type: str,
-    ) -> None:
-        self._drag_payload_callback = callback
-        self._drag_mime_type = str(mime_type).strip()
 
     def keyPressEvent(self, event: QKeyEvent | None) -> None:
         # Let arrow keys propagate to the parent window for global shortcuts.
@@ -55,38 +43,6 @@ class DeselectableTableWidget(QTableWidget):
                 event.accept()
                 return
         super().mousePressEvent(event)
-
-    def startDrag(self, supportedActions: Qt.DropAction) -> None:
-        if self._drag_payload_callback is None or not self._drag_mime_type:
-            super().startDrag(supportedActions)
-            return
-
-        payload = self._drag_payload_callback()
-        if not payload:
-            super().startDrag(supportedActions)
-            return
-
-        mime = QMimeData()
-        try:
-            mime.setData(
-                self._drag_mime_type,
-                json.dumps(payload, ensure_ascii=True).encode("utf-8"),
-            )
-        except Exception:
-            super().startDrag(supportedActions)
-            return
-
-        line_text = []
-        for item in payload:
-            path_text = str(item.get("path", "")).strip()
-            if path_text:
-                line_text.append(path_text)
-        if line_text:
-            mime.setText("\n".join(line_text))
-
-        drag = QDrag(self)
-        drag.setMimeData(mime)
-        drag.exec(Qt.DropAction.CopyAction)
 
 
 if __name__ == "__main__":

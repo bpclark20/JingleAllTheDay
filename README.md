@@ -83,8 +83,8 @@ Distribute the entire `dist\JingleAllTheDay` folder, not just the `.exe`, becaus
 
 Or use the helper script in this repo, which flattens output into `dist\`:
 
-```bat
-build_exe.bat
+```powershell
+.\build_exe.ps1
 ```
 
 That script places `JingleAllTheDay.exe` and `_internal\` directly under `dist\`.
@@ -126,14 +126,14 @@ Install Inno Setup 6 (provides `ISCC.exe`).
 
 1. Build the bundled app output:
 
-```bat
-build_exe.bat
+```powershell
+.\build_exe.ps1
 ```
 
 2. Build the installer:
 
-```bat
-build_installer.bat
+```powershell
+.\build_installer.ps1
 ```
 
 The installer executable is written to:
@@ -142,8 +142,8 @@ The installer executable is written to:
 
 You can override version/source when needed:
 
-```bat
-build_installer.bat -AppVersion "1.0.0-custom" -SourceDir ".\dist"
+```powershell
+.\build_installer.ps1 -AppVersion "1.0.0-custom" -SourceDir ".\dist"
 ```
 
 ## Runtime Dependencies

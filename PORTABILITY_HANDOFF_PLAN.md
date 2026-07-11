@@ -118,8 +118,8 @@ When back on Windows, validate in this order:
 2. Run app.py and verify startup/single-instance behavior.
 3. Verify main playback routing and sample-pad routing.
 4. Verify global hotkeys (native and fallback behavior).
-5. Run build_exe.bat.
-6. Run build_installer.bat.
+5. Run build_exe.ps1.
+6. Run build_installer.ps1.
 
 ## Notes
 

@@ -1,9 +1,9 @@
 #define MyAppId "{{CB8F471A-B9B6-49D6-A975-FC0F9FF7C67F}}"
 #define MyAppName "JingleAllTheDay"
 #ifndef MyAppVersion
-  #define MyAppVersion "1.8.5.070626"
+  #define MyAppVersion "1.0.0"
 #endif
-#define MyAppPublisher "Brian Clark"
+#define MyAppPublisher "JingleAllTheDay"
 #define MyAppExeName "JingleAllTheDay.exe"
 
 #define SourceRoot GetEnv("JATD_SOURCE_DIR")

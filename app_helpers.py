@@ -6,7 +6,6 @@ import os
 import shutil
 import subprocess
 import sys
-import time
 import wave
 from pathlib import Path
 from typing import Any
@@ -14,8 +13,6 @@ from typing import Any
 _HERE = Path(sys._MEIPASS) if hasattr(sys, "_MEIPASS") else Path(__file__).resolve().parent  # type: ignore[attr-defined]
 _FFPROBE_PATH: str | None = None
 _FFPROBE_CHECKED = False
-
-RESERVED_INTERNAL_TAG_RECENT = "Recent"
 
 
 def ensure_qt_logging_rules() -> None:
@@ -118,33 +115,6 @@ def remove_tags(existing: list[str], incoming: list[str]) -> list[str]:
     if not remove_keys:
         return list(existing)
     return [tag for tag in existing if tag.casefold() not in remove_keys]
-
-
-def is_reserved_internal_tag(tag: str) -> bool:
-    return tag.strip().casefold() == RESERVED_INTERNAL_TAG_RECENT.casefold()
-
-
-def sanitize_user_tags(tags: list[str]) -> tuple[list[str], list[str]]:
-    clean: list[str] = []
-    rejected: list[str] = []
-    for tag in normalize_tags(tags):
-        if is_reserved_internal_tag(tag):
-            rejected.append(tag)
-            continue
-        clean.append(tag)
-    return clean, rejected
-
-
-def coerce_recent_window_days(value: Any, default: int = 14) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        parsed = int(default)
-    return max(1, min(3650, parsed))
-
-
-def now_epoch_seconds() -> int:
-    return max(0, int(time.time()))
 
 
 def coerce_volume_percent(value: Any, default: int = 100) -> int:

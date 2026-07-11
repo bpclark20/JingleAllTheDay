@@ -6,12 +6,7 @@ from typing import cast
 from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal
 from PyQt6.QtWidgets import QDialog, QHBoxLayout, QInputDialog, QLabel, QMessageBox, QProgressBar, QPushButton, QVBoxLayout
 
-from app_helpers import (
-    RESERVED_INTERNAL_TAG_RECENT,
-    merge_tags as _merge_tags,
-    normalize_tags as _normalize_tags,
-    sanitize_user_tags as _sanitize_user_tags,
-)
+from app_helpers import merge_tags as _merge_tags, normalize_tags as _normalize_tags
 from mainwindow_contracts import MainWindowToolsHost
 from models_store import JingleRecord
 from waveform_cache import build_waveform_previews, has_persisted_waveform_preview
@@ -69,14 +64,6 @@ class _WaveformBuildWorker(QObject):
 class MainWindowToolsMixin:
     def _host(self) -> MainWindowToolsHost:
         return cast(MainWindowToolsHost, self)
-
-    def _on_tools_open_playlists(self) -> None:
-        host = self._host()
-        playlists_window = host._ensure_playlists_window()
-        playlists_window.show()
-        playlists_window.raise_()
-        playlists_window.activateWindow()
-        host._status.showMessage("Playlists window opened.")
 
     def _on_tools_clear_all_categories(self) -> None:
         host = self._host()
@@ -571,16 +558,12 @@ class MainWindowToolsMixin:
     ) -> int:
         host = self._host()
         updated = 0
-        rejected_total = 0
         for record in records:
             derived_tags = self._derive_folder_tags(record)
             if preserve_existing:
-                proposed_categories = _merge_tags(record.categories, derived_tags)
+                new_categories = _merge_tags(record.categories, derived_tags)
             else:
-                proposed_categories = _normalize_tags(derived_tags)
-
-            new_categories, rejected = _sanitize_user_tags(proposed_categories)
-            rejected_total += len(rejected)
+                new_categories = _normalize_tags(derived_tags)
 
             if new_categories != record.categories:
                 record.categories = new_categories
@@ -589,12 +572,6 @@ class MainWindowToolsMixin:
 
         host._store.save()
         self._apply_filters()
-        if rejected_total > 0:
-            QMessageBox.warning(
-                self,
-                "Reserved Tag",
-                f"Ignored {rejected_total} reserved '{RESERVED_INTERNAL_TAG_RECENT}' folder-derived tag value(s).",
-            )
         return updated
 
 
