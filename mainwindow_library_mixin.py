@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 from typing import cast
 
 from PyQt6.QtCore import Qt
@@ -8,6 +9,7 @@ from PyQt6.QtGui import QCursor
 from PyQt6.QtWidgets import QApplication, QLabel, QPushButton
 
 from app_helpers import (
+    RESERVED_INTERNAL_TAG_RECENT,
     chip_palette_for_tag_seed as _chip_palette_for_tag_seed,
     format_duration_hms as _format_duration_hms,
     format_size_label as _format_size_label,
@@ -39,13 +41,37 @@ class MainWindowLibraryMixin:
 
     def _scan_audio_files(self, root: Path) -> list[Path]:
         files: list[Path] = []
+        reserved_folder_paths: set[Path] = set()
         if not root.exists() or not root.is_dir():
+            self._last_reserved_recent_folders = []
             return files
         for path in root.rglob("*"):
-            if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS:
-                files.append(path)
+            if not path.is_file() or path.suffix.lower() not in AUDIO_EXTENSIONS:
+                continue
+
+            try:
+                rel_parts = path.relative_to(root).parts
+            except ValueError:
+                rel_parts = path.parts
+
+            blocked = False
+            for index, part in enumerate(rel_parts[:-1]):
+                if part.strip().casefold() != RESERVED_INTERNAL_TAG_RECENT.casefold():
+                    continue
+                reserved_folder_paths.add(root.joinpath(*rel_parts[: index + 1]))
+                blocked = True
+                break
+
+            if blocked:
+                continue
+
+            files.append(path)
 
         files.sort(key=self._file_sort_key)
+        self._last_reserved_recent_folders = sorted(
+            reserved_folder_paths,
+            key=lambda p: str(p).casefold(),
+        )
         return files
 
     def _file_sort_key(self, path: Path) -> tuple[int, str, str, str, str]:
@@ -95,6 +121,7 @@ class MainWindowLibraryMixin:
                 JingleRecord(
                     path=path,
                     categories=categories,
+                    added_at_epoch_seconds=self._store.get_added_at(path) or 0,
                     size_bytes=size_bytes,
                     duration_seconds=duration_seconds,
                     clip_start_seconds=clip_start_seconds,
@@ -152,6 +179,7 @@ class MainWindowLibraryMixin:
         QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
         try:
             files = self._scan_audio_files(self._samples_dir)
+            self._maybe_warn_reserved_recent_folders()
             self._refresh_library_watcher_paths(files)
             existing_paths = {path_key for path_key, _ in self._store.iter_entries()}
             new_paths = [path for path in files if str(path) not in existing_paths]
@@ -168,6 +196,11 @@ class MainWindowLibraryMixin:
                 except OSError:
                     size_bytes = 0
                     mtime_ns = 0
+
+                added_at_epoch_seconds = self._store.ensure_added_at(
+                    path,
+                    max(0, int(mtime_ns / 1_000_000_000)) if mtime_ns > 0 else int(time.time()),
+                )
 
                 cached = self._store.get_media_cache(path)
                 if (
@@ -187,6 +220,7 @@ class MainWindowLibraryMixin:
                     JingleRecord(
                         path=path,
                         categories=categories,
+                        added_at_epoch_seconds=added_at_epoch_seconds,
                         size_bytes=size_bytes,
                         duration_seconds=duration_seconds,
                         clip_start_seconds=clip_start_seconds,
@@ -234,9 +268,12 @@ class MainWindowLibraryMixin:
 
         visible: list[int] = []
         for index, record in enumerate(self._records):
+            is_recent = self._is_record_recent(record)
             if selected_categories:
                 record_keys = {tag.casefold() for tag in record.categories}
                 selected_keys = {tag.casefold() for tag in selected_categories}
+                if is_recent:
+                    record_keys.add(RESERVED_INTERNAL_TAG_RECENT.casefold())
                 if category_mode == "all":
                     if not selected_keys.issubset(record_keys):
                         continue
@@ -248,14 +285,20 @@ class MainWindowLibraryMixin:
                 if search_scope == "name":
                     haystack = record.name.casefold()
                 elif search_scope == "tag":
-                    haystack = _tags_to_text(record.categories).casefold()
+                    tags_for_search = list(record.categories)
+                    if is_recent:
+                        tags_for_search.append(RESERVED_INTERNAL_TAG_RECENT)
+                    haystack = _tags_to_text(tags_for_search).casefold()
                 elif search_scope == "path":
                     haystack = str(record.path).casefold()
                 else:
+                    tags_for_search = list(record.categories)
+                    if is_recent:
+                        tags_for_search.append(RESERVED_INTERNAL_TAG_RECENT)
                     haystack = " ".join(
                         [
                             record.name,
-                            _tags_to_text(record.categories),
+                            _tags_to_text(tags_for_search),
                             str(record.path),
                         ]
                     ).casefold()
@@ -267,6 +310,14 @@ class MainWindowLibraryMixin:
         self._visible_indices = visible
         self._rebuild_table()
         self._refresh_status_summary()
+
+    def _is_record_recent(self, record: JingleRecord) -> bool:
+        added_epoch = int(getattr(record, "added_at_epoch_seconds", 0) or 0)
+        if added_epoch <= 0:
+            return False
+        window_days = max(1, int(getattr(self, "_recent_window_days", 14) or 14))
+        age_seconds = max(0, int(time.time()) - added_epoch)
+        return age_seconds <= (window_days * 24 * 60 * 60)
 
     def _refresh_status_summary(self) -> None:
         total_count = len(self._records)

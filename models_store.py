@@ -5,14 +5,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
+from app_helpers import now_epoch_seconds as _now_epoch_seconds
 from app_helpers import merge_tags as _merge_tags
 from app_helpers import normalize_tags as _normalize_tags
+from app_helpers import sanitize_user_tags as _sanitize_user_tags
 
 
 @dataclass
 class JingleRecord:
     path: Path
     categories: list[str]
+    added_at_epoch_seconds: int = 0
     size_bytes: int = 0
     duration_seconds: float = 0.0
     clip_start_seconds: float = 0.0
@@ -34,6 +37,8 @@ class LibraryStore:
     def __init__(self, json_path: Path) -> None:
         self._json_path = json_path
         self._entries: dict[str, dict[str, Any]] = {}
+        self._meta: dict[str, Any] = {}
+        self._last_reserved_tag_sanitized_count = 0
         self._load()
 
     def _load(self) -> None:
@@ -46,12 +51,16 @@ class LibraryStore:
             self._entries = {}
             return
 
-        self._entries = self._entries_from_payload(payload)
+        self._entries, self._meta, sanitized_count = self._entries_from_payload(payload)
+        self._last_reserved_tag_sanitized_count = sanitized_count
 
     @staticmethod
-    def _entries_from_payload(payload: object) -> dict[str, dict[str, Any]]:
+    def _entries_from_payload(payload: object) -> tuple[dict[str, dict[str, Any]], dict[str, Any], int]:
         raw_items = payload.get("items", {}) if isinstance(payload, dict) else {}
+        raw_meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
         entries: dict[str, dict[str, Any]] = {}
+        meta: dict[str, Any] = raw_meta if isinstance(raw_meta, dict) else {}
+        sanitized_count = 0
         if isinstance(raw_items, dict):
             for path_key, info in raw_items.items():
                 if not isinstance(path_key, str) or not isinstance(info, dict):
@@ -66,14 +75,23 @@ class LibraryStore:
                 if subcategory_raw is None:
                     subcategory_raw = info.get("subcategory", "")
 
-                categories = _merge_tags(
+                raw_categories = _merge_tags(
                     _normalize_tags(category_raw),
                     _normalize_tags(subcategory_raw),
                 )
+                categories, rejected = _sanitize_user_tags(raw_categories)
+                sanitized_count += len(rejected)
 
                 entry: dict[str, Any] = {
                     "categories": categories,
                 }
+
+                added_raw = info.get("added_at_epoch_seconds")
+                try:
+                    if added_raw is not None:
+                        entry["added_at_epoch_seconds"] = max(0, int(added_raw))
+                except (TypeError, ValueError):
+                    pass
 
                 size_raw = info.get("size_bytes")
                 duration_raw = info.get("duration_seconds")
@@ -135,32 +153,66 @@ class LibraryStore:
                     pass
 
                 entries[path_key] = entry
-        return entries
+        return entries, meta, sanitized_count
 
     def save(self) -> None:
         self._json_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"version": 6, "items": self._entries}
+        payload = {"version": 7, "meta": self._meta, "items": self._entries}
         self._json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def export_to(self, destination: Path) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"version": 6, "items": self._entries}
+        payload = {"version": 7, "meta": self._meta, "items": self._entries}
         destination.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def import_from(self, source: Path) -> None:
         payload = json.loads(source.read_text(encoding="utf-8"))
-        self._entries = self._entries_from_payload(payload)
+        self._entries, self._meta, sanitized_count = self._entries_from_payload(payload)
+        self._last_reserved_tag_sanitized_count = sanitized_count
+
+    def last_reserved_tag_sanitized_count(self) -> int:
+        return max(0, int(self._last_reserved_tag_sanitized_count))
+
+    def is_added_at_bootstrap_completed(self) -> bool:
+        return bool(self._meta.get("recent_added_at_bootstrapped_from_mtime", False))
+
+    def set_added_at_bootstrap_completed(self, completed: bool) -> None:
+        self._meta["recent_added_at_bootstrapped_from_mtime"] = bool(completed)
 
     def get(self, path: Path) -> list[str]:
         info = self._entries.get(str(path), {})
-        categories = _normalize_tags(info.get("categories", []))
+        categories, _rejected = _sanitize_user_tags(_normalize_tags(info.get("categories", [])))
         return categories
 
     def set(self, path: Path, categories: list[str]) -> None:
         key = str(path)
         entry = dict(self._entries.get(key, {}))
-        entry["categories"] = _normalize_tags(categories)
+        clean_categories, _rejected = _sanitize_user_tags(_normalize_tags(categories))
+        entry["categories"] = clean_categories
         self._entries[key] = entry
+
+    def get_added_at(self, path: Path) -> int | None:
+        info = self._entries.get(str(path), {})
+        try:
+            value = int(info.get("added_at_epoch_seconds"))
+        except (TypeError, ValueError):
+            return None
+        return max(0, value)
+
+    def set_added_at(self, path: Path, added_at_epoch_seconds: int) -> None:
+        key = str(path)
+        entry = dict(self._entries.get(key, {}))
+        entry["added_at_epoch_seconds"] = max(0, int(added_at_epoch_seconds))
+        self._entries[key] = entry
+
+    def ensure_added_at(self, path: Path, fallback_epoch_seconds: int | None = None) -> int:
+        existing = self.get_added_at(path)
+        if existing is not None and existing > 0:
+            return existing
+        fallback = _now_epoch_seconds() if fallback_epoch_seconds is None else int(fallback_epoch_seconds)
+        fallback = max(0, fallback)
+        self.set_added_at(path, fallback)
+        return fallback
 
     def remove(self, path: Path) -> None:
         self._entries.pop(str(path), None)
@@ -346,7 +398,10 @@ class LibraryStore:
         for path in files:
             key = str(path)
             if key not in self._entries:
-                self._entries[key] = {"categories": []}
+                self._entries[key] = {
+                    "categories": [],
+                    "added_at_epoch_seconds": _now_epoch_seconds(),
+                }
 
 
 if __name__ == "__main__":

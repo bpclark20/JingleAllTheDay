@@ -543,6 +543,25 @@ class SamplePadAudioEngine:
         with self._lock:
             self._pad_mix_settings[pad_index] = (volume, pan, bool(muted), bool(solo))
 
+    def set_pad_loop(self, pad_index: int, loop: bool) -> None:
+        """Update loop behavior in-place for an active/pending pad voice."""
+        if pad_index < 0:
+            return
+        loop_value = bool(loop)
+        with self._lock:
+            pending = self._pending_pad_triggers.get(pad_index)
+            if pending is not None:
+                pending_key, pending_volume, _pending_loop = pending
+                self._pending_pad_triggers[pad_index] = (pending_key, pending_volume, loop_value)
+
+            voice_id = self._pad_to_voice.get(pad_index)
+            if voice_id is None:
+                return
+            voice = self._voices.get(voice_id)
+            if voice is None:
+                return
+            voice.loop = loop_value
+
     @staticmethod
     def _pan_gains(pan: float) -> tuple[float, float]:
         """Return equal-power left/right gains for pan in [-1.0, 1.0]."""
@@ -600,6 +619,61 @@ class SamplePadAudioEngine:
             if voice_id is None:
                 return False
             return voice_id in self._voices
+
+    def pad_playback_info(self, pad_index: int) -> dict[str, float | bool]:
+        """Return realtime playback info for *pad_index*.
+
+        Keys:
+            active: True when voice currently exists.
+            pending: True when a deferred trigger is queued.
+            position_seconds: Current playhead offset within clip.
+            duration_seconds: Total clip duration.
+            loop: Voice loop flag.
+        """
+        if pad_index < 0:
+            return {
+                "active": False,
+                "pending": False,
+                "position_seconds": 0.0,
+                "duration_seconds": 0.0,
+                "loop": False,
+            }
+
+        with self._lock:
+            pending = pad_index in self._pending_pad_triggers
+            voice_id = self._pad_to_voice.get(pad_index)
+            if voice_id is None:
+                return {
+                    "active": False,
+                    "pending": pending,
+                    "position_seconds": 0.0,
+                    "duration_seconds": 0.0,
+                    "loop": False,
+                }
+
+            voice = self._voices.get(voice_id)
+            if voice is None:
+                return {
+                    "active": False,
+                    "pending": pending,
+                    "position_seconds": 0.0,
+                    "duration_seconds": 0.0,
+                    "loop": False,
+                }
+
+            sr = float(self._stream_samplerate or 44100)
+            clip_frames = max(0, int(voice.clip_end) - int(voice.clip_start))
+            pos_frames = max(0, int(voice.pos) - int(voice.clip_start))
+            if clip_frames > 0:
+                pos_frames = min(pos_frames, clip_frames)
+
+            return {
+                "active": True,
+                "pending": pending,
+                "position_seconds": float(pos_frames) / sr,
+                "duration_seconds": float(clip_frames) / sr,
+                "loop": bool(voice.loop),
+            }
 
     def active_pad_indices(self) -> set[int]:
         """Return active pad indices currently owned by voices."""

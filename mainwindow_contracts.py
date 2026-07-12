@@ -79,6 +79,8 @@ class MainWindowLibraryHost(Protocol):
     _auto_generate_waveforms: bool
     _records: list[JingleRecord]
     _visible_indices: list[int]
+    _recent_window_days: int
+    _last_reserved_recent_folders: list[Path]
     _store: LibraryStore
     _library_watcher: LibraryWatcherLike
     _watch_rescan_timer: TimerLike
@@ -96,6 +98,8 @@ class MainWindowLibraryHost(Protocol):
 
     def _apply_folder_titles_to_records(self, records: list[JingleRecord], preserve_existing: bool) -> int: ...
 
+    def _maybe_warn_reserved_recent_folders(self) -> None: ...
+
 
 class MainWindowToolsHost(Protocol):
     _app_data_dir: Path
@@ -111,6 +115,8 @@ class MainWindowToolsHost(Protocol):
     _library_watcher: LibraryWatcherLike
     _player: MediaPlayerLike | None
     _table: TableLike
+
+    def _ensure_playlists_window(self) -> Any: ...
 
     def _save_auto_folder_tags(self) -> None: ...
 

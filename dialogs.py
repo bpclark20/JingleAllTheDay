@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app_helpers import coerce_volume_percent as _coerce_volume_percent
+from app_helpers import coerce_recent_window_days as _coerce_recent_window_days
 from app_helpers import format_duration_hms as _format_duration_hms
 from app_helpers import format_size_label as _format_size_label
 import sample_pad_audio_engine as _sp_engine_mod
@@ -125,6 +126,7 @@ class OptionsDialog(QDialog):
         microphone_gain_percent: int,
         live_volume_percent: int,
         preview_volume_percent: int,
+        recent_window_days: int,
         sample_pad_blocksize: int,
         sample_pad_streaming_min_seconds: int,
         samples_dir: Path | None = None,
@@ -272,6 +274,25 @@ class OptionsDialog(QDialog):
         preview_volume_row.addWidget(self._preview_volume_value_label)
 
         root.addLayout(preview_volume_row)
+
+        recent_window_row = QHBoxLayout()
+        recent_window_label = QLabel("Recent Window")
+        recent_window_label.setFixedWidth(100)
+        recent_window_row.addWidget(recent_window_label)
+
+        self._recent_window_days_spin = QSpinBox()
+        self._recent_window_days_spin.setRange(1, 3650)
+        self._recent_window_days_spin.setSingleStep(1)
+        self._recent_window_days_spin.setSuffix(" days")
+        self._recent_window_days_spin.setValue(_coerce_recent_window_days(recent_window_days))
+        self._recent_window_days_spin.setToolTip(
+            "How many days back should count as an internal Recent jingle tag."
+        )
+        self._recent_window_days_spin.setMinimumWidth(160)
+        recent_window_row.addWidget(self._recent_window_days_spin)
+        recent_window_row.addStretch()
+
+        root.addLayout(recent_window_row)
 
         sample_pad_blocksize_row = QHBoxLayout()
         sample_pad_blocksize_label = QLabel("Pad Blocksize")
@@ -509,6 +530,9 @@ class OptionsDialog(QDialog):
     def selected_sample_pad_blocksize(self) -> int:
         value = self._sample_pad_blocksize_combo.currentData()
         return _coerce_sample_pad_blocksize(value)
+
+    def selected_recent_window_days(self) -> int:
+        return _coerce_recent_window_days(self._recent_window_days_spin.value())
 
     def selected_sample_pad_streaming_min_seconds(self) -> int:
         return _coerce_sample_pad_streaming_min_seconds(

@@ -10,12 +10,15 @@ import math
 import os
 import shutil
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable
 
 from app_helpers import (
+    RESERVED_INTERNAL_TAG_RECENT,
     apply_windows_taskbar_icon as _apply_windows_taskbar_icon,
     chip_palette_for_tag_seed as _chip_palette_for_tag_seed,
+    coerce_recent_window_days as _coerce_recent_window_days,
     coerce_volume_percent as _coerce_volume_percent,
     ensure_qt_logging_rules as _ensure_qt_logging_rules,
     format_duration_hms as _format_duration_hms,
@@ -25,6 +28,7 @@ from app_helpers import (
     probe_duration_seconds as _probe_duration_seconds,
     remove_tags as _remove_tags,
     runtime_app_dir as _runtime_app_dir,
+    sanitize_user_tags as _sanitize_user_tags,
     tags_to_text as _tags_to_text,
 )
 from dialogs import (
@@ -46,6 +50,7 @@ from waveform_cache import load_waveform_peaks as _load_waveform_peaks
 from widgets import DeselectableTableWidget
 # Import SamplePadsWindow for sample pad feature
 from sample_pads import SamplePadsWindow
+from playlists_window import PLAYLIST_DRAG_MIME_TYPE, PlaylistsWindow
 from sample_pad_audio_engine import SamplePadAudioEngine as _SamplePadAudioEngine
 import sample_pad_audio_engine as _sp_engine_mod
 
@@ -87,6 +92,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import QAction, QCursor, QIcon, QKeyEvent, QMouseEvent, QPixmap
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QComboBox,
     QDialog,
@@ -258,6 +264,13 @@ class MainWindow(
         self._app_data_dir = Path(app_data_location)
         self._app_data_dir.mkdir(parents=True, exist_ok=True)
         self._settings = self._create_settings_store()
+        self._playlists_last_playlist_path = str(
+            self._settings.value("playlists/lastPlaylistPath", "")
+        ).strip()
+        self._playlists_autosave_path = str(
+            (self._app_data_dir / "playlists_autosave.json").resolve()
+        )
+        self._settings.setValue("playlists/autosavePath", self._playlists_autosave_path)
         self._output_device = str(self._settings.value("options/outputDevice", "")).strip()
         self._preview_output_device = str(self._settings.value("options/previewOutputDevice", "")).strip()
         self._broadcast_output_device = str(
@@ -287,6 +300,9 @@ class MainWindow(
         )
         self._sample_pad_streaming_min_seconds = _coerce_sample_pad_streaming_min_seconds(
             self._settings.value("options/samplePadStreamingMinSeconds", 120)
+        )
+        self._recent_window_days = _coerce_recent_window_days(
+            self._settings.value("options/recentWindowDays", 14)
         )
         self._sample_pads_last_layout_path = str(
             self._settings.value("samplePads/lastLayoutPath", "")
@@ -333,6 +349,7 @@ class MainWindow(
         self._sample_pads_dirty: bool = False
         self._sample_pads_last_saved_signature: str = ""
         self._sample_pads_autosave_in_progress: bool = False
+        self._playlists_window: PlaylistsWindow | None = None
         self._samples_dir: Path | None = self._load_samples_dir()
         self._auto_folder_tags: bool = self._load_auto_folder_tags()
         self._auto_generate_waveforms: bool = self._load_auto_generate_waveforms()
@@ -350,22 +367,41 @@ class MainWindow(
         self._visible_indices: list[int] = []
         self._updating_table = False
         self._is_rescanning = False
+        self._last_reserved_recent_folders: list[Path] = []
+        self._recent_folder_warning_signature = ""
+        self._recent_folder_warning_time = 0.0
 
         self._player: QMediaPlayer | None = None
         self._audio_output: QAudioOutput | None = None
         self._broadcast_player: QMediaPlayer | None = None
         self._broadcast_audio_output: QAudioOutput | None = None
+        self._broadcast_route_conflicts_main_output = False
         self._is_muted = False
         self._slider_pressed = False
         self._playback_mode = "off"
         self._continuous_queue: list[int] = []
         self._continuous_queue_position = -1
         self._current_playing_name = ""
+        self._current_playing_path = ""
+        self._playlist_active = False
+        self._playlist_loop_enabled = False
+        self._playlist_saved_playback_mode: str | None = None
         self._current_clip_start_ms = 0
         self._current_clip_stop_ms = -1
         self._clip_start_seek_pending = False
         self._clip_seek_muted_temporarily = False
+        self._clip_seek_ramp_token = 0
         self._clip_boundary_handling = False
+        self._main_playback_engine: _SamplePadAudioEngine | None = (
+            _SamplePadAudioEngine() if _sp_engine_mod.is_available() else None
+        )
+        self._main_playback_pad_index = 10001
+        self._main_playback_state = "stopped"
+        self._main_playback_duration_ms = 0
+        self._main_playback_paused_position_ms = 0
+        self._main_playback_timer = QTimer(self)
+        self._main_playback_timer.setInterval(30)
+        self._main_playback_timer.timeout.connect(self._on_main_playback_timer)
         self._is_preview_mode = False
         self._loop_breath_effect: QGraphicsOpacityEffect | None = None
         self._loop_breath_anim: QPropertyAnimation | None = None
@@ -490,6 +526,13 @@ class MainWindow(
         self._table.itemChanged.connect(self._on_table_item_changed)
         self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
+        self._table.setDragEnabled(True)
+        self._table.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
+        self._table.setDefaultDropAction(Qt.DropAction.CopyAction)
+        self._table.set_drag_payload_callback(
+            self.selected_playlist_candidates,
+            PLAYLIST_DRAG_MIME_TYPE,
+        )
         self._table.setAlternatingRowColors(True)
         self._table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._on_table_context_menu_requested)
@@ -1252,6 +1295,25 @@ class MainWindow(
             self._sample_pads_dirty = False
         return self._sample_pads_window
 
+    def _ensure_playlists_window(self) -> PlaylistsWindow:
+        if self._playlists_window is None:
+            self._playlists_window = PlaylistsWindow(main_window=self, parent=self)
+            self._playlists_window.finished.connect(self._on_playlists_window_closed)
+        return self._playlists_window
+
+    def _on_playlists_window_closed(self) -> None:
+        self.stop_playlist_playback()
+
+    def playlist_last_playlist_path(self) -> str:
+        return self._playlists_last_playlist_path
+
+    def set_playlist_last_playlist_path(self, path_text: str) -> None:
+        self._playlists_last_playlist_path = str(path_text).strip()
+        self._settings.setValue("playlists/lastPlaylistPath", self._playlists_last_playlist_path)
+
+    def playlist_autosave_path(self) -> str:
+        return self._playlists_autosave_path
+
     def _sample_pad_layout_signature(self) -> str:
         if self._sample_pads_window is None:
             return ""
@@ -1920,14 +1982,20 @@ class MainWindow(
 
     def _should_preserve_selected_row(self) -> bool:
         table = getattr(self, "_table", None)
-        return (
+        is_engine_playing = self._using_main_playback_engine() and self._main_playback_state == "playing"
+        is_qt_playing = (
             self._player is not None
             and self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        )
+        return (
+            (is_engine_playing or is_qt_playing)
             and table is not None
             and bool(table.selectedItems())
         )
 
     def _is_playback_active(self) -> bool:
+        if self._using_main_playback_engine():
+            return self._main_playback_state in ("playing", "paused")
         return (
             self._player is not None
             and self._player.playbackState()
@@ -1938,7 +2006,7 @@ class MainWindow(
         )
 
     def _handle_media_key_event(self, event: QKeyEvent) -> bool:
-        if self._player is None:
+        if not self._using_main_playback_engine() and self._player is None:
             return False
 
         key = event.key()
@@ -1965,6 +2033,12 @@ class MainWindow(
         return False
 
     def _toggle_play_pause(self) -> None:
+        if self._using_main_playback_engine():
+            if self._main_playback_state == "playing":
+                self._pause_playback()
+                return
+            self._resume_or_start_playback()
+            return
         if self._player is None:
             return
         state = self._player.playbackState()
@@ -1981,6 +2055,14 @@ class MainWindow(
         self._on_play_clicked()
 
     def _resume_or_start_playback(self) -> None:
+        if self._using_main_playback_engine():
+            if self._main_playback_state == "paused":
+                if self._start_main_engine_clip(self._main_playback_paused_position_ms):
+                    self._status.showMessage("Playback resumed.")
+                return
+            if self._main_playback_state != "playing":
+                self._on_play_clicked()
+            return
         if self._player is None:
             return
         if self._player.playbackState() == QMediaPlayer.PlaybackState.PausedState:
@@ -1992,6 +2074,19 @@ class MainWindow(
             self._on_play_clicked()
 
     def _pause_playback(self) -> None:
+        if self._using_main_playback_engine():
+            if self._main_playback_state == "playing":
+                if self._main_playback_engine is not None:
+                    info = self._main_playback_engine.pad_playback_info(self._main_playback_pad_index)
+                    position_offset_ms = int(round(float(info.get("position_seconds", 0.0)) * 1000.0))
+                    self._main_playback_paused_position_ms = self._current_clip_start_ms + position_offset_ms
+                    self._main_playback_engine.stop(self._main_playback_pad_index)
+                self._main_playback_state = "paused"
+                self._main_playback_timer.stop()
+                self._set_play_button_state(False)
+                self._set_stop_button_breathing(True)
+                self._status.showMessage("Playback paused.")
+            return
         if self._player is None:
             return
         if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
@@ -2016,19 +2111,14 @@ class MainWindow(
     def _set_muted(self, muted: bool) -> None:
         self._is_muted = muted
         if self._audio_output is not None:
-            if self._clip_seek_muted_temporarily and not muted:
-                self._audio_output.setMuted(True)
-            else:
-                self._audio_output.setMuted(muted)
+            self._audio_output.setMuted(muted)
         if self._broadcast_audio_output is not None:
-            if self._clip_seek_muted_temporarily and not muted:
-                self._broadcast_audio_output.setMuted(True)
-            else:
-                self._broadcast_audio_output.setMuted(muted)
+            self._broadcast_audio_output.setMuted(muted)
+        self._apply_active_volume()
         self._refresh_mute_button_state()
 
     def _on_mute_clicked(self) -> None:
-        if self._audio_output is None:
+        if self._audio_output is None and not self._using_main_playback_engine():
             self._status.showMessage("Playback unavailable: PyQt6 multimedia is not installed.")
             return
         self._set_muted(not self._is_muted)
@@ -2091,15 +2181,20 @@ class MainWindow(
     def _apply_active_volume(self) -> None:
         if self._audio_output is None:
             if self._broadcast_audio_output is None:
-                return
+                if self._main_playback_engine is None:
+                    return
         volume = self._active_volume_percent() / 100.0
+        if self._clip_seek_muted_temporarily and not self._is_muted:
+            volume = 0.0
         if self._audio_output is not None:
             self._audio_output.setVolume(volume)
         if self._broadcast_audio_output is not None:
             self._broadcast_audio_output.setVolume(volume)
+        if self._main_playback_engine is not None:
+            self._main_playback_engine.set_master_gain(0.0 if self._is_muted else volume)
 
     def _broadcast_route_enabled(self) -> bool:
-        return bool(self._broadcast_output_device.strip())
+        return bool(self._broadcast_output_device.strip()) and not self._broadcast_route_conflicts_main_output
 
     def _sync_broadcast_player_to_main(self) -> None:
         if (
@@ -2211,10 +2306,6 @@ class MainWindow(
             return
 
         # Check if playback is currently active (playing or paused)
-        if self._player is None:
-            super().keyPressEvent(event)
-            return
-
         is_playback_active = self._is_playback_active()
 
         # Handle arrow keys for skipping during active playback
@@ -2312,6 +2403,8 @@ class MainWindow(
         self._stop_sample_pad_global_hotkeys()
         self._sp_engine.close()
         self._sp_monitor_engine.close()
+        if self._main_playback_engine is not None:
+            self._main_playback_engine.close()
         super().closeEvent(event)
 
     def _skip_to_previous(self) -> None:
@@ -2467,6 +2560,10 @@ class MainWindow(
         self._audio_diagnostics_dialog.activateWindow()
 
     def _connect_player_signals(self) -> None:
+        if self._using_main_playback_engine():
+            self._set_play_button_state(False)
+            self._set_stop_button_breathing(False)
+            return
         if self._player is None:
             self._play_btn.setEnabled(False)
             self._stop_btn.setEnabled(False)
@@ -2528,6 +2625,7 @@ class MainWindow(
         )
 
     def _maybe_run_first_time_setup(self) -> None:
+        self._maybe_bootstrap_added_at_from_mtime()
         is_first_run = str(self._settings.value("library/samplesDir", "")).strip() == ""
         if is_first_run:
             self._run_first_time_setup()
@@ -2537,7 +2635,110 @@ class MainWindow(
                 self._status.showMessage(
                     f"Loaded {loaded_count} jingles from cache. Checking for library changes..."
                 )
+            self._refresh_recent_runtime_from_store()
             QTimer.singleShot(0, self._rescan_library)
+
+    def _maybe_bootstrap_added_at_from_mtime(self) -> None:
+        if self._store.is_added_at_bootstrap_completed():
+            return
+
+        updated = 0
+        fallback_count = 0
+        for path_key, _entry in self._store.iter_entries():
+            path = Path(path_key)
+            existing = self._store.get_added_at(path)
+            if existing is not None and existing > 0:
+                continue
+
+            try:
+                stat = path.stat()
+                added_epoch = max(0, int(stat.st_mtime_ns / 1_000_000_000))
+            except OSError:
+                added_epoch = int(time.time())
+                fallback_count += 1
+
+            self._store.set_added_at(path, added_epoch)
+            updated += 1
+
+        self._store.set_added_at_bootstrap_completed(True)
+        self._store.save()
+
+        if updated > 0:
+            message = f"Initialized Added date for {updated} library item(s) from file modified time."
+            if fallback_count > 0:
+                message += f" {fallback_count} item(s) used current time fallback."
+            self._status.showMessage(message)
+
+    def _refresh_recent_runtime_from_store(self) -> None:
+        for record in self._records:
+            record.added_at_epoch_seconds = self._store.get_added_at(record.path) or 0
+        self._apply_filters()
+
+    def _maybe_warn_reserved_recent_folders(self) -> None:
+        conflicts = list(self._last_reserved_recent_folders)
+        if not conflicts:
+            self._recent_folder_warning_signature = ""
+            return
+
+        signature = "\n".join(sorted(str(path) for path in conflicts))
+        now = time.monotonic()
+        if (
+            signature == self._recent_folder_warning_signature
+            and (now - self._recent_folder_warning_time) < 5.0
+        ):
+            return
+
+        self._recent_folder_warning_signature = signature
+        self._recent_folder_warning_time = now
+
+        details = "\n".join(str(path) for path in conflicts)
+        reply = QMessageBox.question(
+            self,
+            "Reserved Folder Name Detected",
+            "One or more folders are named 'Recent'.\n\n"
+            "'Recent' is an internal reserved tag and jingles in these folders are excluded from the library until renamed.\n\n"
+            "Would you like to create a Desktop text file with all problematic absolute folder paths?\n\n"
+            f"Detected folders:\n{details}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            self._status.showMessage(
+                f"Detected {len(conflicts)} reserved 'Recent' folder(s). Rename them to include their jingles."
+            )
+            return
+
+        desktop = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DesktopLocation)
+        desktop_dir = Path(desktop) if desktop.strip() else Path.home()
+        desktop_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        report_path = desktop_dir / f"JingleAllTheDay-Recent-Folder-Conflicts-{stamp}.txt"
+        lines = [
+            "JingleAllTheDay Reserved Folder Conflicts",
+            f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            "",
+            "Folders named 'Recent' were detected and excluded from the library:",
+            *[str(path) for path in conflicts],
+            "",
+            "Rename these folders to make their jingles visible in the library scan.",
+        ]
+        try:
+            report_path.write_text("\n".join(lines), encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.warning(
+                self,
+                "Report Creation Failed",
+                f"Could not create Desktop report file.\n\n{exc}",
+            )
+            self._status.showMessage("Reserved folder report creation failed.")
+            return
+
+        QMessageBox.information(
+            self,
+            "Report Created",
+            f"Created report:\n{report_path}",
+        )
+        self._status.showMessage(f"Reserved folder report created: {report_path.name}")
 
     def _run_first_time_setup(self) -> None:
         QMessageBox.information(
@@ -2598,6 +2799,20 @@ class MainWindow(
             selected_record_indices.append(record_index)
         return selected_record_indices
 
+    def selected_playlist_candidates(self) -> list[dict[str, str]]:
+        payload: list[dict[str, str]] = []
+        for record_index in self._selected_record_indices():
+            if record_index < 0 or record_index >= len(self._records):
+                continue
+            record = self._records[record_index]
+            payload.append(
+                {
+                    "name": record.name,
+                    "path": str(record.path),
+                }
+            )
+        return payload
+
     def _rebuild_table(self) -> None:
         self._updating_table = True
         self._table.blockSignals(True)
@@ -2642,7 +2857,14 @@ class MainWindow(
             return
 
         record = self._records[record_index]
-        new_categories = _normalize_tags(self._table.item(item.row(), 1).text())
+        requested_categories = _normalize_tags(self._table.item(item.row(), 1).text())
+        new_categories, rejected = _sanitize_user_tags(requested_categories)
+        if rejected:
+            QMessageBox.warning(
+                self,
+                "Reserved Tag",
+                f"'{RESERVED_INTERNAL_TAG_RECENT}' is an internal tag and cannot be assigned manually.",
+            )
 
         record.categories = new_categories
         self._store.set(record.path, new_categories)
@@ -2656,9 +2878,16 @@ class MainWindow(
             self._status.showMessage("Select one or more rows first.")
             return
 
-        categories = _normalize_tags(self._bulk_category_edit.text())
         mode_data = self._bulk_mode_combo.currentData()
         mode = str(mode_data) if mode_data is not None else "replace"
+        requested_categories = _normalize_tags(self._bulk_category_edit.text())
+        categories, rejected = _sanitize_user_tags(requested_categories)
+        if rejected:
+            QMessageBox.warning(
+                self,
+                "Reserved Tag",
+                f"Ignored internal reserved tag '{RESERVED_INTERNAL_TAG_RECENT}' in bulk tags.",
+            )
 
         if mode in {"append", "remove"} and not categories:
             verb = "append" if mode == "append" else "remove"
@@ -2781,7 +3010,24 @@ class MainWindow(
         delete_action.setEnabled(selected_count > 0)
         delete_action.triggered.connect(self._on_edit_delete)
 
+        menu.addSeparator()
+        add_to_playlist_action = menu.addAction("Add to Playlist")
+        add_to_playlist_action.setEnabled(selected_count > 0)
+        add_to_playlist_action.triggered.connect(self._on_add_selected_to_playlist)
+
         menu.exec(self._table.viewport().mapToGlobal(pos))
+
+    def _on_add_selected_to_playlist(self) -> None:
+        payload = self.selected_playlist_candidates()
+        if not payload:
+            self._status.showMessage("Select one or more jingles first.")
+            return
+        playlists_window = self._ensure_playlists_window()
+        playlists_window.add_payload_items(payload)
+        playlists_window.show()
+        playlists_window.raise_()
+        playlists_window.activateWindow()
+        self._status.showMessage(f"Added {len(payload)} jingle(s) to playlist.")
 
     def _assign_selected_to_sample_pad(
         self,
@@ -2830,6 +3076,10 @@ class MainWindow(
         if item.column() != 0:
             return
         self._table.selectRow(item.row())
+        if self._using_main_playback_engine() and self._main_playback_state in ("playing", "paused"):
+            self._on_stop_clicked()
+            self._on_play_clicked()
+            return
         if (
             self._player is not None
             and self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
@@ -2837,6 +3087,8 @@ class MainWindow(
             self._player.stop()
             self._reset_continuous_queue()
             self._current_playing_name = ""
+            self._current_playing_path = ""
+            self._clear_playlist_state()
         self._on_play_clicked()
 
     def _selected_record_index(self) -> int | None:
@@ -2865,17 +3117,99 @@ class MainWindow(
         self._continuous_queue = []
         self._continuous_queue_position = -1
 
+    def _clear_playlist_state(self) -> None:
+        was_active = self._playlist_active
+        self._playlist_active = False
+        self._playlist_loop_enabled = False
+        if was_active and self._playlist_saved_playback_mode is not None:
+            self._playback_mode = self._playlist_saved_playback_mode
+            self._playlist_saved_playback_mode = None
+            self._refresh_playback_mode_button()
+            self._apply_player_loop_mode()
+
     def _reset_clip_playback_window(self) -> None:
         self._current_clip_start_ms = 0
         self._current_clip_stop_ms = -1
         self._clip_start_seek_pending = False
         self._clip_seek_muted_temporarily = False
+        self._clip_seek_ramp_token += 1
         self._clip_boundary_handling = False
+
+    def _clear_clip_seek_temporary_silence(self, *, ramp_up: bool) -> None:
+        if not self._clip_seek_muted_temporarily:
+            return
+
+        self._clip_seek_muted_temporarily = False
+        self._clip_seek_ramp_token += 1
+
+        if self._audio_output is not None:
+            self._audio_output.setMuted(self._is_muted)
+        if self._broadcast_audio_output is not None:
+            self._broadcast_audio_output.setMuted(self._is_muted)
+
+        target_volume = self._active_volume_percent() / 100.0
+        if self._is_muted or not ramp_up or target_volume <= 0.0:
+            self._apply_active_volume()
+            return
+
+        ramp_token = self._clip_seek_ramp_token
+        ramp_multipliers = (0.35, 0.7, 1.0)
+        for step_index, multiplier in enumerate(ramp_multipliers, start=1):
+            delay_ms = 4 * step_index
+
+            def _apply_step(mult: float = multiplier, token: int = ramp_token) -> None:
+                if token != self._clip_seek_ramp_token:
+                    return
+                if self._clip_seek_muted_temporarily or self._is_muted:
+                    return
+                stepped_volume = max(0.0, min(1.0, target_volume * mult))
+                if self._audio_output is not None:
+                    self._audio_output.setVolume(stepped_volume)
+                if self._broadcast_audio_output is not None:
+                    self._broadcast_audio_output.setVolume(stepped_volume)
+
+            QTimer.singleShot(delay_ms, _apply_step)
+
+    def _apply_short_start_ramp(self) -> None:
+        if self._is_muted or self._clip_seek_muted_temporarily:
+            return
+        if self._audio_output is None and self._broadcast_audio_output is None:
+            return
+
+        target_volume = self._active_volume_percent() / 100.0
+        if target_volume <= 0.0:
+            return
+
+        self._clip_seek_ramp_token += 1
+        ramp_token = self._clip_seek_ramp_token
+
+        if self._audio_output is not None:
+            self._audio_output.setVolume(0.0)
+        if self._broadcast_audio_output is not None:
+            self._broadcast_audio_output.setVolume(0.0)
+
+        ramp_multipliers = (0.4, 0.75, 1.0)
+        for step_index, multiplier in enumerate(ramp_multipliers):
+            delay_ms = 4 * step_index
+
+            def _apply_step(mult: float = multiplier, token: int = ramp_token) -> None:
+                if token != self._clip_seek_ramp_token:
+                    return
+                if self._clip_seek_muted_temporarily or self._is_muted:
+                    return
+                stepped_volume = max(0.0, min(1.0, target_volume * mult))
+                if self._audio_output is not None:
+                    self._audio_output.setVolume(stepped_volume)
+                if self._broadcast_audio_output is not None:
+                    self._broadcast_audio_output.setVolume(stepped_volume)
+
+            QTimer.singleShot(delay_ms, _apply_step)
 
     def _prepare_clip_start_seek(self, temporary_mute_for_seek: bool) -> int:
         start_ms = max(0, int(self._current_clip_start_ms))
         self._clip_boundary_handling = False
         self._clip_start_seek_pending = start_ms > 0
+        self._clip_seek_ramp_token += 1
         if self._audio_output is not None:
             # Also pre-mute when start_ms == 0: rapid sample retriggers can still
             # produce audible discontinuities when the media source is replaced.
@@ -2885,15 +3219,19 @@ class MainWindow(
                 if not self._clip_start_seek_pending:
                     self._clip_start_seek_pending = True
                 self._clip_seek_muted_temporarily = True
-                self._audio_output.setMuted(True)
+                self._audio_output.setMuted(False)
+                self._audio_output.setVolume(0.0)
             else:
                 self._clip_seek_muted_temporarily = False
                 self._audio_output.setMuted(self._is_muted)
+                self._audio_output.setVolume(self._active_volume_percent() / 100.0)
         if self._broadcast_audio_output is not None:
             if temporary_mute_for_seek and not self._is_muted:
-                self._broadcast_audio_output.setMuted(True)
+                self._broadcast_audio_output.setMuted(False)
+                self._broadcast_audio_output.setVolume(0.0)
             else:
                 self._broadcast_audio_output.setMuted(self._is_muted)
+                self._broadcast_audio_output.setVolume(self._active_volume_percent() / 100.0)
         return start_ms
 
     def _restart_current_clip_from_start(self, temporary_mute_for_seek: bool) -> None:
@@ -2908,6 +3246,7 @@ class MainWindow(
         duration_ms = max(0, int(round(record.duration_seconds * 1000.0)))
         start_ms = max(0, int(round(record.clip_start_seconds * 1000.0)))
         stop_ms = max(0, int(round(record.clip_stop_seconds * 1000.0)))
+        near_end_tolerance_ms = 80
 
         if duration_ms > 0:
             start_ms = min(start_ms, duration_ms)
@@ -2916,19 +3255,131 @@ class MainWindow(
                 start_ms = 0
                 stop_ms = duration_ms
 
-        # For the default full-file window, let the backend reach EndOfMedia
-        # naturally. Enforcing the stop position manually can cut off very short
-        # clips because the media clock reaches the end before buffered audio has
-        # fully drained to the output device.
-        if duration_ms > 0 and start_ms == 0 and stop_ms >= duration_ms:
+        # For full-file (or effectively full-file) windows, let the backend
+        # reach EndOfMedia naturally. Enforcing the stop position manually can
+        # cut off very short tails because the media clock reaches the end
+        # before buffered audio has fully drained to the output device.
+        if duration_ms > 0 and start_ms == 0 and stop_ms >= duration_ms - near_end_tolerance_ms:
             return 0, -1
 
         return start_ms, stop_ms
 
-    def _play_record(self, record_index: int) -> bool:
-        if self._player is None:
+    def _using_main_playback_engine(self) -> bool:
+        return self._main_playback_engine is not None
+
+    def _apply_main_playback_output_route(self) -> bool:
+        if self._main_playback_engine is None:
             return False
+        target_device = self._active_output_device().strip()
+        try:
+            self._main_playback_engine.set_device(
+                target_device,
+                blocksize=self._sample_pad_blocksize,
+            )
+            self._main_playback_engine.set_master_gain(self._active_volume_percent() / 100.0)
+            return True
+        except Exception as exc:
+            self._status.showMessage(f"Main playback engine unavailable: {exc}")
+            return False
+
+    def _start_main_engine_clip(self, start_position_ms: int) -> bool:
+        if self._main_playback_engine is None:
+            return False
+        clip_start_ms = self._current_clip_start_ms
+        clip_stop_ms = self._current_clip_stop_ms
+        start_position_ms = max(clip_start_ms, int(start_position_ms))
+        if clip_stop_ms > clip_start_ms:
+            start_position_ms = min(start_position_ms, clip_stop_ms)
+
+        clip_stop_seconds = 0.0 if clip_stop_ms < 0 else (clip_stop_ms / 1000.0)
+        loop_enabled = self._playback_mode == "loop" or self._sample_pad_looping
+
+        self._main_playback_engine.trigger(
+            path=self._current_playing_path,
+            volume=1.0,
+            clip_start_seconds=start_position_ms / 1000.0,
+            clip_stop_seconds=clip_stop_seconds,
+            loop=loop_enabled,
+            pad_index=self._main_playback_pad_index,
+        )
+        self._main_playback_state = "playing"
+        self._main_playback_paused_position_ms = start_position_ms
+        self._main_playback_timer.start()
+        self._set_play_button_state(True)
+        self._set_stop_button_breathing(True)
+        return True
+
+    def _finish_main_playback(self) -> None:
+        ended_name = self._current_playing_name
+        if self._play_next_continuous_record():
+            return
+        self._reset_continuous_queue()
+        self._reset_clip_playback_window()
+        self._sample_pad_looping = False
+        self._sample_pad_release_looping = False
+        self._sample_pad_native_looping = False
+        self._current_sample_pad_index = -1
+        self._current_playing_name = ""
+        self._current_playing_path = ""
+        self._clear_playlist_state()
+        self._main_playback_state = "stopped"
+        self._main_playback_paused_position_ms = 0
+        self._main_playback_timer.stop()
+        self._set_play_button_state(False)
+        self._set_stop_button_breathing(False)
+        if ended_name:
+            self._status.showMessage(f"Playback finished: {ended_name}")
+        else:
+            self._status.showMessage("Playback finished.")
+
+    def _on_main_playback_timer(self) -> None:
+        if self._main_playback_engine is None:
+            return
+        if self._main_playback_state == "paused":
+            return
+        if self._main_playback_state != "playing":
+            self._main_playback_timer.stop()
+            return
+
+        info = self._main_playback_engine.pad_playback_info(self._main_playback_pad_index)
+        is_active = bool(info.get("active", False)) or bool(info.get("pending", False))
+        if not is_active:
+            self._finish_main_playback()
+            return
+
+        position_ms = self._current_clip_start_ms + int(round(float(info.get("position_seconds", 0.0)) * 1000.0))
+        if self._main_playback_duration_ms <= 0:
+            self._main_playback_duration_ms = int(round(float(info.get("duration_seconds", 0.0)) * 1000.0))
+        duration_ms = max(0, self._main_playback_duration_ms)
+        if not self._slider_pressed:
+            self._position_slider.setValue(max(0, position_ms))
+        self._update_time_label(position_ms, duration_ms)
+
+    def _seek_main_engine_to(self, position_ms: int) -> None:
+        if self._main_playback_engine is None:
+            return
+        position_ms = max(self._current_clip_start_ms, int(position_ms))
+        if self._current_clip_stop_ms > self._current_clip_start_ms:
+            position_ms = min(position_ms, self._current_clip_stop_ms)
+
+        if self._main_playback_state == "paused":
+            self._main_playback_paused_position_ms = position_ms
+            self._position_slider.setValue(max(0, position_ms))
+            self._update_time_label(position_ms, self._main_playback_duration_ms)
+            return
+
+        if self._main_playback_state != "playing":
+            return
+
+        self._main_playback_engine.stop(self._main_playback_pad_index)
+        self._start_main_engine_clip(position_ms)
+
+    def _play_record(self, record_index: int) -> bool:
         if record_index < 0 or record_index >= len(self._records):
+            return False
+        if self._using_main_playback_engine():
+            return self._play_record_via_main_engine(record_index)
+        if self._player is None:
             return False
 
         record = self._records[record_index]
@@ -2968,8 +3419,53 @@ class MainWindow(
             self._player.play()
             if start_ms > 0:
                 self._player.setPosition(start_ms)
+        if not self._clip_seek_muted_temporarily:
+            self._apply_short_start_ramp()
         self._sync_broadcast_player_to_main()
         self._current_playing_name = record.path.name
+        self._current_playing_path = str(record.path)
+        self._select_record_row(record_index)
+
+        mode_text = ""
+        if self._playback_mode == "loop":
+            mode_text = " (loop)"
+        elif self._continuous_queue:
+            total = len(self._continuous_queue)
+            current = self._continuous_queue_position + 1 if total > 0 else 1
+            if self._playback_mode == "continuous":
+                mode_text = f" (continuous {current}/{max(total, 1)})"
+            else:
+                mode_text = f" (queue {current}/{max(total, 1)})"
+        self._status.showMessage(f"Playing: {record.path.name}{mode_text}")
+        return True
+
+    def _play_record_via_main_engine(self, record_index: int) -> bool:
+        if self._main_playback_engine is None:
+            return False
+        if record_index < 0 or record_index >= len(self._records):
+            return False
+
+        record = self._records[record_index]
+        if not record.path.exists():
+            return False
+
+        if not self._apply_main_playback_output_route():
+            return False
+        clip_start_ms, clip_stop_ms = self._clip_window_for_record(record)
+        self._current_clip_start_ms = clip_start_ms
+        self._current_clip_stop_ms = clip_stop_ms
+        self._current_playing_name = record.path.name
+        self._current_playing_path = str(record.path)
+        self._main_playback_duration_ms = max(0, clip_stop_ms if clip_stop_ms >= 0 else int(round(record.duration_seconds * 1000.0)))
+        self._main_playback_paused_position_ms = clip_start_ms
+
+        self._main_playback_engine.stop(self._main_playback_pad_index)
+        if not self._start_main_engine_clip(clip_start_ms):
+            return False
+
+        self._position_slider.setRange(0, max(0, self._main_playback_duration_ms))
+        self._position_slider.setValue(max(0, clip_start_ms))
+        self._update_time_label(clip_start_ms, self._main_playback_duration_ms)
         self._select_record_row(record_index)
 
         mode_text = ""
@@ -3011,8 +3507,8 @@ class MainWindow(
         self._continuous_queue_position = -1
         return self._play_next_continuous_record()
 
-    def _play_next_continuous_record(self) -> bool:
-        if self._player is None:
+    def _play_next_continuous_record(self, allow_playlist_restart: bool = True) -> bool:
+        if not self._using_main_playback_engine() and self._player is None:
             return False
 
         next_position = self._continuous_queue_position + 1
@@ -3023,10 +3519,60 @@ class MainWindow(
                 return True
             next_position += 1
 
+        if self._playlist_active and self._playlist_loop_enabled and self._continuous_queue and allow_playlist_restart:
+            self._continuous_queue_position = -1
+            return self._play_next_continuous_record(allow_playlist_restart=False)
+
         self._reset_continuous_queue()
+        self._clear_playlist_state()
         return False
 
     def _on_play_clicked(self) -> None:
+        if self._using_main_playback_engine():
+            if self._main_playback_state == "playing":
+                if self._main_playback_engine is not None:
+                    info = self._main_playback_engine.pad_playback_info(self._main_playback_pad_index)
+                    position_offset_ms = int(round(float(info.get("position_seconds", 0.0)) * 1000.0))
+                    self._main_playback_paused_position_ms = self._current_clip_start_ms + position_offset_ms
+                    self._main_playback_engine.stop(self._main_playback_pad_index)
+                self._main_playback_state = "paused"
+                self._main_playback_timer.stop()
+                self._set_play_button_state(False)
+                self._set_stop_button_breathing(True)
+                self._status.showMessage("Playback paused.")
+                return
+
+            if self._main_playback_state == "paused":
+                if self._start_main_engine_clip(self._main_playback_paused_position_ms):
+                    self._status.showMessage("Playback resumed.")
+                return
+
+            self._clear_playlist_state()
+
+            selected_record_index = self._selected_record_index()
+            if selected_record_index is None:
+                self._status.showMessage("Select a jingle first.")
+                return
+
+            if self._playback_mode == "continuous":
+                if not self._start_continuous_playback():
+                    self._current_playing_name = ""
+                    self._current_playing_path = ""
+                    self._status.showMessage("No playable jingles were found from the selected row onward.")
+                return
+
+            if self._playback_mode == "off" and self._start_selected_queue_playback():
+                return
+
+            self._reset_continuous_queue()
+            record = self._records[selected_record_index]
+            if not record.path.exists():
+                self._status.showMessage("Selected file no longer exists.")
+                return
+
+            self._play_record(selected_record_index)
+            return
+
         if self._player is None:
             self._status.showMessage("Playback unavailable: PyQt6 multimedia is not installed.")
             return
@@ -3043,6 +3589,8 @@ class MainWindow(
             self._status.showMessage("Playback resumed.")
             return
 
+        self._clear_playlist_state()
+
         selected_record_index = self._selected_record_index()
         if selected_record_index is None:
             self._status.showMessage("Select a jingle first.")
@@ -3051,6 +3599,7 @@ class MainWindow(
         if self._playback_mode == "continuous":
             if not self._start_continuous_playback():
                 self._current_playing_name = ""
+                self._current_playing_path = ""
                 self._status.showMessage("No playable jingles were found from the selected row onward.")
             return
 
@@ -3066,6 +3615,29 @@ class MainWindow(
         self._play_record(selected_record_index)
 
     def _on_stop_clicked(self) -> None:
+        if self._using_main_playback_engine():
+            if self._main_playback_state in ("playing", "paused"):
+                if self._main_playback_engine is not None:
+                    self._main_playback_engine.stop(self._main_playback_pad_index)
+                self._main_playback_state = "stopped"
+                self._main_playback_timer.stop()
+                self._main_playback_paused_position_ms = 0
+                self._position_slider.setValue(0)
+                self._update_time_label(0, self._main_playback_duration_ms)
+                self._set_play_button_state(False)
+                self._set_stop_button_breathing(False)
+                self._reset_continuous_queue()
+                self._reset_clip_playback_window()
+                self._sample_pad_looping = False
+                self._sample_pad_release_looping = False
+                self._sample_pad_native_looping = False
+                self._current_sample_pad_index = -1
+                self._current_playing_name = ""
+                self._current_playing_path = ""
+                self._clear_playlist_state()
+                self._status.showMessage("Playback stopped.")
+            return
+
         if self._player is None:
             self._status.showMessage("Playback unavailable: PyQt6 multimedia is not installed.")
             return
@@ -3090,6 +3662,8 @@ class MainWindow(
             if self._broadcast_audio_output is not None:
                 self._broadcast_audio_output.setMuted(self._is_muted)
             self._current_playing_name = ""
+            self._current_playing_path = ""
+            self._clear_playlist_state()
             self._status.showMessage("Playback stopped.")
 
     def _on_table_selection_changed(self) -> None:
@@ -3112,11 +3686,7 @@ class MainWindow(
                     return
                 self._clip_start_seek_pending = False
                 if self._clip_seek_muted_temporarily:
-                    self._clip_seek_muted_temporarily = False
-                    if self._audio_output is not None:
-                        self._audio_output.setMuted(self._is_muted)
-                    if self._broadcast_audio_output is not None:
-                        self._broadcast_audio_output.setMuted(self._is_muted)
+                    self._clear_clip_seek_temporary_silence(ramp_up=True)
 
             clip_stop_ms = self._current_clip_stop_ms
             if (
@@ -3146,6 +3716,7 @@ class MainWindow(
                 self._sample_pad_release_looping = False
                 self._sample_pad_native_looping = False
                 self._current_playing_name = ""
+                self._current_playing_path = ""
                 self._clip_boundary_handling = False
                 if self._broadcast_player is not None:
                     self._broadcast_player.stop()
@@ -3171,11 +3742,7 @@ class MainWindow(
         if is_stopped:
             self._position_slider.setValue(0)
             if self._clip_seek_muted_temporarily:
-                self._clip_seek_muted_temporarily = False
-                if self._audio_output is not None:
-                    self._audio_output.setMuted(self._is_muted)
-                if self._broadcast_audio_output is not None:
-                    self._broadcast_audio_output.setMuted(self._is_muted)
+                self._clear_clip_seek_temporary_silence(ramp_up=False)
         # Make stop button breathe when playing or paused
         is_active = self._player.playbackState() in (
             QMediaPlayer.PlaybackState.PlayingState,
@@ -3210,10 +3777,124 @@ class MainWindow(
             if self._broadcast_audio_output is not None:
                 self._broadcast_audio_output.setMuted(self._is_muted)
             self._current_playing_name = ""
+            self._current_playing_path = ""
+            self._clear_playlist_state()
             if ended_name:
                 self._status.showMessage(f"Playback finished: {ended_name}")
             else:
                 self._status.showMessage("Playback finished.")
+
+    def _record_index_for_path(self, path_text: str) -> int | None:
+        target = Path(path_text)
+        try:
+            target = target.resolve()
+        except Exception:
+            target = Path(path_text)
+        for index, record in enumerate(self._records):
+            candidate = record.path
+            try:
+                candidate = candidate.resolve()
+            except Exception:
+                pass
+            if candidate == target:
+                return index
+        return None
+
+    def start_playlist_playback(
+        self,
+        audio_paths: list[str],
+        start_index: int = 0,
+        loop_enabled: bool = False,
+        use_preview_mode: bool = False,
+    ) -> bool:
+        if self._player is None:
+            self._status.showMessage("Playback unavailable: PyQt6 multimedia is not installed.")
+            return False
+
+        if not audio_paths:
+            self._status.showMessage("Playlist is empty.")
+            return False
+
+        self.set_playlist_preview_mode(bool(use_preview_mode))
+
+        start = max(0, min(start_index, len(audio_paths) - 1))
+        ordered_paths = list(audio_paths[start:])
+        if not ordered_paths:
+            ordered_paths = list(audio_paths)
+
+        queue: list[int] = []
+        for path_text in ordered_paths:
+            record_index = self._record_index_for_path(path_text)
+            if record_index is not None:
+                queue.append(record_index)
+
+        if not queue:
+            self._status.showMessage("No playable playlist items were found in the current library.")
+            return False
+
+        if not self._playlist_active:
+            self._playlist_saved_playback_mode = self._playback_mode
+        self._playback_mode = "off"
+        self._refresh_playback_mode_button()
+        self._apply_player_loop_mode()
+
+        self._playlist_active = True
+        self._playlist_loop_enabled = bool(loop_enabled)
+        self._continuous_queue = queue
+        self._continuous_queue_position = -1
+        if not self._play_next_continuous_record():
+            self._clear_playlist_state()
+            return False
+        return True
+
+    def toggle_playlist_pause_resume(self) -> str:
+        if self._player is None:
+            return "unavailable"
+        state = self._player.playbackState()
+        if state == QMediaPlayer.PlaybackState.PlayingState:
+            self._player.pause()
+            self._sync_broadcast_player_to_main()
+            self._status.showMessage("Playlist paused.")
+            return "paused"
+        if state == QMediaPlayer.PlaybackState.PausedState:
+            self._player.play()
+            self._sync_broadcast_player_to_main()
+            self._status.showMessage("Playlist resumed.")
+            return "playing"
+        return "stopped"
+
+    def stop_playlist_playback(self) -> None:
+        self._clear_playlist_state()
+        self._on_stop_clicked()
+
+    def set_playlist_loop_enabled(self, enabled: bool) -> None:
+        self._playlist_loop_enabled = bool(enabled)
+
+    def set_playlist_preview_mode(self, preview_mode: bool) -> bool:
+        if preview_mode and not self._can_use_preview_mode():
+            return False
+        self._mode_btn.setChecked(bool(preview_mode))
+        return self._is_preview_mode == bool(preview_mode)
+
+    def playlist_playback_snapshot(self) -> dict[str, Any]:
+        state = "unavailable"
+        if self._player is not None:
+            playback_state = self._player.playbackState()
+            if playback_state == QMediaPlayer.PlaybackState.PlayingState:
+                state = "playing"
+            elif playback_state == QMediaPlayer.PlaybackState.PausedState:
+                state = "paused"
+            else:
+                state = "stopped"
+
+        return {
+            "state": state,
+            "active": self._playlist_active,
+            "loop_enabled": self._playlist_loop_enabled,
+            "is_preview_mode": self._is_preview_mode,
+            "current_path": self._current_playing_path,
+            "queue_position": self._continuous_queue_position,
+        }
 
     def _refresh_playback_mode_button(self) -> None:
         if self._playback_mode == "loop":
@@ -3255,8 +3936,7 @@ class MainWindow(
         # from the currently playing row so the next EndOfMedia can advance.
         if (
             self._playback_mode == "continuous"
-            and self._player is not None
-            and self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+            and self._is_playback_active()
             and not self._continuous_queue
         ):
             current_index = self._selected_record_index()
@@ -3266,6 +3946,10 @@ class MainWindow(
                     self._continuous_queue = list(self._visible_indices[start_row:])
                     # Position 0 is the currently playing track; next advance starts at 1.
                     self._continuous_queue_position = 0
+
+        if self._using_main_playback_engine() and self._main_playback_engine is not None:
+            engine_loop_enabled = self._playback_mode == "loop" or self._sample_pad_looping
+            self._main_playback_engine.set_pad_loop(self._main_playback_pad_index, engine_loop_enabled)
 
     def _should_use_native_looping(self) -> bool:
         """True when Qt should handle looping internally (no seek gap between iterations)."""
@@ -3425,6 +4109,9 @@ class MainWindow(
 
     def _on_slider_released(self) -> None:
         self._slider_pressed = False
+        if self._using_main_playback_engine():
+            self._seek_main_engine_to(int(self._position_slider.value()))
+            return
         if self._player is not None:
             self._player.setPosition(int(self._position_slider.value()))
             self._sync_broadcast_player_to_main()
@@ -3453,6 +4140,7 @@ class MainWindow(
             self._microphone_gain_percent,
             self._live_volume_percent,
             self._preview_volume_percent,
+            self._recent_window_days,
             self._sample_pad_blocksize,
             self._sample_pad_streaming_min_seconds,
             self._samples_dir,
@@ -3472,6 +4160,7 @@ class MainWindow(
             self._microphone_gain_percent,
         ) = dialog.selected_mixer_config()
         self._live_volume_percent, self._preview_volume_percent = dialog.selected_volumes()
+        selected_recent_window_days = dialog.selected_recent_window_days()
         self._sample_pad_blocksize = dialog.selected_sample_pad_blocksize()
         self._sample_pad_streaming_min_seconds = (
             dialog.selected_sample_pad_streaming_min_seconds()
@@ -3488,11 +4177,15 @@ class MainWindow(
         self._settings.setValue(
             "options/microphoneGainPercent", self._microphone_gain_percent
         )
+        self._settings.setValue("options/recentWindowDays", selected_recent_window_days)
         self._settings.setValue("options/samplePadBlocksize", self._sample_pad_blocksize)
         self._settings.setValue(
             "options/samplePadStreamingMinSeconds",
             self._sample_pad_streaming_min_seconds,
         )
+        if selected_recent_window_days != self._recent_window_days:
+            self._recent_window_days = selected_recent_window_days
+            self._refresh_recent_runtime_from_store()
         self._sp_engine.set_streaming_min_seconds(self._sample_pad_streaming_min_seconds)
         self._sp_engine.set_mixer_enabled(self._mixer_enabled)
         self._sp_engine.set_input_gain(self._microphone_gain_percent / 100.0)
@@ -3680,6 +4373,7 @@ class MainWindow(
                 )
 
     def _apply_output_device(self) -> None:
+        self._broadcast_route_conflicts_main_output = False
         if self._audio_output is not None and _has_qt_multimedia:
             selected = self._active_output_device().strip()
             target_device = QMediaDevices.defaultAudioOutput()
@@ -3702,13 +4396,7 @@ class MainWindow(
             # produce clicks or pops even when the same device is re-selected.
             if self._audio_output.device().id() != target_device.id():
                 self._audio_output.setDevice(target_device)
-            # Respect any temporary seek-mute that is still active.  A back-to-back
-            # one-shot retrigger calls _apply_output_device before the first
-            # position callback has cleared _clip_seek_muted_temporarily, so
-            # blindly applying self._is_muted would briefly unmute the output while
-            # the new media source is being swapped in, causing an audible pop.
-            effective_muted = self._is_muted or self._clip_seek_muted_temporarily
-            self._audio_output.setMuted(effective_muted)
+            self._audio_output.setMuted(self._is_muted)
             self._apply_active_volume()
 
         if self._broadcast_audio_output is not None and _has_qt_multimedia:
@@ -3724,8 +4412,14 @@ class MainWindow(
                     target_device = matched
                     if self._broadcast_audio_output.device().id() != target_device.id():
                         self._broadcast_audio_output.setDevice(target_device)
-                effective_muted = self._is_muted or self._clip_seek_muted_temporarily
-                self._broadcast_audio_output.setMuted(effective_muted)
+                if self._audio_output is not None:
+                    try:
+                        self._broadcast_route_conflicts_main_output = (
+                            self._broadcast_audio_output.device().id() == self._audio_output.device().id()
+                        )
+                    except Exception:
+                        self._broadcast_route_conflicts_main_output = False
+                self._broadcast_audio_output.setMuted(self._is_muted)
                 self._apply_active_volume()
             elif self._broadcast_player is not None:
                 self._broadcast_player.stop()
@@ -3838,7 +4532,10 @@ class MainWindow(
         self._is_preview_mode = bool(checked)
         self._set_mode_button_visual()
         self._refresh_volume_controls()
-        self._apply_output_device()
+        if self._using_main_playback_engine():
+            self._apply_main_playback_output_route()
+        else:
+            self._apply_output_device()
         if self._sample_pads_window is not None:
             self._sample_pads_window.refresh_mode_volume_controls()
 
