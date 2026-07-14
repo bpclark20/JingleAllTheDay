@@ -386,7 +386,7 @@ class MainWindowToolsMixin:
         layout.addWidget(progress_bar)
 
         detail_label = QLabel("Preparing...")
-        detail_label.setStyleSheet("color: #7f8790;")
+        detail_label.setStyleSheet("color: palette(mid);")
         layout.addWidget(detail_label)
 
         buttons_row = QHBoxLayout()

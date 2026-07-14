@@ -219,7 +219,7 @@ class SequencerWindow(QMainWindow):
         display_row.addStretch()
         self._time_display_label = QLabel("Beats")
         self._time_display_label.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._time_display_label.setStyleSheet("color: #00a; text-decoration: underline;")
+        self._time_display_label.setStyleSheet("color: palette(link); text-decoration: underline;")
         self._time_display_label.setMaximumWidth(80)
         display_row.addWidget(self._time_display_label)
         display_row.addSpacing(10)

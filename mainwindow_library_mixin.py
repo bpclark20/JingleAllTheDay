@@ -353,7 +353,7 @@ class MainWindowLibraryMixin:
 
         if not selected_categories:
             empty = QLabel("None")
-            empty.setStyleSheet("color: #888;")
+            empty.setStyleSheet("color: palette(mid);")
             self._chips_layout.addWidget(empty)
             self._chips_layout.addStretch()
             return

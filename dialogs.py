@@ -738,7 +738,7 @@ class KeyboardShortcutsDialog(QDialog):
             self._row_labels[key] = label_text
 
             default_label = QLabel(f"Default: {default_shortcuts.get(key, '')}")
-            default_label.setStyleSheet("color: #666;")
+            default_label.setStyleSheet("color: palette(mid);")
             grid.addWidget(default_label, row_idx, 2)
 
         controls_row = QHBoxLayout()

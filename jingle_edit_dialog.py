@@ -429,7 +429,7 @@ class JingleEditDialog(QDialog):
 
         self._waveform_loading_label = QLabel("Loading waveform...")
         self._waveform_loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._waveform_loading_label.setStyleSheet("color: #7f8790;")
+        self._waveform_loading_label.setStyleSheet("color: palette(mid);")
         root.addWidget(self._waveform_loading_label)
 
         self._timeline = WaveformTimelineWidget(self)
@@ -462,7 +462,7 @@ class JingleEditDialog(QDialog):
 
         tips_row = QHBoxLayout()
         tips = QLabel("Drag start/stop markers directly on the waveform or type exact values.")
-        tips.setStyleSheet("color: #7f8790;")
+        tips.setStyleSheet("color: palette(mid);")
         tips_row.addWidget(tips)
         tips_row.addStretch()
         root.addLayout(tips_row)

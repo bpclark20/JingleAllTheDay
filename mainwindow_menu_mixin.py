@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PyQt6.QtGui import QAction
+from PyQt6.QtGui import QAction, QActionGroup
 
 
 class MainWindowMenuMixin:
@@ -64,6 +64,31 @@ class MainWindowMenuMixin:
         options_action = QAction("Options", self)
         options_action.triggered.connect(self._on_open_options)
         tools_menu.addAction(options_action)
+
+        appearance_menu = tools_menu.addMenu("Appearance")
+        self._appearance_action_group = QActionGroup(self)
+        self._appearance_action_group.setExclusive(True)
+
+        self._appearance_action_system = QAction("Follow System", self)
+        self._appearance_action_system.setCheckable(True)
+        self._appearance_action_system.triggered.connect(self._on_appearance_follow_system_triggered)
+        self._appearance_action_group.addAction(self._appearance_action_system)
+        appearance_menu.addAction(self._appearance_action_system)
+
+        self._appearance_action_light = QAction("Light", self)
+        self._appearance_action_light.setCheckable(True)
+        self._appearance_action_light.triggered.connect(self._on_appearance_light_triggered)
+        self._appearance_action_group.addAction(self._appearance_action_light)
+        appearance_menu.addAction(self._appearance_action_light)
+
+        self._appearance_action_dark = QAction("Dark", self)
+        self._appearance_action_dark.setCheckable(True)
+        self._appearance_action_dark.triggered.connect(self._on_appearance_dark_triggered)
+        self._appearance_action_group.addAction(self._appearance_action_dark)
+        appearance_menu.addAction(self._appearance_action_dark)
+
+        self._refresh_appearance_action_checks()
+
         edit_shortcuts_action = QAction("Edit Keyboard Shortcuts...", self)
         edit_shortcuts_action.triggered.connect(self._on_edit_keyboard_shortcuts)
         tools_menu.addAction(edit_shortcuts_action)

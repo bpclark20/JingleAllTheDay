@@ -11,14 +11,18 @@ import sys
 import time
 from pathlib import Path
 
-from app_helpers import apply_windows_taskbar_icon as _apply_windows_taskbar_icon
+from app_helpers import (
+    apply_app_appearance_mode as _apply_app_appearance_mode,
+    apply_windows_taskbar_icon as _apply_windows_taskbar_icon,
+    coerce_appearance_mode as _coerce_appearance_mode,
+)
 from gui import MainWindow
-from PyQt6.QtCore import QStandardPaths
+from PyQt6.QtCore import QSettings, QStandardPaths
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 APP_NAME = "JingleAllTheDay"
-APP_VERSION = "1.9.0.071226"
+APP_VERSION = "1.9.1.071326"
 APP_ID = "JingleAllTheDay.App"
 _INSTANCE_LOCK_NAME = "single_instance.lock"
 
@@ -179,6 +183,21 @@ def main() -> None:
     # Setting organization name here would redirect users to a new empty data folder.
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(APP_VERSION)
+
+    app_data_location = QStandardPaths.writableLocation(
+        QStandardPaths.StandardLocation.AppDataLocation
+    )
+    if app_data_location.strip():
+        app_data_dir = Path(app_data_location)
+    else:
+        app_data_dir = Path.home() / ".local" / "share" / APP_NAME
+    app_data_dir.mkdir(parents=True, exist_ok=True)
+    settings = QSettings(str(app_data_dir / "settings.ini"), QSettings.Format.IniFormat)
+    settings.setFallbacksEnabled(False)
+    configured_appearance_mode = _coerce_appearance_mode(
+        settings.value("options/appearanceMode", "system")
+    )
+    _apply_app_appearance_mode(app, configured_appearance_mode)
 
     icon_path = _HERE / "icon.png"
     if icon_path.exists():

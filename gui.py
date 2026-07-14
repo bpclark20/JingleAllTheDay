@@ -15,9 +15,15 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app_helpers import (
+    APPEARANCE_MODE_DARK,
+    APPEARANCE_MODE_LIGHT,
+    APPEARANCE_MODE_SYSTEM,
+    apply_app_appearance_mode as _apply_app_appearance_mode,
+    apply_windows_titlebar_theme as _apply_windows_titlebar_theme,
     RESERVED_INTERNAL_TAG_RECENT,
     apply_windows_taskbar_icon as _apply_windows_taskbar_icon,
     chip_palette_for_tag_seed as _chip_palette_for_tag_seed,
+    coerce_appearance_mode as _coerce_appearance_mode,
     coerce_recent_window_days as _coerce_recent_window_days,
     coerce_volume_percent as _coerce_volume_percent,
     ensure_qt_logging_rules as _ensure_qt_logging_rules,
@@ -90,7 +96,7 @@ from PyQt6.QtCore import (
     QUrl,
     pyqtSignal,
 )
-from PyQt6.QtGui import QAction, QCursor, QIcon, QKeyEvent, QMouseEvent, QPixmap
+from PyQt6.QtGui import QAction, QActionGroup, QCursor, QIcon, QKeyEvent, QMouseEvent, QPixmap, QShowEvent
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -264,6 +270,10 @@ class MainWindow(
         self._app_data_dir = Path(app_data_location)
         self._app_data_dir.mkdir(parents=True, exist_ok=True)
         self._settings = self._create_settings_store()
+        self._appearance_mode = _coerce_appearance_mode(
+            self._settings.value("options/appearanceMode", APPEARANCE_MODE_SYSTEM)
+        )
+        self._appearance_effective_mode = APPEARANCE_MODE_LIGHT
         self._playlists_last_playlist_path = str(
             self._settings.value("playlists/lastPlaylistPath", "")
         ).strip()
@@ -359,6 +369,10 @@ class MainWindow(
 
         self._rename_action: QAction | None = None
         self._delete_action: QAction | None = None
+        self._appearance_action_group: QActionGroup | None = None
+        self._appearance_action_system: QAction | None = None
+        self._appearance_action_light: QAction | None = None
+        self._appearance_action_dark: QAction | None = None
 
         library_path = self._app_data_dir / "jingle-library.json"
         self._store = LibraryStore(library_path)
@@ -402,6 +416,10 @@ class MainWindow(
         self._main_playback_timer = QTimer(self)
         self._main_playback_timer.setInterval(30)
         self._main_playback_timer.timeout.connect(self._on_main_playback_timer)
+        self._titlebar_reassert_timer = QTimer(self)
+        self._titlebar_reassert_timer.setInterval(150)
+        self._titlebar_reassert_timer.timeout.connect(self._on_titlebar_reassert_tick)
+        self._titlebar_reassert_remaining = 0
         self._is_preview_mode = False
         self._loop_breath_effect: QGraphicsOpacityEffect | None = None
         self._loop_breath_anim: QPropertyAnimation | None = None
@@ -426,6 +444,14 @@ class MainWindow(
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
+            style_hints = app.styleHints()
+            color_scheme_changed = getattr(style_hints, "colorSchemeChanged", None)
+            if color_scheme_changed is not None:
+                try:
+                    color_scheme_changed.connect(self._on_system_color_scheme_changed)
+                except Exception:
+                    pass
+            self._appearance_effective_mode = _apply_app_appearance_mode(app, self._appearance_mode)
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
         root.setContentsMargins(8, 8, 8, 8)
@@ -1943,6 +1969,8 @@ class MainWindow(
         return self._trigger_sample_pad(pad_index)
 
     def eventFilter(self, watched: QObject | None, event: QEvent | None) -> bool:
+        if watched is self and event is not None and event.type() == QEvent.Type.WindowActivate:
+            self._refresh_system_appearance_fallback()
         if (
             isinstance(watched, QWidget)
             and event is not None
@@ -1979,6 +2007,13 @@ class MainWindow(
             if self._handle_media_key_event(event):
                 return True
         return super().eventFilter(watched, event)
+
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        _apply_windows_titlebar_theme(
+            self,
+            self._appearance_effective_mode == APPEARANCE_MODE_DARK,
+        )
 
     def _should_preserve_selected_row(self) -> bool:
         table = getattr(self, "_table", None)
@@ -2586,6 +2621,103 @@ class MainWindow(
         settings = QSettings(str(settings_path), QSettings.Format.IniFormat)
         settings.setFallbacksEnabled(False)
         return settings
+
+    def appearance_mode(self) -> str:
+        return self._appearance_mode
+
+    def _set_appearance_mode(self, mode: str, *, announce: bool = True) -> None:
+        normalized_mode = _coerce_appearance_mode(mode)
+        if normalized_mode != self._appearance_mode:
+            self._appearance_mode = normalized_mode
+            self._settings.setValue("options/appearanceMode", self._appearance_mode)
+        self._apply_current_appearance_mode()
+        self._start_titlebar_reassertion()
+        self._refresh_appearance_action_checks()
+        if announce:
+            label = {
+                APPEARANCE_MODE_SYSTEM: "Follow System",
+                APPEARANCE_MODE_LIGHT: "Light",
+                APPEARANCE_MODE_DARK: "Dark",
+            }.get(self._appearance_mode, "Follow System")
+            self._status.showMessage(f"Appearance mode: {label}")
+
+    def _apply_current_appearance_mode(self) -> None:
+        app = QApplication.instance()
+        if app is None:
+            return
+        self._appearance_effective_mode = _apply_app_appearance_mode(app, self._appearance_mode)
+        use_dark_titlebar = self._appearance_effective_mode == APPEARANCE_MODE_DARK
+        for widget in app.topLevelWidgets():
+            try:
+                _apply_windows_titlebar_theme(widget, use_dark_titlebar)
+                widget.update()
+            except RuntimeError:
+                continue
+
+        # Windows can occasionally lag one paint cycle on non-client updates;
+        # re-apply titlebar mode on the next event loop turn for consistency.
+        QTimer.singleShot(0, self._apply_deferred_titlebar_theme)
+
+    def _apply_deferred_titlebar_theme(self) -> None:
+        app = QApplication.instance()
+        if app is None:
+            return
+        use_dark_titlebar = self._appearance_effective_mode == APPEARANCE_MODE_DARK
+        for widget in app.topLevelWidgets():
+            try:
+                _apply_windows_titlebar_theme(widget, use_dark_titlebar)
+            except RuntimeError:
+                continue
+
+    def _start_titlebar_reassertion(self) -> None:
+        if sys.platform != "win32":
+            return
+        # Re-assert for ~1.2s to ride out transient non-client repaints.
+        self._titlebar_reassert_remaining = 8
+        if not self._titlebar_reassert_timer.isActive():
+            self._titlebar_reassert_timer.start()
+
+    def _on_titlebar_reassert_tick(self) -> None:
+        if self._titlebar_reassert_remaining <= 0:
+            self._titlebar_reassert_timer.stop()
+            return
+        self._titlebar_reassert_remaining -= 1
+        app = QApplication.instance()
+        if app is None:
+            return
+        use_dark_titlebar = self._appearance_effective_mode == APPEARANCE_MODE_DARK
+        for widget in app.topLevelWidgets():
+            try:
+                _apply_windows_titlebar_theme(widget, use_dark_titlebar)
+            except RuntimeError:
+                continue
+
+    def _refresh_appearance_action_checks(self) -> None:
+        if self._appearance_action_system is not None:
+            self._appearance_action_system.setChecked(self._appearance_mode == APPEARANCE_MODE_SYSTEM)
+        if self._appearance_action_light is not None:
+            self._appearance_action_light.setChecked(self._appearance_mode == APPEARANCE_MODE_LIGHT)
+        if self._appearance_action_dark is not None:
+            self._appearance_action_dark.setChecked(self._appearance_mode == APPEARANCE_MODE_DARK)
+
+    def _on_appearance_follow_system_triggered(self) -> None:
+        self._set_appearance_mode(APPEARANCE_MODE_SYSTEM)
+
+    def _on_appearance_light_triggered(self) -> None:
+        self._set_appearance_mode(APPEARANCE_MODE_LIGHT)
+
+    def _on_appearance_dark_triggered(self) -> None:
+        self._set_appearance_mode(APPEARANCE_MODE_DARK)
+
+    def _on_system_color_scheme_changed(self, *_: Any) -> None:
+        if self._appearance_mode != APPEARANCE_MODE_SYSTEM:
+            return
+        self._apply_current_appearance_mode()
+
+    def _refresh_system_appearance_fallback(self) -> None:
+        if self._appearance_mode != APPEARANCE_MODE_SYSTEM:
+            return
+        self._apply_current_appearance_mode()
 
     def _load_samples_dir(self) -> Path | None:
         raw = str(self._settings.value("library/samplesDir", "")).strip()
