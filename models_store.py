@@ -9,6 +9,7 @@ from app_helpers import now_epoch_seconds as _now_epoch_seconds
 from app_helpers import merge_tags as _merge_tags
 from app_helpers import normalize_tags as _normalize_tags
 from app_helpers import sanitize_user_tags as _sanitize_user_tags
+from app_helpers import RESERVED_INTERNAL_TAG_RECORDING
 
 
 @dataclass
@@ -86,6 +87,16 @@ class LibraryStore:
                     "categories": categories,
                 }
 
+                internal_tags_raw = info.get("internal_tags")
+                if isinstance(internal_tags_raw, list):
+                    internal_tags = [
+                        tag
+                        for tag in _normalize_tags(internal_tags_raw)
+                        if tag.casefold() == RESERVED_INTERNAL_TAG_RECORDING.casefold()
+                    ]
+                    if internal_tags:
+                        entry["internal_tags"] = internal_tags
+
                 added_raw = info.get("added_at_epoch_seconds")
                 try:
                     if added_raw is not None:
@@ -157,12 +168,12 @@ class LibraryStore:
 
     def save(self) -> None:
         self._json_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"version": 7, "meta": self._meta, "items": self._entries}
+        payload = {"version": 8, "meta": self._meta, "items": self._entries}
         self._json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def export_to(self, destination: Path) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"version": 7, "meta": self._meta, "items": self._entries}
+        payload = {"version": 8, "meta": self._meta, "items": self._entries}
         destination.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def import_from(self, source: Path) -> None:
@@ -190,6 +201,46 @@ class LibraryStore:
         clean_categories, _rejected = _sanitize_user_tags(_normalize_tags(categories))
         entry["categories"] = clean_categories
         self._entries[key] = entry
+
+    def get_internal_tags(self, path: Path) -> list[str]:
+        info = self._entries.get(str(path), {})
+        raw_tags = info.get("internal_tags", [])
+        if not isinstance(raw_tags, list):
+            return []
+        return [
+            tag
+            for tag in _normalize_tags(raw_tags)
+            if tag.casefold() == RESERVED_INTERNAL_TAG_RECORDING.casefold()
+        ]
+
+    def set_internal_tags(self, path: Path, internal_tags: list[str]) -> None:
+        key = str(path)
+        entry = dict(self._entries.get(key, {}))
+        clean_tags = [
+            tag
+            for tag in _normalize_tags(internal_tags)
+            if tag.casefold() == RESERVED_INTERNAL_TAG_RECORDING.casefold()
+        ]
+        if clean_tags:
+            entry["internal_tags"] = clean_tags
+        else:
+            entry.pop("internal_tags", None)
+        self._entries[key] = entry
+
+    def has_internal_tag(self, path: Path, tag: str) -> bool:
+        normalized = tag.strip().casefold()
+        if normalized != RESERVED_INTERNAL_TAG_RECORDING.casefold():
+            return False
+        return any(item.casefold() == normalized for item in self.get_internal_tags(path))
+
+    def mark_recorded(self, path: Path, recorded: bool = True) -> None:
+        if recorded:
+            self.set_internal_tags(path, [RESERVED_INTERNAL_TAG_RECORDING])
+            return
+        self.set_internal_tags(path, [])
+
+    def is_recorded(self, path: Path) -> bool:
+        return self.has_internal_tag(path, RESERVED_INTERNAL_TAG_RECORDING)
 
     def get_added_at(self, path: Path) -> int | None:
         info = self._entries.get(str(path), {})

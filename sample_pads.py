@@ -71,6 +71,8 @@ class SamplePad(QtWidgets.QWidget):
         self.pad_mode: str = "one_shot"
         self.is_playing = False
         self._is_held = False
+        self._is_recording = False
+        self._recording_blink_on = True
         self.init_ui()
 
     def init_ui(self) -> None:
@@ -163,9 +165,50 @@ class SamplePad(QtWidgets.QWidget):
     def _refresh_stop_button_state(self) -> None:
         self.stop_btn.setEnabled(bool(self.is_playing))
 
+    def _base_button_text(self) -> str:
+        if isinstance(self.jingle, dict) and "name" in self.jingle:
+            return str(self.jingle["name"])
+        return f"Pad {self.slot_index + 1}"
+
+    def _refresh_sample_button_presentation(self) -> None:
+        base_text = self._base_button_text()
+        if self._is_recording:
+            self.sample_btn.setText(f"REC {base_text}")
+            if self._recording_blink_on:
+                self.sample_btn.setStyleSheet(
+                    "QPushButton { background: #8a1010; color: white; border: 2px solid #ff6b6b; font-weight: bold; }"
+                )
+            else:
+                self.sample_btn.setStyleSheet(
+                    "QPushButton { background: #5f0a0a; color: #ffe5e5; border: 2px solid #9a3b3b; font-weight: bold; }"
+                )
+            return
+        self.sample_btn.setText(base_text)
+        self.sample_btn.setStyleSheet("")
+
+    def set_recording_active(self, active: bool) -> None:
+        self._is_recording = bool(active)
+        if self._is_recording:
+            self._recording_blink_on = True
+        self._refresh_sample_button_presentation()
+
+    def set_recording_blink_phase(self, phase_on: bool) -> None:
+        self._recording_blink_on = bool(phase_on)
+        if self._is_recording:
+            self._refresh_sample_button_presentation()
+
     def on_sample_pressed(self) -> None:
         self._sync_playing_state_from_main_window()
         self._is_held = True
+        parent_window = self._parent_window()
+        if parent_window and hasattr(parent_window, "parent_main_window"):
+            main_window: Any = parent_window.parent_main_window
+            if main_window and hasattr(main_window, "handle_sample_pad_activation"):
+                try:
+                    if main_window.handle_sample_pad_activation(self, parent_window.is_live_mode):
+                        return
+                except Exception:
+                    pass
         if self.pad_mode == "one_shot":
             if self.is_playing:
                 self.restart_sample()
@@ -182,6 +225,16 @@ class SamplePad(QtWidgets.QWidget):
     def on_sample_released(self) -> None:
         if not self._is_held:
             return
+        parent_window = self._parent_window()
+        if parent_window and hasattr(parent_window, "parent_main_window"):
+            main_window: Any = parent_window.parent_main_window
+            if main_window and hasattr(main_window, "sample_pad_recording_mode_enabled"):
+                try:
+                    if bool(main_window.sample_pad_recording_mode_enabled()):
+                        self._is_held = False
+                        return
+                except Exception:
+                    pass
         if self.pad_mode in _RELEASE_PAD_MODES:
             self.stop_sample()
         else:
@@ -289,10 +342,7 @@ class SamplePad(QtWidgets.QWidget):
 
     def assign_jingle(self, jingle: dict[str, Any] | None) -> None:
         self.jingle = jingle
-        if isinstance(jingle, dict) and "name" in jingle:
-            self.sample_btn.setText(str(jingle["name"]))
-        else:
-            self.sample_btn.setText(f"Pad {self.slot_index + 1}")
+        self._refresh_sample_button_presentation()
 
         parent_window = self._parent_window()
         if (
@@ -1078,6 +1128,7 @@ class SamplePadsWindow(QtWidgets.QDialog):
     layoutLoaded = QtCore.pyqtSignal(str)
     layoutSaved = QtCore.pyqtSignal(str)
     modeChanged = QtCore.pyqtSignal(bool)
+    recordingModeToggled = QtCore.pyqtSignal(bool)
     globalHotkeysToggled = QtCore.pyqtSignal(bool)
     altModifierToggled = QtCore.pyqtSignal(bool)
     boardSwitchCtrlModifierToggled = QtCore.pyqtSignal(bool)
@@ -1105,6 +1156,8 @@ class SamplePadsWindow(QtWidgets.QDialog):
         self._active_board_index = 0
 
         self.is_live_mode: bool = True
+        self._recording_mode_enabled: bool = False
+        self._recording_banner_visible: bool = False
         self.parent_main_window: QtWidgets.QWidget | None = parent
         self._current_layout_path = ""
         self._suppress_pad_state_changed: bool = False
@@ -1209,6 +1262,21 @@ class SamplePadsWindow(QtWidgets.QDialog):
         self.mode_volume_value = QtWidgets.QLabel("100%")
         controls_row.addWidget(self.mode_volume_value)
 
+        self.recording_mode_checkbox = QtWidgets.QCheckBox("Recording Mode")
+        self.recording_mode_checkbox.setToolTip(
+            "When enabled, empty pads record instead of playing. Occupied pads are ignored."
+        )
+        self.recording_mode_checkbox.toggled.connect(self._on_recording_mode_toggled)
+        controls_row.addWidget(self.recording_mode_checkbox)
+
+        self.recording_status_label = QtWidgets.QLabel("")
+        self.recording_status_label.setVisible(False)
+        self.recording_status_label.setStyleSheet(
+            "QLabel { background: #2b0f0f; color: #ffb3b3; border: 1px solid #7a2424;"
+            " border-radius: 6px; padding: 4px 10px; font-weight: bold; }"
+        )
+        controls_row.addWidget(self.recording_status_label)
+
         self.global_hotkeys_checkbox = QtWidgets.QCheckBox("Global Hotkeys")
         self.global_hotkeys_checkbox.setToolTip(
             "Trigger pads 1-10 with keys 1-9 and 0; pads 11-20 with Ctrl+1-9 and Ctrl+0. Works even when this app is not focused."
@@ -1293,6 +1361,19 @@ class SamplePadsWindow(QtWidgets.QDialog):
 
         layout.addLayout(layout_row)
         self.refresh_mode_volume_controls()
+
+    def is_recording_mode_enabled(self) -> bool:
+        return bool(self._recording_mode_enabled)
+
+    def set_recording_mode_enabled(self, enabled: bool) -> None:
+        self._recording_mode_enabled = bool(enabled)
+        self.recording_mode_checkbox.blockSignals(True)
+        self.recording_mode_checkbox.setChecked(self._recording_mode_enabled)
+        self.recording_mode_checkbox.blockSignals(False)
+
+    def _on_recording_mode_toggled(self, enabled: bool) -> None:
+        self._recording_mode_enabled = bool(enabled)
+        self.recordingModeToggled.emit(self._recording_mode_enabled)
 
     def toggle_mode(self) -> None:
         self.set_live_mode(self.mode_btn.isChecked())
@@ -1484,6 +1565,51 @@ class SamplePadsWindow(QtWidgets.QDialog):
         board = self._boards[board_index]
         if 0 <= pad_index < len(board):
             board[pad_index].assign_jingle(jingle)
+
+    def set_pad_recording_indicator(self, board_index: int, pad_index: int, active: bool) -> None:
+        if board_index < 0 or board_index >= self._num_boards:
+            return
+        board = self._boards[board_index]
+        if 0 <= pad_index < len(board):
+            board[pad_index].set_recording_active(active)
+
+    def set_recording_blink_phase(self, phase_on: bool) -> None:
+        for board in self._boards:
+            for pad in board:
+                pad.set_recording_blink_phase(phase_on)
+
+    @staticmethod
+    def _format_elapsed_label(seconds: float) -> str:
+        whole = max(0, int(seconds))
+        minutes, secs = divmod(whole, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
+
+    def update_recording_status(
+        self,
+        active: bool,
+        board_index: int,
+        slot_index: int,
+        elapsed_seconds: float,
+        output_name: str = "",
+    ) -> None:
+        if not active:
+            self._recording_banner_visible = False
+            self.recording_status_label.setVisible(False)
+            self.recording_status_label.setText("")
+            return
+
+        board_label = board_index + 1
+        pad_label = slot_index + 1
+        elapsed_text = self._format_elapsed_label(elapsed_seconds)
+        suffix = f" | {output_name}" if output_name else ""
+        self.recording_status_label.setText(
+            f"REC Board {board_label} Pad {pad_label} | {elapsed_text}{suffix}"
+        )
+        self._recording_banner_visible = True
+        self.recording_status_label.setVisible(True)
 
     def trigger_pad(self, pad_index: int) -> bool:
         board = self._boards[self._active_board_index]

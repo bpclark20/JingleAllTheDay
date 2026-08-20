@@ -65,6 +65,10 @@ class MainWindowMenuMixin:
         options_action.triggered.connect(self._on_open_options)
         tools_menu.addAction(options_action)
 
+        record_jingle_action = QAction("Record Jingle", self)
+        record_jingle_action.triggered.connect(self._on_tools_record_jingle)
+        tools_menu.addAction(record_jingle_action)
+
         appearance_menu = tools_menu.addMenu("Appearance")
         self._appearance_action_group = QActionGroup(self)
         self._appearance_action_group.setExclusive(True)

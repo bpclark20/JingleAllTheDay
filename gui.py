@@ -51,6 +51,7 @@ from mainwindow_menu_mixin import MainWindowMenuMixin
 from mainwindow_shortcuts_mixin import MainWindowShortcutsMixin
 from mainwindow_tools_mixin import MainWindowToolsMixin
 from models_store import JingleRecord, LibraryStore
+from recording_engine import RecordingConfig, get_recording_engine
 from waveform_cache import load_waveform_peaks as _load_waveform_peaks
 
 from widgets import DeselectableTableWidget
@@ -77,6 +78,19 @@ def _coerce_sample_pad_streaming_min_seconds(value: Any) -> int:
     except (TypeError, ValueError):
         parsed = 120
     return max(0, min(3600, parsed))
+
+
+def _normalize_recording_wav_subtype(value: Any) -> str:
+    candidate = str(value or "").strip().upper().replace("-", "_")
+    if candidate == "PCM24":
+        candidate = "PCM_24"
+    elif candidate == "PCM16":
+        candidate = "PCM_16"
+    elif candidate in {"FLOAT32", "PCM_FLOAT"}:
+        candidate = "FLOAT"
+    if candidate not in {"PCM_16", "PCM_24", "FLOAT"}:
+        return "PCM_16"
+    return candidate
 
 
 _ensure_qt_logging_rules()
@@ -293,6 +307,15 @@ class MainWindow(
             self._settings.value("options/microphoneInputDevice", "")
         ).strip()
         try:
+            self._recording_input_device = int(self._settings.value("options/recordingInputDevice", -1))
+        except (TypeError, ValueError):
+            self._recording_input_device = -1
+        if self._recording_input_device < 0:
+            self._recording_input_device = -1
+        self._recording_wav_subtype = _normalize_recording_wav_subtype(
+            self._settings.value("options/recordingWavSubtype", "PCM_16")
+        )
+        try:
             self._microphone_gain_percent = int(
                 self._settings.value("options/microphoneGainPercent", 100)
             )
@@ -335,6 +358,10 @@ class MainWindow(
         )
         if self._sample_pad_active_board_index < 0 or self._sample_pad_active_board_index > 4:
             self._sample_pad_active_board_index = 0
+        self._sample_pad_recording_mode_enabled = (
+            str(self._settings.value("samplePads/recordingModeEnabled", "false")).strip().lower()
+            == "true"
+        )
         self._sample_pad_listener: Any | None = None
         self._sample_pad_hotkey_backend = "none"
         self._sample_pad_win_filter: _WindowsHotkeyEventFilter | None = None
@@ -344,6 +371,15 @@ class MainWindow(
         self._sample_pad_release_looping: bool = False
         self._sample_pad_native_looping: bool = False
         self._current_sample_pad_index: int = -1
+        self._sample_pad_recording_active: bool = False
+        self._sample_pad_recording_pad_index: int = -1
+        self._sample_pad_recording_board_index: int = -1
+        self._sample_pad_recording_slot_index: int = -1
+        self._sample_pad_recording_output_path: Path | None = None
+        self._sample_pad_recording_blink_on: bool = True
+        self._sample_pad_recording_ui_timer = QTimer(self)
+        self._sample_pad_recording_ui_timer.setInterval(350)
+        self._sample_pad_recording_ui_timer.timeout.connect(self._on_sample_pad_recording_ui_tick)
         self._main_playback_meter_peaks_path: str = ""
         self._main_playback_meter_peaks: list[float] = []
         self._main_playback_meter_loading_path: str = ""
@@ -1258,6 +1294,9 @@ class MainWindow(
             self._sample_pads_window.layoutLoaded.connect(self._on_sample_pads_layout_selected)
             self._sample_pads_window.layoutSaved.connect(self._on_sample_pads_layout_selected)
             self._sample_pads_window.modeChanged.connect(self._on_sample_pads_mode_changed)
+            self._sample_pads_window.recordingModeToggled.connect(
+                self._on_sample_pads_recording_mode_toggled
+            )
             self._sample_pads_window.globalHotkeysToggled.connect(
                 self._on_sample_pads_global_hotkeys_toggled
             )
@@ -1294,6 +1333,8 @@ class MainWindow(
                 self._sample_pad_board_switch_requires_ctrl
             )
             self._sample_pads_window.set_active_board(self._sample_pad_active_board_index)
+            self._sample_pads_window.set_recording_mode_enabled(self._sample_pad_recording_mode_enabled)
+            self._update_sample_pad_recording_ui()
             # Prefer autosave state; fall back to last manually loaded layout
             autosave_path = self._app_data_dir / "sample_pads_autosave.json"
             if autosave_path.exists():
@@ -1365,6 +1406,10 @@ class MainWindow(
             self._sample_pads_dirty = True
             self._status.showMessage(f"Switched to sample pad board {board_index + 1}")
             self._autosave_sample_pad_layout()
+            if self._sample_pad_recording_active and self._sample_pad_recording_slot_index >= 0:
+                self._status.showMessage(
+                    f"Recording is active. Press pad {self._sample_pad_recording_slot_index + 1} again to stop."
+                )
         return changed
 
     def _on_sample_pads_layout_selected(self, file_path: str) -> None:
@@ -1522,6 +1567,165 @@ class MainWindow(
         except Exception:
             # Playback path already handles/report errors at trigger time.
             pass
+
+    def _on_sample_pads_recording_mode_toggled(self, enabled: bool) -> None:
+        self._sample_pad_recording_mode_enabled = bool(enabled)
+        self._settings.setValue(
+            "samplePads/recordingModeEnabled",
+            "true" if self._sample_pad_recording_mode_enabled else "false",
+        )
+        if not self._sample_pad_recording_mode_enabled and self._sample_pad_recording_active:
+            self._stop_sample_pad_recording(save_to_pad=True)
+        if self._sample_pads_window is not None and not self._sample_pad_recording_mode_enabled:
+            self._sample_pads_window.update_recording_status(False, -1, -1, 0.0, "")
+        state = "enabled" if self._sample_pad_recording_mode_enabled else "disabled"
+        self._status.showMessage(f"Sample pad recording mode: {state}.")
+
+    def _on_sample_pad_recording_ui_tick(self) -> None:
+        if not self._sample_pad_recording_active:
+            self._sample_pad_recording_ui_timer.stop()
+            return
+        self._sample_pad_recording_blink_on = not self._sample_pad_recording_blink_on
+        if self._sample_pads_window is not None:
+            self._sample_pads_window.set_recording_blink_phase(self._sample_pad_recording_blink_on)
+        self._update_sample_pad_recording_ui()
+
+    def _update_sample_pad_recording_ui(self) -> None:
+        if self._sample_pads_window is None:
+            return
+
+        if not self._sample_pad_recording_active:
+            self._sample_pads_window.update_recording_status(False, -1, -1, 0.0, "")
+            return
+
+        board_index = self._sample_pad_recording_board_index
+        slot_index = self._sample_pad_recording_slot_index
+        output_name = self._sample_pad_recording_output_path.name if self._sample_pad_recording_output_path else ""
+
+        elapsed_seconds = 0.0
+        latest_metrics = get_recording_engine().get_latest_metrics()
+        if latest_metrics is not None:
+            elapsed_seconds = max(0.0, float(latest_metrics.current_seconds))
+
+        if board_index >= 0 and slot_index >= 0:
+            self._sample_pads_window.set_pad_recording_indicator(board_index, slot_index, True)
+        self._sample_pads_window.update_recording_status(
+            True,
+            board_index,
+            slot_index,
+            elapsed_seconds,
+            output_name,
+        )
+
+    def sample_pad_recording_mode_enabled(self) -> bool:
+        return bool(self._sample_pad_recording_mode_enabled)
+
+    def handle_sample_pad_activation(self, pad: Any, is_live_mode: bool) -> bool:
+        del is_live_mode
+        if not self.sample_pad_recording_mode_enabled():
+            return False
+
+        pad_index = int(getattr(pad, "pad_index", -1))
+        board_index = int(getattr(pad, "board_index", -1))
+        slot_index = int(getattr(pad, "slot_index", -1))
+        jingle = getattr(pad, "jingle", None)
+
+        if self._sample_pad_recording_active:
+            same_absolute_pad = pad_index == self._sample_pad_recording_pad_index
+            same_slot_hotkey = slot_index == self._sample_pad_recording_slot_index
+            if not (same_absolute_pad or same_slot_hotkey):
+                if self._sample_pad_recording_slot_index >= 0:
+                    self._status.showMessage(
+                        f"Recording is active. Press pad {self._sample_pad_recording_slot_index + 1} again to stop."
+                    )
+                return True
+            self._stop_sample_pad_recording(save_to_pad=True)
+            return True
+
+        if isinstance(jingle, dict) and jingle.get("path"):
+            self._status.showMessage(f"Pad {slot_index + 1} already has audio. Recording mode ignores occupied pads.")
+            return True
+
+        self._start_sample_pad_recording(board_index, slot_index, pad_index)
+        return True
+
+    def _start_sample_pad_recording(self, board_index: int, slot_index: int, pad_index: int) -> None:
+        output_path = self._next_recording_path()
+        if output_path is None:
+            self._status.showMessage("Choose a samples folder before recording to a pad.")
+            return
+
+        engine = get_recording_engine()
+        config = RecordingConfig(
+            device_id=self._resolved_recording_input_device(),
+            sample_rate=None,
+            channels=2,
+            wav_subtype=self._recording_wav_subtype,
+        )
+        error = engine.start_recording(output_path, config)
+        if error:
+            self._status.showMessage(error)
+            return
+
+        self._sample_pad_recording_active = True
+        self._sample_pad_recording_pad_index = pad_index
+        self._sample_pad_recording_board_index = board_index
+        self._sample_pad_recording_slot_index = slot_index
+        self._sample_pad_recording_output_path = output_path
+        self._sample_pad_recording_blink_on = True
+        if self._sample_pads_window is not None:
+            self._sample_pads_window.set_recording_blink_phase(True)
+            self._sample_pads_window.set_pad_recording_indicator(board_index, slot_index, True)
+        self._update_sample_pad_recording_ui()
+        if not self._sample_pad_recording_ui_timer.isActive():
+            self._sample_pad_recording_ui_timer.start()
+        self._status.showMessage(
+            f"Recording pad {slot_index + 1} to {output_path.name}. Press the same pad/hotkey again to stop."
+        )
+
+    def _stop_sample_pad_recording(self, *, save_to_pad: bool) -> None:
+        if not self._sample_pad_recording_active:
+            return
+
+        engine = get_recording_engine()
+        engine.stop_recording()
+
+        output_path = self._sample_pad_recording_output_path
+        pad_index = self._sample_pad_recording_pad_index
+        board_index = self._sample_pad_recording_board_index
+        slot_index = self._sample_pad_recording_slot_index
+        self._sample_pad_recording_active = False
+        self._sample_pad_recording_pad_index = -1
+        self._sample_pad_recording_board_index = -1
+        self._sample_pad_recording_slot_index = -1
+        self._sample_pad_recording_output_path = None
+        self._sample_pad_recording_ui_timer.stop()
+        self._sample_pad_recording_blink_on = True
+
+        if self._sample_pads_window is not None and board_index >= 0 and slot_index >= 0:
+            self._sample_pads_window.set_pad_recording_indicator(board_index, slot_index, False)
+            self._sample_pads_window.set_recording_blink_phase(True)
+            self._sample_pads_window.update_recording_status(False, -1, -1, 0.0, "")
+
+        if output_path is None or not output_path.exists():
+            self._status.showMessage("Sample pad recording stopped before a file was written.")
+            return
+
+        self._store.mark_recorded(output_path, True)
+        self._store.save()
+        self._rescan_library()
+
+        if save_to_pad and self._sample_pads_window is not None:
+            board = self._sample_pads_window.board_pads(board_index)
+            if 0 <= slot_index < len(board):
+                board[slot_index].assign_jingle(
+                    {
+                        "name": output_path.stem,
+                        "path": str(output_path),
+                    }
+                )
+                self._sp_engine_preload_all_pads()
+        self._status.showMessage(f"Saved pad recording to {output_path.name}.")
 
     def _on_sample_pads_alt_modifier_toggled(self, enabled: bool) -> None:
         self._sample_pad_alt_modifier = enabled
@@ -4269,6 +4473,7 @@ class MainWindow(
             self._broadcast_output_device,
             self._mixer_enabled,
             self._microphone_input_device,
+            self._recording_input_device,
             self._microphone_gain_percent,
             self._live_volume_percent,
             self._preview_volume_percent,
@@ -4291,6 +4496,7 @@ class MainWindow(
             self._microphone_input_device,
             self._microphone_gain_percent,
         ) = dialog.selected_mixer_config()
+        self._recording_input_device = dialog.selected_recording_device() or -1
         self._live_volume_percent, self._preview_volume_percent = dialog.selected_volumes()
         selected_recent_window_days = dialog.selected_recent_window_days()
         self._sample_pad_blocksize = dialog.selected_sample_pad_blocksize()
@@ -4306,6 +4512,7 @@ class MainWindow(
         self._settings.setValue(
             "options/microphoneInputDevice", self._microphone_input_device
         )
+        self._settings.setValue("options/recordingInputDevice", self._recording_input_device)
         self._settings.setValue(
             "options/microphoneGainPercent", self._microphone_gain_percent
         )
@@ -4355,6 +4562,12 @@ class MainWindow(
             return selected
         if not _has_qt_multimedia:
             return ""
+
+    def _resolved_recording_input_device(self) -> int | None:
+        device_id = self._recording_input_device
+        if isinstance(device_id, int) and device_id >= 0:
+            return device_id
+        return None
         try:
             return QMediaDevices.defaultAudioInput().description().strip()
         except Exception:

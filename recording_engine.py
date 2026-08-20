@@ -18,10 +18,11 @@ class RecordingConfig:
     """Configuration for recording session."""
 
     device_id: int | str | None
-    sample_rate: int = 44100
+    sample_rate: int | None = None
     channels: int = 2
     blocksize: int = 2048
     use_wasapi_loopback: bool = False
+    wav_subtype: str = "PCM_16"
 
 
 @dataclass
@@ -86,6 +87,43 @@ class RecordingEngine:
 
         return devices
 
+    @staticmethod
+    def _normalize_wav_subtype(wav_subtype: str | None) -> str:
+        normalized = str(wav_subtype or "PCM_16").strip().upper()
+        if normalized in {"PCM_16", "PCM_24", "FLOAT"}:
+            return normalized
+        if normalized in {"FLOAT32", "32BITFLOAT", "32-BIT FLOAT"}:
+            return "FLOAT"
+        return "PCM_16"
+
+    @staticmethod
+    def _resolve_input_device(device_id: int | str | None) -> int | str | None:
+        if isinstance(device_id, int) and device_id < 0:
+            return None
+        if device_id is not None:
+            return device_id
+        try:
+            return sd.default.device[0]
+        except Exception:
+            return None
+
+    @staticmethod
+    def _resolve_device_sample_rate(device_id: int | str | None, fallback: int = 44100) -> int:
+        if device_id is None:
+            return max(1, int(fallback))
+        try:
+            device_info = sd.query_devices(device_id, "input")
+            default_sample_rate = int(round(float(device_info.get("default_samplerate", fallback))))
+        except Exception:
+            default_sample_rate = int(fallback)
+        return max(1, default_sample_rate)
+
+    def resolve_recording_settings(self, config: RecordingConfig) -> tuple[int | str | None, int, str]:
+        device_id = self._resolve_input_device(config.device_id)
+        sample_rate = int(config.sample_rate) if config.sample_rate else self._resolve_device_sample_rate(device_id)
+        wav_subtype = self._normalize_wav_subtype(config.wav_subtype)
+        return device_id, sample_rate, wav_subtype
+
     def start_recording(
         self,
         output_path: Path,
@@ -147,10 +185,7 @@ class RecordingEngine:
     def _recording_thread(self, output_path: Path, config: RecordingConfig) -> None:
         """Thread worker for recording audio."""
         try:
-            # Normalize device ID
-            device_id = config.device_id
-            if device_id is None:
-                device_id = sd.default.device[0]  # Default input device
+            device_id, sample_rate, wav_subtype = self.resolve_recording_settings(config)
 
             # Prepare audio stream callback
             recorded_frames: list[np.ndarray] = []
@@ -176,11 +211,17 @@ class RecordingEngine:
                 peak = float(np.max(np.abs(audio_data)))
 
                 # Send metrics
-                current_seconds = frame_count / config.sample_rate
+                current_seconds = frame_count / sample_rate
                 metrics = RecordingMetrics(
                     current_seconds=current_seconds,
                     peak_level=peak,
                 )
+
+                if self._metrics_callback is not None:
+                    try:
+                        self._metrics_callback(metrics)
+                    except Exception:
+                        pass
 
                 try:
                     self._metrics_queue.put_nowait(metrics)
@@ -195,7 +236,7 @@ class RecordingEngine:
             # Open input stream
             with sd.InputStream(
                 device=device_id,
-                samplerate=config.sample_rate,
+                samplerate=sample_rate,
                 channels=config.channels,
                 blocksize=config.blocksize,
                 callback=audio_callback,
@@ -209,7 +250,8 @@ class RecordingEngine:
                 sf.write(
                     str(output_path),
                     audio_data,
-                    samplerate=config.sample_rate,
+                    samplerate=sample_rate,
+                    subtype=wav_subtype,
                 )
 
         except Exception as e:

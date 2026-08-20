@@ -19,6 +19,11 @@ _HERE = Path(sys._MEIPASS) if hasattr(sys, "_MEIPASS") else Path(__file__).resol
 _FFPROBE_PATH: str | None = None
 _FFPROBE_CHECKED = False
 RESERVED_INTERNAL_TAG_RECENT = "Recent"
+RESERVED_INTERNAL_TAG_RECORDING = "JADR"
+_RESERVED_INTERNAL_TAGS = {
+    RESERVED_INTERNAL_TAG_RECENT.casefold(),
+    RESERVED_INTERNAL_TAG_RECORDING.casefold(),
+}
 APPEARANCE_MODE_SYSTEM = "system"
 APPEARANCE_MODE_LIGHT = "light"
 APPEARANCE_MODE_DARK = "dark"
@@ -339,7 +344,7 @@ def remove_tags(existing: list[str], incoming: list[str]) -> list[str]:
 
 
 def is_reserved_internal_tag(tag: str) -> bool:
-    return tag.strip().casefold() == RESERVED_INTERNAL_TAG_RECENT.casefold()
+    return tag.strip().casefold() in _RESERVED_INTERNAL_TAGS
 
 
 def sanitize_user_tags(tags: list[str]) -> tuple[list[str], list[str]]:

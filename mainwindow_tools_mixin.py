@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from typing import cast
 
@@ -14,6 +15,7 @@ from app_helpers import (
 )
 from mainwindow_contracts import MainWindowToolsHost
 from models_store import JingleRecord
+from jingle_record_dialog import JingleRecordDialog
 from waveform_cache import build_waveform_previews, has_persisted_waveform_preview
 
 
@@ -70,6 +72,27 @@ class MainWindowToolsMixin:
     def _host(self) -> MainWindowToolsHost:
         return cast(MainWindowToolsHost, self)
 
+    def _recordings_root(self) -> Path | None:
+        host = self._host()
+        samples_dir = getattr(host, "_samples_dir", None)
+        if samples_dir is None:
+            return None
+        return Path(samples_dir) / "Recordings"
+
+    def _next_recording_path(self) -> Path | None:
+        root = self._recordings_root()
+        if root is None:
+            return None
+        root.mkdir(parents=True, exist_ok=True)
+
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        candidate = root / f"JingleAllTheDay-Recording-{stamp}.wav"
+        suffix = 1
+        while candidate.exists():
+            candidate = root / f"JingleAllTheDay-Recording-{stamp}-{suffix:02d}.wav"
+            suffix += 1
+        return candidate
+
     def _on_tools_open_playlists(self) -> None:
         host = self._host()
         playlists_window = host._ensure_playlists_window()
@@ -77,6 +100,31 @@ class MainWindowToolsMixin:
         playlists_window.raise_()
         playlists_window.activateWindow()
         host._status.showMessage("Playlists window opened.")
+
+    def _on_tools_record_jingle(self) -> None:
+        host = self._host()
+        default_path = self._next_recording_path()
+        if default_path is None:
+            host._status.showMessage("Choose a samples folder before recording jingles.")
+            return
+
+        waveform_cache_root = getattr(host, "_app_data_dir", None)
+        waveform_cache_dir = Path(waveform_cache_root) / "waveform-cache" if waveform_cache_root else None
+        dialog = JingleRecordDialog(
+            default_output_path=default_path,
+            input_device=host._resolved_recording_input_device(),
+            initial_wav_subtype=host._recording_wav_subtype,
+            waveform_cache_dir=waveform_cache_dir,
+            parent=host,
+        )
+        dialog.exec()
+        host._recording_wav_subtype = dialog.selected_wav_subtype()
+        host._settings.setValue("options/recordingWavSubtype", host._recording_wav_subtype)
+        saved_path = dialog.saved_output_path()
+        if saved_path is not None:
+            host._store.mark_recorded(saved_path, True)
+            host._store.save()
+            host._rescan_library()
 
     def _on_tools_clear_all_categories(self) -> None:
         host = self._host()

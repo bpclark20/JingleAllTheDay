@@ -32,6 +32,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from recording_engine import RecordingConfig, get_recording_engine
 
 _has_qt_multimedia = False
 try:
@@ -123,6 +124,7 @@ class OptionsDialog(QDialog):
         broadcast_output_device: str,
         mixer_enabled: bool,
         microphone_input_device: str,
+        recording_input_device: int | str | None,
         microphone_gain_percent: int,
         live_volume_percent: int,
         preview_volume_percent: int,
@@ -218,6 +220,20 @@ class OptionsDialog(QDialog):
         microphone_row.addWidget(self._microphone_device_combo)
 
         root.addLayout(microphone_row)
+
+        recording_row = QHBoxLayout()
+        recording_label = QLabel("Recording")
+        recording_label.setFixedWidth(100)
+        recording_row.addWidget(recording_label)
+
+        self._recording_device_combo = QComboBox()
+        self._recording_device_combo.setMinimumWidth(340)
+        self._recording_device_combo.setToolTip(
+            "Audio input used by the Tools > Record Jingle window and Sample Pads recording mode."
+        )
+        recording_row.addWidget(self._recording_device_combo)
+
+        root.addLayout(recording_row)
 
         microphone_gain_row = QHBoxLayout()
         microphone_gain_label = QLabel("Mic Gain")
@@ -368,6 +384,7 @@ class OptionsDialog(QDialog):
             preview_output_device,
             broadcast_output_device,
             microphone_input_device,
+            recording_input_device,
         )
         self._live_volume_slider.valueChanged.connect(self._sync_volume_labels)
         self._preview_volume_slider.valueChanged.connect(self._sync_volume_labels)
@@ -384,11 +401,13 @@ class OptionsDialog(QDialog):
         preview_selected: str,
         broadcast_selected: str,
         microphone_selected: str,
+        recording_selected: int | str | None,
     ) -> None:
         self._populate_device_combo(self._live_device_combo, live_selected)
         self._populate_device_combo(self._preview_device_combo, preview_selected)
         self._populate_device_combo(self._broadcast_device_combo, broadcast_selected)
         self._populate_input_device_combo(self._microphone_device_combo, microphone_selected)
+        self._populate_recording_device_combo(self._recording_device_combo, recording_selected)
 
     def _populate_device_combo(self, combo: QComboBox, selected_device: str) -> None:
         combo.blockSignals(True)
@@ -431,15 +450,18 @@ class OptionsDialog(QDialog):
         preview_current = self._preview_device_combo.currentData()
         broadcast_current = self._broadcast_device_combo.currentData()
         microphone_current = self._microphone_device_combo.currentData()
+        recording_current = self._recording_device_combo.currentData()
         live_selected = str(live_current).strip() if live_current is not None else ""
         preview_selected = str(preview_current).strip() if preview_current is not None else ""
         broadcast_selected = str(broadcast_current).strip() if broadcast_current is not None else ""
         microphone_selected = str(microphone_current).strip() if microphone_current is not None else ""
+        recording_selected = recording_current if isinstance(recording_current, int) else None
         self._populate_devices(
             live_selected,
             preview_selected,
             broadcast_selected,
             microphone_selected,
+            recording_selected,
         )
         self._refresh_broadcast_warning()
 
@@ -476,6 +498,70 @@ class OptionsDialog(QDialog):
                 combo.setCurrentIndex(combo.count() - 1)
         else:
             combo.setCurrentIndex(0)
+
+        combo.blockSignals(False)
+
+    def _populate_recording_device_combo(self, combo: QComboBox, selected_device: int | str | None) -> None:
+        combo.blockSignals(True)
+        combo.clear()
+
+        engine = get_recording_engine()
+        available_devices = engine.get_available_devices()
+        names_by_id = {device_id: device_name for device_id, device_name in available_devices}
+        name_counts: dict[str, int] = {}
+        for _device_id, device_name in available_devices:
+            key = device_name.strip().casefold()
+            if not key:
+                continue
+            name_counts[key] = name_counts.get(key, 0) + 1
+
+        default_name = ""
+        try:
+            default_device_id, _sample_rate, _wav_subtype = engine.resolve_recording_settings(
+                RecordingConfig(device_id=None)
+            )
+            if isinstance(default_device_id, int):
+                default_name = names_by_id.get(default_device_id, "").strip()
+        except Exception:
+            default_name = ""
+
+        default_label = "System Default"
+        if default_name:
+            default_label = f"System Default ({format_audio_device_label(default_name)})"
+
+        combo.insertItem(0, default_label, -1)
+
+        seen: set[int] = set()
+        for device_id, device_name in available_devices:
+            if device_id in seen:
+                continue
+            seen.add(device_id)
+            base_label = format_audio_device_label(device_name)
+            if name_counts.get(device_name.strip().casefold(), 0) > 1:
+                display_label = f"{base_label} (Device {device_id})"
+            else:
+                display_label = base_label
+            combo.addItem(display_label, device_id)
+
+        target_value: int | None = None
+        if isinstance(selected_device, int):
+            target_value = selected_device if selected_device >= 0 else None
+        elif isinstance(selected_device, str):
+            try:
+                parsed = int(selected_device)
+            except (TypeError, ValueError):
+                parsed = -1
+            target_value = parsed if parsed >= 0 else None
+
+        if target_value is None:
+            combo.setCurrentIndex(0)
+        else:
+            idx = combo.findData(target_value)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+            else:
+                combo.addItem(f"Device {target_value} (Unavailable)", target_value)
+                combo.setCurrentIndex(combo.count() - 1)
 
         combo.blockSignals(False)
 
@@ -520,6 +606,18 @@ class OptionsDialog(QDialog):
         microphone_value = str(microphone).strip() if microphone is not None else ""
         microphone_gain = max(0, min(200, int(self._microphone_gain_slider.value())))
         return bool(self._mixer_enabled_checkbox.isChecked()), microphone_value, microphone_gain
+
+    def selected_recording_device(self) -> int | str | None:
+        recording = self._recording_device_combo.currentData()
+        if recording is None:
+            return None
+        if isinstance(recording, int):
+            return recording if recording >= 0 else None
+        try:
+            parsed = int(str(recording).strip())
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed >= 0 else None
 
     def selected_volumes(self) -> tuple[int, int]:
         return (
