@@ -131,6 +131,8 @@ class MainWindowMenuMixin:
         self._watch_library_changes_action.toggled.connect(self._on_watch_library_changes_toggled)
         tools_menu.addAction(self._watch_library_changes_action)
 
+        self._build_server_menu()
+
         help_menu = menu_bar.addMenu("Help")
         audio_diagnostics_action = QAction("Audio Diagnostics", self)
         audio_diagnostics_action.triggered.connect(self._on_help_audio_diagnostics)

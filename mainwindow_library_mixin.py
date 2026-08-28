@@ -35,6 +35,69 @@ AUDIO_EXTENSIONS = {
 }
 
 
+def is_record_recent(record: JingleRecord, recent_window_days: int) -> bool:
+    added_epoch = int(getattr(record, "added_at_epoch_seconds", 0) or 0)
+    if added_epoch <= 0:
+        return False
+    window_days = max(1, int(recent_window_days or 14))
+    age_seconds = max(0, int(time.time()) - added_epoch)
+    return age_seconds <= (window_days * 24 * 60 * 60)
+
+
+def filter_jingle_records(
+    records: list[JingleRecord],
+    query: str,
+    search_scope: str,
+    selected_categories: list[str],
+    category_mode: str,
+    recent_window_days: int,
+) -> list[int]:
+    """Pure filter matching `_apply_filters`, reused by the remote API for identical search semantics."""
+    query = query.strip().casefold()
+    visible: list[int] = []
+    for index, record in enumerate(records):
+        is_recent = is_record_recent(record, recent_window_days)
+        if selected_categories:
+            record_keys = {tag.casefold() for tag in record.categories}
+            selected_keys = {tag.casefold() for tag in selected_categories}
+            if is_recent:
+                record_keys.add(RESERVED_INTERNAL_TAG_RECENT.casefold())
+            if category_mode == "all":
+                if not selected_keys.issubset(record_keys):
+                    continue
+            else:
+                if record_keys.isdisjoint(selected_keys):
+                    continue
+
+        if query:
+            if search_scope == "name":
+                haystack = record.name.casefold()
+            elif search_scope == "tag":
+                tags_for_search = list(record.categories)
+                if is_recent:
+                    tags_for_search.append(RESERVED_INTERNAL_TAG_RECENT)
+                haystack = _tags_to_text(tags_for_search).casefold()
+            elif search_scope == "path":
+                haystack = str(record.path).casefold()
+            else:
+                tags_for_search = list(record.categories)
+                if is_recent:
+                    tags_for_search.append(RESERVED_INTERNAL_TAG_RECENT)
+                haystack = " ".join(
+                    [
+                        record.name,
+                        _tags_to_text(tags_for_search),
+                        str(record.path),
+                    ]
+                ).casefold()
+            if query not in haystack:
+                continue
+
+        visible.append(index)
+
+    return visible
+
+
 class MainWindowLibraryMixin:
     def _contract(self) -> MainWindowLibraryHost:
         return cast(MainWindowLibraryHost, self)
@@ -266,58 +329,19 @@ class MainWindowLibraryMixin:
         category_mode = str(mode_data) if mode_data is not None else "any"
         self._refresh_filter_chips(selected_categories)
 
-        visible: list[int] = []
-        for index, record in enumerate(self._records):
-            is_recent = self._is_record_recent(record)
-            if selected_categories:
-                record_keys = {tag.casefold() for tag in record.categories}
-                selected_keys = {tag.casefold() for tag in selected_categories}
-                if is_recent:
-                    record_keys.add(RESERVED_INTERNAL_TAG_RECENT.casefold())
-                if category_mode == "all":
-                    if not selected_keys.issubset(record_keys):
-                        continue
-                else:
-                    if record_keys.isdisjoint(selected_keys):
-                        continue
-
-            if query:
-                if search_scope == "name":
-                    haystack = record.name.casefold()
-                elif search_scope == "tag":
-                    tags_for_search = list(record.categories)
-                    if is_recent:
-                        tags_for_search.append(RESERVED_INTERNAL_TAG_RECENT)
-                    haystack = _tags_to_text(tags_for_search).casefold()
-                elif search_scope == "path":
-                    haystack = str(record.path).casefold()
-                else:
-                    tags_for_search = list(record.categories)
-                    if is_recent:
-                        tags_for_search.append(RESERVED_INTERNAL_TAG_RECENT)
-                    haystack = " ".join(
-                        [
-                            record.name,
-                            _tags_to_text(tags_for_search),
-                            str(record.path),
-                        ]
-                    ).casefold()
-                if query not in haystack:
-                    continue
-
-            visible.append(index)
-
-        self._visible_indices = visible
+        self._visible_indices = filter_jingle_records(
+            self._records,
+            query,
+            search_scope,
+            selected_categories,
+            category_mode,
+            getattr(self, "_recent_window_days", 14),
+        )
         self._rebuild_table()
         self._refresh_status_summary()
 
     def _is_record_recent(self, record: JingleRecord) -> bool:
-        added_epoch = int(getattr(record, "added_at_epoch_seconds", 0) or 0)
-        if added_epoch <= 0:
-            return False
-        window_days = max(1, int(getattr(self, "_recent_window_days", 14) or 14))
-        age_seconds = max(0, int(time.time()) - added_epoch)
-        return age_seconds <= (window_days * 24 * 60 * 60)
+        return is_record_recent(record, getattr(self, "_recent_window_days", 14))
 
     def _refresh_status_summary(self) -> None:
         total_count = len(self._records)

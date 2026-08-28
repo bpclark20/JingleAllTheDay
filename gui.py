@@ -46,13 +46,15 @@ from dialogs import (
     is_virtual_audio_device_name as _is_virtual_audio_device_name,
 )
 from mainwindow_file_edit_mixin import MainWindowFileEditMixin
-from mainwindow_library_mixin import MainWindowLibraryMixin
+from mainwindow_library_mixin import MainWindowLibraryMixin, filter_jingle_records
 from mainwindow_menu_mixin import MainWindowMenuMixin
+from mainwindow_server_mixin import MainWindowServerMixin
 from mainwindow_shortcuts_mixin import MainWindowShortcutsMixin
 from mainwindow_tools_mixin import MainWindowToolsMixin
 from models_store import JingleRecord, LibraryStore
 from recording_engine import RecordingConfig, get_recording_engine
 from waveform_cache import load_waveform_peaks as _load_waveform_peaks
+import remote_server as _remote_server
 
 from widgets import DeselectableTableWidget
 # Import SamplePadsWindow for sample pad feature
@@ -257,6 +259,7 @@ MEDIA_PREVIOUS_KEYS = tuple(
 
 class MainWindow(
     MainWindowMenuMixin,
+    MainWindowServerMixin,
     MainWindowShortcutsMixin,
     MainWindowFileEditMixin,
     MainWindowToolsMixin,
@@ -337,6 +340,17 @@ class MainWindow(
         self._recent_window_days = _coerce_recent_window_days(
             self._settings.value("options/recentWindowDays", 14)
         )
+        self._server_enabled = (
+            str(self._settings.value("server/enabled", "true")).strip().lower() == "true"
+        )
+        try:
+            self._server_port = int(self._settings.value("server/portNumber", 8765))
+        except (TypeError, ValueError):
+            self._server_port = 8765
+        if not (1024 <= self._server_port <= 65535):
+            self._server_port = 8765
+        self._server_pin = str(self._settings.value("server/pin", "")).strip()
+        self._server_admin_pin = str(self._settings.value("server/adminPin", "")).strip()
         self._sample_pads_last_layout_path = str(
             self._settings.value("samplePads/lastLayoutPath", "")
         ).strip()
@@ -616,7 +630,7 @@ class MainWindow(
         self._play_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._play_btn.clicked.connect(self._on_play_clicked)
         playback_row.addWidget(self._play_btn)
-        self._set_play_button_state(False)
+        self._set_play_button_state("stopped")
 
         self._stop_btn = QPushButton("Stop")
         self._stop_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -706,6 +720,8 @@ class MainWindow(
         self._sample_pad_board_switch_requested.connect(self._on_sample_pad_board_switch_requested)
         if self._sample_pad_global_hotkeys_enabled:
             self._set_sample_pad_global_hotkeys(True)
+
+        self._init_remote_server()
 
         # Defer the initial scan so the window can render immediately.
         QTimer.singleShot(0, self._maybe_run_first_time_setup)
@@ -981,6 +997,176 @@ class MainWindow(
             self._status.showMessage("All sample pad playback stopped.")
             return
         self.stop_sample_pad_jingle(-1)
+
+    # ------------------------------------------------------------------
+    # Remote control API (called from remote_server.py's Qt-thread bridge).
+    # These wrap the private main-window click handlers with a stable,
+    # path-addressable surface so remote_server.py never needs to reach
+    # into private `_on_*_clicked` UI handlers directly.
+    # ------------------------------------------------------------------
+
+    def _init_remote_server(self) -> None:
+        self._remote_bridge = _remote_server.RemoteServerBridge(self)
+        self._remote_state = _remote_server.RemoteServerState()
+        self._remote_diagnostics = _remote_server.RemoteDiagnostics()
+        webclient_dir = _HERE / "webclient"
+        self._remote_manager = _remote_server.RemoteServerManager(
+            self._remote_bridge,
+            self._remote_state,
+            self._remote_diagnostics,
+            pin_provider=lambda: self._server_pin,
+            admin_pin_provider=lambda: self._server_admin_pin,
+            library_provider=self.remote_get_library,
+            audio_path_provider=self.remote_resolve_audio_path,
+            static_dir=webclient_dir if webclient_dir.exists() else None,
+        )
+        if self._server_enabled:
+            self._start_remote_server(announce=False)
+
+    def _start_remote_server(self, *, announce: bool = True) -> bool:
+        if not hasattr(self, "_remote_manager"):
+            return False
+        started = self._remote_manager.start(self._server_port)
+        if announce:
+            if started:
+                self._status.showMessage(f"Remote server listening on port {self._server_port}.")
+            else:
+                self._status.showMessage(f"Remote server failed to start: {self._remote_manager.last_error()}")
+        return started
+
+    def _publish_remote_state(self) -> None:
+        if hasattr(self, "_remote_state"):
+            self._remote_state.update(self.remote_get_status())
+
+    def remote_get_status(self) -> dict[str, Any]:
+        if self._using_main_playback_engine() and self._main_playback_engine is not None:
+            if self._main_playback_state == "playing":
+                info = self._main_playback_engine.pad_playback_info(self._main_playback_pad_index)
+                position_ms = self._current_clip_start_ms + int(
+                    round(float(info.get("position_seconds", 0.0)) * 1000.0)
+                )
+            elif self._main_playback_state == "paused":
+                position_ms = self._main_playback_paused_position_ms
+            else:
+                position_ms = 0
+            duration_ms = self._main_playback_duration_ms
+            state_name = self._main_playback_state
+        else:
+            position_ms = self._player.position() if self._player is not None else 0
+            duration_ms = self._player.duration() if self._player is not None else 0
+            if self._player is None:
+                state_name = "stopped"
+            elif self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                state_name = "playing"
+            elif self._player.playbackState() == QMediaPlayer.PlaybackState.PausedState:
+                state_name = "paused"
+            else:
+                state_name = "stopped"
+
+        return {
+            "state": state_name,
+            "is_live_mode": not self._is_preview_mode,
+            "current_name": self._current_playing_name,
+            "current_path": self._current_playing_path,
+            "position_seconds": max(0.0, position_ms / 1000.0),
+            "duration_seconds": max(0.0, duration_ms / 1000.0),
+            "loop_mode": self._playback_mode,
+        }
+
+    def remote_get_library(
+        self,
+        search: str = "",
+        scope: str = "all",
+        category: str = "",
+        category_mode: str = "any",
+        limit: int = 200,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        selected_categories = _normalize_tags(category)
+        indices = filter_jingle_records(
+            self._records,
+            search,
+            scope,
+            selected_categories,
+            category_mode,
+            self._recent_window_days,
+        )
+        total = len(indices)
+        page = indices[offset : offset + limit] if limit > 0 else indices
+        items = []
+        for index in page:
+            record = self._records[index]
+            items.append(
+                {
+                    "path": str(record.path),
+                    "name": record.name,
+                    "folder": record.folder,
+                    "categories": list(record.categories),
+                    "duration_seconds": record.duration_seconds,
+                    "size_bytes": record.size_bytes,
+                }
+            )
+        return {"total": total, "items": items}
+
+    def remote_resolve_audio_path(self, path: str) -> Path | None:
+        """Validate a path against the scanned library before streaming it to a browser."""
+        record_index = self._record_index_for_path(path)
+        if record_index is None:
+            return None
+        record = self._records[record_index]
+        if not record.path.exists():
+            return None
+        return record.path
+
+    def remote_play(self, path: str, loop_mode: str = "off", is_live_mode: bool = True) -> dict[str, Any]:
+        record_index = self._record_index_for_path(path)
+        if record_index is None:
+            return {"ok": False, "error": "not_found"}
+        record = self._records[record_index]
+        if not record.path.exists():
+            return {"ok": False, "error": "missing_file"}
+
+        self._on_stop_clicked()
+        self._clear_playlist_state()
+        self.remote_set_live_mode(is_live_mode)
+        self.remote_set_loop_mode(loop_mode)
+        self._select_record_row(record_index)
+
+        if self._playback_mode == "continuous":
+            started = self._start_continuous_playback()
+        else:
+            self._reset_continuous_queue()
+            started = self._play_record(record_index)
+
+        self._publish_remote_state()
+        if not started:
+            return {"ok": False, "error": "playback_failed"}
+        return {"ok": True, **self.remote_get_status()}
+
+    def remote_toggle_pause(self) -> dict[str, Any]:
+        self._on_play_clicked()
+        self._publish_remote_state()
+        return self.remote_get_status()
+
+    def remote_stop(self) -> None:
+        self._on_stop_clicked()
+        self._publish_remote_state()
+
+    def remote_set_loop_mode(self, loop_mode: str) -> None:
+        normalized = loop_mode if loop_mode in ("off", "loop", "continuous") else "off"
+        if normalized != self._playback_mode:
+            self._playback_mode = normalized
+            self._apply_playback_mode_change()
+        self._publish_remote_state()
+
+    def remote_set_live_mode(self, is_live_mode: bool) -> bool:
+        want_preview = not is_live_mode
+        if want_preview and not self._can_use_preview_mode():
+            self._publish_remote_state()
+            return False
+        self._mode_btn.setChecked(want_preview)
+        self._publish_remote_state()
+        return self._is_preview_mode == want_preview
 
     def set_sample_pad_mix(
         self,
@@ -2322,7 +2508,7 @@ class MainWindow(
                     self._main_playback_engine.stop(self._main_playback_pad_index)
                 self._main_playback_state = "paused"
                 self._main_playback_timer.stop()
-                self._set_play_button_state(False)
+                self._set_play_button_state("paused")
                 self._set_stop_button_breathing(True)
                 self._status.showMessage("Playback paused.")
             return
@@ -2640,6 +2826,8 @@ class MainWindow(
             except Exception:
                 pass
         self._stop_sample_pad_global_hotkeys()
+        if hasattr(self, "_remote_manager"):
+            self._remote_manager.stop()
         self._sp_engine.close()
         self._sp_monitor_engine.close()
         if self._main_playback_engine is not None:
@@ -2800,7 +2988,7 @@ class MainWindow(
 
     def _connect_player_signals(self) -> None:
         if self._using_main_playback_engine():
-            self._set_play_button_state(False)
+            self._set_play_button_state("stopped")
             self._set_stop_button_breathing(False)
             return
         if self._player is None:
@@ -3641,7 +3829,7 @@ class MainWindow(
         self._main_playback_state = "playing"
         self._main_playback_paused_position_ms = start_position_ms
         self._main_playback_timer.start()
-        self._set_play_button_state(True)
+        self._set_play_button_state("playing")
         self._set_stop_button_breathing(True)
         return True
 
@@ -3661,8 +3849,9 @@ class MainWindow(
         self._main_playback_state = "stopped"
         self._main_playback_paused_position_ms = 0
         self._main_playback_timer.stop()
-        self._set_play_button_state(False)
+        self._set_play_button_state("stopped")
         self._set_stop_button_breathing(False)
+        self._publish_remote_state()
         if ended_name:
             self._status.showMessage(f"Playback finished: {ended_name}")
         else:
@@ -3690,6 +3879,7 @@ class MainWindow(
         if not self._slider_pressed:
             self._position_slider.setValue(max(0, position_ms))
         self._update_time_label(position_ms, duration_ms)
+        self._publish_remote_state()
 
     def _seek_main_engine_to(self, position_ms: int) -> None:
         if self._main_playback_engine is None:
@@ -3864,6 +4054,12 @@ class MainWindow(
         return False
 
     def _on_play_clicked(self) -> None:
+        try:
+            self._on_play_clicked_impl()
+        finally:
+            self._publish_remote_state()
+
+    def _on_play_clicked_impl(self) -> None:
         if self._using_main_playback_engine():
             if self._main_playback_state == "playing":
                 if self._main_playback_engine is not None:
@@ -3873,7 +4069,7 @@ class MainWindow(
                     self._main_playback_engine.stop(self._main_playback_pad_index)
                 self._main_playback_state = "paused"
                 self._main_playback_timer.stop()
-                self._set_play_button_state(False)
+                self._set_play_button_state("paused")
                 self._set_stop_button_breathing(True)
                 self._status.showMessage("Playback paused.")
                 return
@@ -3951,6 +4147,12 @@ class MainWindow(
         self._play_record(selected_record_index)
 
     def _on_stop_clicked(self) -> None:
+        try:
+            self._on_stop_clicked_impl()
+        finally:
+            self._publish_remote_state()
+
+    def _on_stop_clicked_impl(self) -> None:
         if self._using_main_playback_engine():
             if self._main_playback_state in ("playing", "paused"):
                 if self._main_playback_engine is not None:
@@ -3960,7 +4162,7 @@ class MainWindow(
                 self._main_playback_paused_position_ms = 0
                 self._position_slider.setValue(0)
                 self._update_time_label(0, self._main_playback_duration_ms)
-                self._set_play_button_state(False)
+                self._set_play_button_state("stopped")
                 self._set_stop_button_breathing(False)
                 self._reset_continuous_queue()
                 self._reset_clip_playback_window()
@@ -4071,8 +4273,13 @@ class MainWindow(
     def _on_playback_state_changed(self, _state: Any) -> None:
         if self._player is None:
             return
-        is_playing = self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
-        self._set_play_button_state(is_playing)
+        playback_state = self._player.playbackState()
+        if playback_state == QMediaPlayer.PlaybackState.PlayingState:
+            self._set_play_button_state("playing")
+        elif playback_state == QMediaPlayer.PlaybackState.PausedState:
+            self._set_play_button_state("paused")
+        else:
+            self._set_play_button_state("stopped")
         # Only reset slider when stopped, not when paused
         is_stopped = self._player.playbackState() == QMediaPlayer.PlaybackState.StoppedState
         if is_stopped:
@@ -4259,6 +4466,10 @@ class MainWindow(
             self._playback_mode = "continuous"
         else:
             self._playback_mode = "off"
+        self._apply_playback_mode_change()
+
+    def _apply_playback_mode_change(self) -> None:
+        """Shared tail for any `_playback_mode` change (Loop button click or remote set)."""
         self._refresh_playback_mode_button()
         self._apply_player_loop_mode()
 
@@ -4348,14 +4559,21 @@ class MainWindow(
 
         self._loop_breath_anim.start()
 
-    def _set_play_button_state(self, is_playing: bool) -> None:
-        if is_playing:
+    def _set_play_button_state(self, state: str) -> None:
+        if state == "playing":
             self._play_btn.setText("Pause")
             self._play_btn.setStyleSheet(
                 "QPushButton { background-color: #f57c00; color: white; font-weight: bold; }"
                 "QPushButton:hover { background-color: #e65100; }"
             )
             self._set_play_stop_breathing(self._play_btn.isEnabled())
+        elif state == "paused":
+            self._play_btn.setText("Resume")
+            self._play_btn.setStyleSheet(
+                "QPushButton { background-color: #1565c0; color: white; font-weight: bold; }"
+                "QPushButton:hover { background-color: #0d47a1; }"
+            )
+            self._set_play_stop_breathing(False)
         else:
             self._play_btn.setText("Play Selected")
             self._play_btn.setStyleSheet(
@@ -4481,6 +4699,10 @@ class MainWindow(
             self._sample_pad_blocksize,
             self._sample_pad_streaming_min_seconds,
             self._samples_dir,
+            self._server_enabled,
+            self._server_port,
+            self._server_pin,
+            self._server_admin_pin,
             self,
         )
         if dialog.exec() != int(QDialog.DialogCode.Accepted):
@@ -4522,6 +4744,28 @@ class MainWindow(
             "options/samplePadStreamingMinSeconds",
             self._sample_pad_streaming_min_seconds,
         )
+
+        new_server_enabled = dialog.selected_server_enabled()
+        new_server_port = dialog.selected_server_port()
+        new_server_pin = dialog.selected_server_pin()
+        new_server_admin_pin = dialog.selected_server_admin_pin()
+        server_port_changed = new_server_port != self._server_port
+        self._server_enabled = new_server_enabled
+        self._server_port = new_server_port
+        self._server_pin = new_server_pin
+        self._server_admin_pin = new_server_admin_pin
+        self._settings.setValue("server/enabled", "true" if self._server_enabled else "false")
+        self._settings.setValue("server/portNumber", self._server_port)
+        self._settings.setValue("server/pin", self._server_pin)
+        self._settings.setValue("server/adminPin", self._server_admin_pin)
+        if hasattr(self, "_remote_manager"):
+            if self._remote_manager.is_running() and server_port_changed:
+                self._remote_manager.restart(self._server_port)
+            elif self._server_enabled and not self._remote_manager.is_running():
+                self._start_remote_server(announce=False)
+            elif not self._server_enabled and self._remote_manager.is_running():
+                self._remote_manager.stop()
+
         if selected_recent_window_days != self._recent_window_days:
             self._recent_window_days = selected_recent_window_days
             self._refresh_recent_runtime_from_store()
@@ -4865,6 +5109,12 @@ class MainWindow(
         self._mode_live_breath_anim.start()
 
     def _on_mode_toggled(self, checked: bool) -> None:
+        try:
+            self._on_mode_toggled_impl(checked)
+        finally:
+            self._publish_remote_state()
+
+    def _on_mode_toggled_impl(self, checked: bool) -> None:
         if checked and not self._can_use_preview_mode():
             self._mode_btn.blockSignals(True)
             self._mode_btn.setChecked(False)

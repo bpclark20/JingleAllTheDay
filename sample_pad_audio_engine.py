@@ -201,7 +201,10 @@ class SamplePadAudioEngine:
         self._input_buffer_frames: int = 0
         self._input_buffer_max_frames: int = 0
 
-        # PCM cache: keyed by (str(path), clip_start_seconds, clip_stop_seconds)
+        # PCM cache: keyed by (str(path), samplerate, channels) only - decoded
+        # PCM is always the full file regardless of clip window, so caching per
+        # clip window would force a pointless full re-decode on every pause/
+        # resume or seek (each of which uses a different clip_start_seconds).
         # Stores already-decoded, resampled, channel-matched float32 numpy arrays
         # so that trigger() never touches the disk on the hot path.
         # Access from any thread is protected by _cache_lock (separate from _lock
@@ -217,7 +220,7 @@ class SamplePadAudioEngine:
         self._pad_mix_settings: dict[int, tuple[float, float, bool, bool]] = {}
         self._pad_meter_levels: dict[int, float] = {}
         self._output_meter_levels: tuple[float, float] = (0.0, 0.0)
-        self._pending_pad_triggers: dict[int, tuple[tuple, float, bool]] = {}
+        self._pending_pad_triggers: dict[int, tuple[tuple, float, float, float, bool]] = {}
         self._streaming_min_seconds: float = _STREAMING_MIN_SECONDS
         self._master_gain: float = 1.0
         self._mixer_enabled: bool = False
@@ -410,26 +413,26 @@ class SamplePadAudioEngine:
             return
         sr = samplerate or self._stream_samplerate or 44100
         ch = channels or self._stream_channels or 2
-        cache_key = (str(path), clip_start_seconds, clip_stop_seconds, sr, ch)
+        decode_key = (str(path), sr, ch)
 
         if self._should_skip_preload(path, clip_start_seconds, clip_stop_seconds):
             return
 
         with self._cache_lock:
-            if cache_key in self._cache:
+            if decode_key in self._cache:
                 return  # already cached
-            if cache_key in self._cache_inflight:
+            if decode_key in self._cache_inflight:
                 return
-            self._cache_inflight.add(cache_key)
+            self._cache_inflight.add(decode_key)
         try:
             pcm = self._load_pcm(path, sr, ch)
         except Exception:
             with self._cache_lock:
-                self._cache_inflight.discard(cache_key)
+                self._cache_inflight.discard(decode_key)
             return
         with self._cache_lock:
-            self._cache[cache_key] = pcm
-            self._cache_inflight.discard(cache_key)
+            self._cache[decode_key] = pcm
+            self._cache_inflight.discard(decode_key)
 
     def clear_cache(self) -> None:
         """Evict all preloaded PCM data."""
@@ -451,11 +454,11 @@ class SamplePadAudioEngine:
 
         stream_sr = self._stream_samplerate
         target_ch = self._stream_channels
-        cache_key = (str(path), clip_start_seconds, clip_stop_seconds, stream_sr, target_ch)
+        decode_key = (str(path), stream_sr, target_ch)
 
         # Fast path: use preloaded PCM if available
         with self._cache_lock:
-            pcm = self._cache.get(cache_key)
+            pcm = self._cache.get(decode_key)
 
         if pcm is None:
             if self._try_start_streaming_voice(
@@ -474,21 +477,27 @@ class SamplePadAudioEngine:
             # When preload finishes, that pending trigger is started automatically.
             if pad_index >= 0:
                 with self._lock:
-                    self._pending_pad_triggers[pad_index] = (cache_key, float(volume), bool(loop))
+                    self._pending_pad_triggers[pad_index] = (
+                        decode_key,
+                        float(clip_start_seconds),
+                        float(clip_stop_seconds),
+                        float(volume),
+                        bool(loop),
+                    )
 
             should_start_worker = False
             with self._cache_lock:
-                if cache_key in self._cache:
-                    pcm = self._cache.get(cache_key)
-                elif cache_key not in self._cache_inflight:
-                    self._cache_inflight.add(cache_key)
+                if decode_key in self._cache:
+                    pcm = self._cache.get(decode_key)
+                elif decode_key not in self._cache_inflight:
+                    self._cache_inflight.add(decode_key)
                     should_start_worker = True
 
             if pcm is None:
                 if should_start_worker:
                     worker = threading.Thread(
                         target=self._preload_and_fulfill_pending,
-                        args=(path, cache_key),
+                        args=(path, decode_key),
                         daemon=True,
                     )
                     worker.start()
@@ -551,8 +560,14 @@ class SamplePadAudioEngine:
         with self._lock:
             pending = self._pending_pad_triggers.get(pad_index)
             if pending is not None:
-                pending_key, pending_volume, _pending_loop = pending
-                self._pending_pad_triggers[pad_index] = (pending_key, pending_volume, loop_value)
+                pending_key, clip_start_seconds, clip_stop_seconds, pending_volume, _pending_loop = pending
+                self._pending_pad_triggers[pad_index] = (
+                    pending_key,
+                    clip_start_seconds,
+                    clip_stop_seconds,
+                    pending_volume,
+                    loop_value,
+                )
 
             voice_id = self._pad_to_voice.get(pad_index)
             if voice_id is None:
@@ -1239,29 +1254,31 @@ class SamplePadAudioEngine:
         worker.start()
         return True
 
-    def _preload_and_fulfill_pending(self, path: str | Path, cache_key: tuple) -> None:
-        _, clip_start_seconds, clip_stop_seconds, samplerate, channels = cache_key
+    def _preload_and_fulfill_pending(self, path: str | Path, decode_key: tuple) -> None:
+        _, samplerate, channels = decode_key
         try:
             pcm = self._load_pcm(path, int(samplerate), int(channels))
         except Exception:
             with self._cache_lock:
-                self._cache_inflight.discard(cache_key)
+                self._cache_inflight.discard(decode_key)
             return
 
         with self._cache_lock:
-            self._cache[cache_key] = pcm
-            self._cache_inflight.discard(cache_key)
+            self._cache[decode_key] = pcm
+            self._cache_inflight.discard(decode_key)
 
-        # Collect pads still waiting for this exact cache key.
-        pending: list[tuple[int, float, bool]] = []
+        # Collect pads still waiting for this exact decode key, each with its own clip window.
+        pending: list[tuple[int, float, float, float, bool]] = []
         with self._lock:
-            for pad_index, (pending_key, pending_volume, pending_loop) in list(self._pending_pad_triggers.items()):
-                if pending_key == cache_key:
-                    pending.append((pad_index, pending_volume, pending_loop))
+            for pad_index, (pending_key, clip_start_seconds, clip_stop_seconds, pending_volume, pending_loop) in list(
+                self._pending_pad_triggers.items()
+            ):
+                if pending_key == decode_key:
+                    pending.append((pad_index, clip_start_seconds, clip_stop_seconds, pending_volume, pending_loop))
                     self._pending_pad_triggers.pop(pad_index, None)
 
         # Start each pending trigger only if stream format still matches.
-        for pad_index, pending_volume, pending_loop in pending:
+        for pad_index, clip_start_seconds, clip_stop_seconds, pending_volume, pending_loop in pending:
             if self._stream is None:
                 continue
             if self._stream_samplerate != int(samplerate) or self._stream_channels != int(channels):
@@ -1269,8 +1286,8 @@ class SamplePadAudioEngine:
             self._start_voice(
                 pcm,
                 int(samplerate),
-                float(clip_start_seconds),
-                float(clip_stop_seconds),
+                clip_start_seconds,
+                clip_stop_seconds,
                 pending_loop,
                 pending_volume,
                 pad_index,

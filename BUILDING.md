@@ -20,6 +20,15 @@ Default result:
 - App bundle output: `%LOCALAPPDATA%\JingleAllTheDay\pyinstaller\dist`
 - Installer output folder: `./installer`
 
+## Remote Control Server Note
+
+The app bundles a LAN remote-control server (FastAPI/Uvicorn) that auto-starts on a
+non-standard port (Options > Server Port, default `8765`). On first run of a packaged
+build, Windows Defender Firewall may prompt to allow the app to accept inbound
+connections on the private network — allow it if remote control from a phone/browser
+on the LAN is desired, or leave the "Enable remote server" option in Options unchecked
+to disable auto-start entirely.
+
 ## Script 1: build_exe.ps1
 
 Purpose:

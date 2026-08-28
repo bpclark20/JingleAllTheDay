@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -20,6 +21,7 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QGridLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -29,9 +31,12 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QSlider,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
+from PyQt6.QtCore import QTimer
 from recording_engine import RecordingConfig, get_recording_engine
 
 _has_qt_multimedia = False
@@ -132,6 +137,10 @@ class OptionsDialog(QDialog):
         sample_pad_blocksize: int,
         sample_pad_streaming_min_seconds: int,
         samples_dir: Path | None = None,
+        server_enabled: bool = True,
+        server_port: int = 8765,
+        server_pin: str = "",
+        server_admin_pin: str = "",
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -353,6 +362,55 @@ class OptionsDialog(QDialog):
         sample_pad_streaming_row.addStretch()
 
         root.addLayout(sample_pad_streaming_row)
+
+        server_enabled_row = QHBoxLayout()
+        server_enabled_label = QLabel("Remote Server")
+        server_enabled_label.setFixedWidth(100)
+        server_enabled_row.addWidget(server_enabled_label)
+        self._server_enabled_checkbox = QCheckBox("Auto-start on launch")
+        self._server_enabled_checkbox.setChecked(bool(server_enabled))
+        self._server_enabled_checkbox.setToolTip(
+            "When enabled, the LAN remote-control server starts automatically when the app opens. "
+            "It can always be started/stopped manually from the Server menu."
+        )
+        server_enabled_row.addWidget(self._server_enabled_checkbox)
+        server_enabled_row.addStretch()
+        root.addLayout(server_enabled_row)
+
+        server_port_row = QHBoxLayout()
+        server_port_label = QLabel("Server Port")
+        server_port_label.setFixedWidth(100)
+        server_port_row.addWidget(server_port_label)
+        self._server_port_spin = QSpinBox()
+        self._server_port_spin.setRange(1024, 65535)
+        self._server_port_spin.setValue(max(1024, min(65535, int(server_port))))
+        self._server_port_spin.setToolTip("Non-standard TCP port the remote-control server listens on.")
+        self._server_port_spin.setMinimumWidth(160)
+        server_port_row.addWidget(self._server_port_spin)
+        server_port_row.addStretch()
+        root.addLayout(server_port_row)
+
+        server_pin_row = QHBoxLayout()
+        server_pin_label = QLabel("Guest PIN")
+        server_pin_label.setFixedWidth(100)
+        server_pin_row.addWidget(server_pin_label)
+        self._server_pin_edit = QLineEdit(str(server_pin or ""))
+        self._server_pin_edit.setPlaceholderText("Lets guests browse/preview in their own browser only")
+        self._server_pin_edit.setMinimumWidth(160)
+        server_pin_row.addWidget(self._server_pin_edit)
+        server_pin_row.addStretch()
+        root.addLayout(server_pin_row)
+
+        server_admin_pin_row = QHBoxLayout()
+        server_admin_pin_label = QLabel("Admin PIN")
+        server_admin_pin_label.setFixedWidth(100)
+        server_admin_pin_row.addWidget(server_admin_pin_label)
+        self._server_admin_pin_edit = QLineEdit(str(server_admin_pin or ""))
+        self._server_admin_pin_edit.setPlaceholderText("Required to control the real Live/Preview output remotely")
+        self._server_admin_pin_edit.setMinimumWidth(160)
+        server_admin_pin_row.addWidget(self._server_admin_pin_edit)
+        server_admin_pin_row.addStretch()
+        root.addLayout(server_admin_pin_row)
 
         refresh_btn = QPushButton("Refresh Devices")
         refresh_btn.clicked.connect(self._on_refresh_clicked)
@@ -631,6 +689,19 @@ class OptionsDialog(QDialog):
 
     def selected_recent_window_days(self) -> int:
         return _coerce_recent_window_days(self._recent_window_days_spin.value())
+
+    def selected_server_enabled(self) -> bool:
+        return bool(self._server_enabled_checkbox.isChecked())
+
+    def selected_server_port(self) -> int:
+        return max(1024, min(65535, int(self._server_port_spin.value())))
+
+    def selected_server_pin(self) -> str:
+        return self._server_pin_edit.text().strip()
+
+    def selected_server_admin_pin(self) -> str:
+        return self._server_admin_pin_edit.text().strip()
+
 
     def selected_sample_pad_streaming_min_seconds(self) -> int:
         return _coerce_sample_pad_streaming_min_seconds(
@@ -1078,6 +1149,84 @@ class RevisionHistoryDialog(QDialog):
         buttons.rejected.connect(self.reject)
         buttons.accepted.connect(self.accept)
         root.addWidget(buttons)
+
+
+class RemoteDiagnosticsDialog(QDialog):
+    def __init__(
+        self,
+        snapshot_provider: Callable[[], dict[str, Any]],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Remote Server Diagnostics")
+        self.resize(720, 520)
+        self._snapshot_provider = snapshot_provider
+
+        root = QVBoxLayout(self)
+
+        self._status_label = QLabel(self)
+        self._status_label.setWordWrap(True)
+        root.addWidget(self._status_label)
+
+        root.addWidget(QLabel("Connected Clients", self))
+        self._clients_table = QTableWidget(0, 2, self)
+        self._clients_table.setHorizontalHeaderLabels(["IP Address", "Connected Since"])
+        self._clients_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self._clients_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        root.addWidget(self._clients_table, 1)
+
+        root.addWidget(QLabel("Recent Requests", self))
+        self._log_table = QTableWidget(0, 5, self)
+        self._log_table.setHorizontalHeaderLabels(["Time", "IP Address", "Action", "Target", "Result"])
+        self._log_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self._log_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        root.addWidget(self._log_table, 2)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.close)
+        buttons.accepted.connect(self.close)
+        root.addWidget(buttons)
+
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setInterval(1000)
+        self._refresh_timer.timeout.connect(self.refresh)
+        self._refresh_timer.start()
+        self.refresh()
+
+    def refresh(self) -> None:
+        snapshot = self._snapshot_provider()
+        running = bool(snapshot.get("running", False))
+        port = snapshot.get("port", 0)
+        last_error = str(snapshot.get("last_error", ""))
+        if running:
+            self._status_label.setText(f"Server running on port {port}.")
+        elif last_error:
+            self._status_label.setText(f"Server stopped. Last error: {last_error}")
+        else:
+            self._status_label.setText("Server stopped.")
+
+        clients = snapshot.get("clients", [])
+        self._clients_table.setRowCount(len(clients))
+        for row, (_client_id, info) in enumerate(clients):
+            connected_at = float(info.get("connected_at", 0.0))
+            timestamp = time.strftime("%H:%M:%S", time.localtime(connected_at)) if connected_at else ""
+            self._clients_table.setItem(row, 0, QTableWidgetItem(str(info.get("ip", ""))))
+            self._clients_table.setItem(row, 1, QTableWidgetItem(timestamp))
+
+        log_entries = snapshot.get("log", [])
+        self._log_table.setRowCount(len(log_entries))
+        for row, entry in enumerate(log_entries):
+            timestamp = time.strftime("%H:%M:%S", time.localtime(float(entry.get("time", 0.0))))
+            result_text = "OK" if entry.get("ok") else f"Denied: {entry.get('detail', '')}"
+            self._log_table.setItem(row, 0, QTableWidgetItem(timestamp))
+            self._log_table.setItem(row, 1, QTableWidgetItem(str(entry.get("ip", ""))))
+            self._log_table.setItem(row, 2, QTableWidgetItem(str(entry.get("action", ""))))
+            self._log_table.setItem(row, 3, QTableWidgetItem(str(entry.get("target", ""))))
+            self._log_table.setItem(row, 4, QTableWidgetItem(result_text))
+
+    def closeEvent(self, event) -> None:  # noqa: ANN001 - Qt override signature
+        self._refresh_timer.stop()
+        super().closeEvent(event)
 
 
 if __name__ == "__main__":
