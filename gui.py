@@ -343,14 +343,28 @@ class MainWindow(
         self._server_enabled = (
             str(self._settings.value("server/enabled", "true")).strip().lower() == "true"
         )
+        self._server_address = str(self._settings.value("server/address", "")).strip()
+        self._server_device_token = str(self._settings.value("server/deviceToken", "")).strip()
         try:
-            self._server_port = int(self._settings.value("server/portNumber", 8765))
+            self._cache_backup_reminder_days = int(
+                self._settings.value("server/cacheBackupReminderDays", 7)
+            )
         except (TypeError, ValueError):
-            self._server_port = 8765
-        if not (1024 <= self._server_port <= 65535):
-            self._server_port = 8765
-        self._server_pin = str(self._settings.value("server/pin", "")).strip()
-        self._server_admin_pin = str(self._settings.value("server/adminPin", "")).strip()
+            self._cache_backup_reminder_days = 7
+        if self._cache_backup_reminder_days < 1:
+            self._cache_backup_reminder_days = 7
+        try:
+            self._cache_backup_last_epoch = float(
+                self._settings.value("server/lastCacheBackupEpoch", 0.0)
+            )
+        except (TypeError, ValueError):
+            self._cache_backup_last_epoch = 0.0
+        try:
+            self._cache_backup_snooze_until_epoch = float(
+                self._settings.value("server/cacheBackupSnoozeUntilEpoch", 0.0)
+            )
+        except (TypeError, ValueError):
+            self._cache_backup_snooze_until_epoch = 0.0
         self._sample_pads_last_layout_path = str(
             self._settings.value("samplePads/lastLayoutPath", "")
         ).strip()
@@ -1008,35 +1022,164 @@ class MainWindow(
     def _init_remote_server(self) -> None:
         self._remote_bridge = _remote_server.RemoteServerBridge(self)
         self._remote_state = _remote_server.RemoteServerState()
-        self._remote_diagnostics = _remote_server.RemoteDiagnostics()
-        webclient_dir = _HERE / "webclient"
-        self._remote_manager = _remote_server.RemoteServerManager(
+        self._remote_diagnostics = _remote_server.RemoteRelayDiagnostics()
+        self._remote_manager = _remote_server.RemoteRelayClient(
             self._remote_bridge,
             self._remote_state,
             self._remote_diagnostics,
-            pin_provider=lambda: self._server_pin,
-            admin_pin_provider=lambda: self._server_admin_pin,
+            address_provider=lambda: self._server_address,
+            device_token_provider=lambda: self._server_device_token,
             library_provider=self.remote_get_library,
             audio_path_provider=self.remote_resolve_audio_path,
-            static_dir=webclient_dir if webclient_dir.exists() else None,
         )
-        if self._server_enabled:
+        if self._server_enabled and self._server_address and self._server_device_token:
             self._start_remote_server(announce=False)
+        self._cache_backup_reminder_timer = QTimer(self)
+        self._cache_backup_reminder_timer.timeout.connect(self._maybe_show_cache_backup_reminder)
+        self._cache_backup_reminder_timer.start(60 * 60 * 1000)
+        QTimer.singleShot(5000, self._maybe_show_cache_backup_reminder)
 
     def _start_remote_server(self, *, announce: bool = True) -> bool:
         if not hasattr(self, "_remote_manager"):
             return False
-        started = self._remote_manager.start(self._server_port)
+        if not self._server_address or not self._server_device_token:
+            if announce:
+                self._status.showMessage("Set a Server Address and Device Token in Options to connect.")
+            return False
+        started = self._remote_manager.start()
         if announce:
             if started:
-                self._status.showMessage(f"Remote server listening on port {self._server_port}.")
+                self._status.showMessage(f"Connecting to remote-control server at {self._server_address}...")
             else:
-                self._status.showMessage(f"Remote server failed to start: {self._remote_manager.last_error()}")
+                self._status.showMessage("Remote relay failed to start (see Server > Diagnostics).")
         return started
 
     def _publish_remote_state(self) -> None:
         if hasattr(self, "_remote_state"):
             self._remote_state.update(self.remote_get_status())
+
+    def _maybe_show_cache_backup_reminder(self) -> None:
+        if not hasattr(self, "_remote_manager") or not self._remote_manager.is_connected():
+            return
+        now = time.time()
+        if now < self._cache_backup_snooze_until_epoch:
+            return
+        reminder_seconds = self._cache_backup_reminder_days * 86400
+        if now - self._cache_backup_last_epoch < reminder_seconds:
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("Offline Cache Backup Reminder")
+        box.setText(
+            "The remote-control server's offline jingle cache may be out of date.\n"
+            "Back it up now so guests can still browse the library while the jingle machine is offline?"
+        )
+        backup_btn = box.addButton("Backup Now", QMessageBox.ButtonRole.AcceptRole)
+        remind_btn = box.addButton("Remind me in 24 hours", QMessageBox.ButtonRole.RejectRole)
+        ignore_btn = box.addButton(
+            f"Ignore for {self._cache_backup_reminder_days} days", QMessageBox.ButtonRole.DestructiveRole
+        )
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is backup_btn:
+            self._on_file_offline_cache_backup()
+        elif clicked is remind_btn:
+            self._cache_backup_snooze_until_epoch = now + 86400
+            self._settings.setValue("server/cacheBackupSnoozeUntilEpoch", self._cache_backup_snooze_until_epoch)
+        elif clicked is ignore_btn:
+            self._cache_backup_snooze_until_epoch = now + reminder_seconds
+            self._settings.setValue("server/cacheBackupSnoozeUntilEpoch", self._cache_backup_snooze_until_epoch)
+
+    def _update_offline_cache_backup_action_enabled(self) -> None:
+        if hasattr(self, "_offline_cache_backup_action"):
+            connected = hasattr(self, "_remote_manager") and self._remote_manager.is_connected()
+            running = getattr(self, "_cache_backup_thread", None) is not None
+            self._offline_cache_backup_action.setEnabled(connected and not running)
+
+    def _on_file_offline_cache_backup(self) -> None:
+        if not hasattr(self, "_remote_manager") or not self._remote_manager.is_connected():
+            QMessageBox.information(
+                self, "Offline Cache Backup", "Connect to a remote-control server first (Server menu)."
+            )
+            return
+        if getattr(self, "_cache_backup_thread", None) is not None:
+            self._status.showMessage("Offline cache backup is already running.")
+            return
+        self._status.showMessage("Offline cache backup started...")
+        self._update_offline_cache_backup_action_enabled()
+
+        def _worker() -> None:
+            try:
+                count = self._perform_offline_cache_backup()
+            except Exception as exc:  # noqa: BLE001 - surface any failure to the user
+                QTimer.singleShot(0, lambda exc=exc: self._on_cache_backup_finished(None, exc))
+                return
+            QTimer.singleShot(0, lambda count=count: self._on_cache_backup_finished(count, None))
+
+        self._cache_backup_thread = threading.Thread(target=_worker, name="jatd-cache-backup", daemon=True)
+        self._cache_backup_thread.start()
+
+    def _on_cache_backup_finished(self, count: int | None, exc: Exception | None) -> None:
+        self._cache_backup_thread = None
+        self._update_offline_cache_backup_action_enabled()
+        if exc is not None:
+            QMessageBox.warning(self, "Offline Cache Backup Failed", str(exc))
+            return
+        now = time.time()
+        self._cache_backup_last_epoch = now
+        self._settings.setValue("server/lastCacheBackupEpoch", now)
+        self._status.showMessage(f"Offline cache backup complete: {count} jingle(s) uploaded.")
+
+    def _perform_offline_cache_backup(self) -> int:
+        import re
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+
+        def _raise_with_detail(exc: "urllib.error.HTTPError", context: str) -> None:
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                detail = ""
+            raise RuntimeError(f"{context} (HTTP {exc.code}): {detail or exc.reason}") from exc
+
+        base_url = _remote_server.relay_http_base_url(self._server_address)
+        headers = {"X-Device-Token": self._server_device_token}
+        manifest_items: list[dict[str, Any]] = []
+        uploaded = 0
+        for index, record in enumerate(self._records):
+            if not record.path.exists():
+                continue
+            safe_name = re.sub(r"[^A-Za-z0-9_.\-]", "_", record.path.name)
+            relpath = f"{index:05d}_{safe_name}"
+            data = record.path.read_bytes()
+            url = f"{base_url}/agent/cache/file?relpath={urllib.parse.quote(relpath)}"
+            request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(request, timeout=30):
+                    pass
+            except urllib.error.HTTPError as exc:
+                _raise_with_detail(exc, f"Upload failed for '{record.name}'")
+            manifest_items.append(
+                {
+                    "name": record.name,
+                    "categories": list(record.categories),
+                    "duration_seconds": record.duration_seconds,
+                    "cached_audio_relpath": relpath,
+                }
+            )
+            uploaded += 1
+        manifest_request = urllib.request.Request(
+            f"{base_url}/agent/cache/manifest",
+            data=json.dumps({"items": manifest_items}).encode("utf-8"),
+            headers={**headers, "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(manifest_request, timeout=30):
+                pass
+        except urllib.error.HTTPError as exc:
+            _raise_with_detail(exc, "Manifest upload failed")
+        return uploaded
 
     def remote_get_status(self) -> dict[str, Any]:
         if self._using_main_playback_engine() and self._main_playback_engine is not None:
@@ -4700,9 +4843,9 @@ class MainWindow(
             self._sample_pad_streaming_min_seconds,
             self._samples_dir,
             self._server_enabled,
-            self._server_port,
-            self._server_pin,
-            self._server_admin_pin,
+            self._server_address,
+            self._server_device_token,
+            self._cache_backup_reminder_days,
             self,
         )
         if dialog.exec() != int(QDialog.DialogCode.Accepted):
@@ -4746,21 +4889,23 @@ class MainWindow(
         )
 
         new_server_enabled = dialog.selected_server_enabled()
-        new_server_port = dialog.selected_server_port()
-        new_server_pin = dialog.selected_server_pin()
-        new_server_admin_pin = dialog.selected_server_admin_pin()
-        server_port_changed = new_server_port != self._server_port
+        new_server_address = dialog.selected_server_address()
+        new_server_device_token = dialog.selected_server_device_token()
+        new_cache_backup_reminder_days = dialog.selected_cache_backup_reminder_days()
+        connection_settings_changed = (
+            new_server_address != self._server_address or new_server_device_token != self._server_device_token
+        )
         self._server_enabled = new_server_enabled
-        self._server_port = new_server_port
-        self._server_pin = new_server_pin
-        self._server_admin_pin = new_server_admin_pin
+        self._server_address = new_server_address
+        self._server_device_token = new_server_device_token
+        self._cache_backup_reminder_days = new_cache_backup_reminder_days
         self._settings.setValue("server/enabled", "true" if self._server_enabled else "false")
-        self._settings.setValue("server/portNumber", self._server_port)
-        self._settings.setValue("server/pin", self._server_pin)
-        self._settings.setValue("server/adminPin", self._server_admin_pin)
+        self._settings.setValue("server/address", self._server_address)
+        self._settings.setValue("server/deviceToken", self._server_device_token)
+        self._settings.setValue("server/cacheBackupReminderDays", self._cache_backup_reminder_days)
         if hasattr(self, "_remote_manager"):
-            if self._remote_manager.is_running() and server_port_changed:
-                self._remote_manager.restart(self._server_port)
+            if self._remote_manager.is_running() and connection_settings_changed:
+                self._remote_manager.restart()
             elif self._server_enabled and not self._remote_manager.is_running():
                 self._start_remote_server(announce=False)
             elif not self._server_enabled and self._remote_manager.is_running():

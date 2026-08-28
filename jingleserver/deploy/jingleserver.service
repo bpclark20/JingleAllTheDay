@@ -1,0 +1,23 @@
+[Unit]
+Description=JingleAllTheDay remote-control middleman (jingleserver)
+After=network.target
+
+[Service]
+Type=simple
+User=jingleserver
+Group=jingleserver
+WorkingDirectory=/opt/jingleserver
+Environment=JINGLESERVER_DATA_DIR=/var/lib/jingleserver
+Environment=JINGLESERVER_HOST=127.0.0.1
+Environment=JINGLESERVER_PORT=47030
+Environment=JINGLESERVER_WEBCLIENT_DIR=/opt/jingleserver/webclient
+ExecStart=/opt/jingleserver/.venv/bin/uvicorn jsrv.web:app --host ${JINGLESERVER_HOST} --port ${JINGLESERVER_PORT}
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/jingleserver
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

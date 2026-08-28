@@ -1,42 +1,41 @@
-"""LAN remote-control server for JingleAllTheDay.
+"""Outbound relay client for JingleAllTheDay remote control.
 
-Runs a FastAPI/Uvicorn server in a background thread so a phone or any other
-device on the same LAN can browse the library and mirror/drive the main
-window's playback (search, play/pause/stop, loop mode, Live/Preview).
+The desktop app no longer hosts an inbound server. Instead it dials OUT to a
+jingleserver middleman (see the `jingleserver/` folder) over a persistent
+WebSocket at `/agent/connect`, authenticating with a device token issued by
+`jingleserver adddevice`. jingleserver relays browser commands to us over
+that connection, and we push status snapshots back down it. See
+`REMOTE_API.md` for the wire protocol.
 
 Thread-safety model
 --------------------
-Uvicorn owns its own asyncio event loop on a background thread. Control
-endpoints are declared as plain ``def`` (Starlette runs them in a worker
-threadpool), and they reach into Qt via `RemoteServerBridge`, a `QObject`
-that lives on the Qt main thread. Emitting its signal with
-`Qt.ConnectionType.BlockingQueuedConnection` blocks the calling worker
-thread until the slot has run to completion on the main thread, so no Qt
-object is ever touched off the main thread.
-
-Status/library reads are lock-protected snapshots (`RemoteServerState`,
-`RemoteDiagnostics`) that the main thread keeps up to date; the async side
-only ever reads them, so no cross-thread Qt calls are needed for polling.
+The relay owns its own asyncio event loop on a background thread. Incoming
+"command" messages are handled by `RemoteServerBridge` exactly like the old
+inbound FastAPI server did: `Bridge.execute()` emits a Qt signal with
+`Qt.ConnectionType.BlockingQueuedConnection`, which blocks the relay thread
+until the slot has run to completion on the Qt main thread. This lets us
+reuse the same `MainWindow.remote_*` surface (`remote_play`,
+`remote_get_status`, etc.) the old server used, unchanged.
 """
 
 from __future__ import annotations
 
 import collections
+import json
+import mimetypes
+import socket
+import struct
 import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
 
 from PyQt6.QtCore import QObject, Qt, pyqtSignal
-from fastapi import Header as _Header
-from fastapi import Request, WebSocket
-from pydantic import BaseModel
 
-
-def _pin_header() -> Any:
-    """Fresh `Header()` default per route param (FastAPI defaults must not be shared)."""
-    return _Header(default=None)
-
+try:
+    import websockets
+except ModuleNotFoundError:  # pragma: no cover - dependency is in requirements.txt
+    websockets = None  # type: ignore[assignment]
 
 
 class RemoteCommand:
@@ -50,7 +49,7 @@ class RemoteCommand:
 
 
 class RemoteServerBridge(QObject):
-    """Lives on the Qt main thread; marshals remote commands into MainWindow calls."""
+    """Lives on the Qt main thread; marshals relayed commands into MainWindow calls."""
 
     _command_ready = pyqtSignal(object)
 
@@ -62,7 +61,7 @@ class RemoteServerBridge(QObject):
         self._command_ready.connect(self._handle_command, Qt.ConnectionType.BlockingQueuedConnection)  # pyright: ignore[reportCallIssue]
 
     def execute(self, action: str, timeout: float = 5.0, **kwargs: Any) -> dict[str, Any]:
-        """Called from any thread; blocks until the main thread has handled it."""
+        """Called from the relay thread; blocks until the main thread has handled it."""
         cmd = RemoteCommand(action, **kwargs)
         self._command_ready.emit(cmd)
         cmd.done.wait(timeout)
@@ -75,7 +74,7 @@ class RemoteServerBridge(QObject):
                 cmd.result = mw.remote_play(
                     cmd.kwargs.get("path", ""),
                     cmd.kwargs.get("loop_mode", "off"),
-                    bool(cmd.kwargs.get("is_live_mode", True)),
+                    bool(cmd.kwargs.get("live", cmd.kwargs.get("is_live_mode", True))),
                 )
             elif cmd.action == "toggle_pause":
                 cmd.result = {"ok": True, **mw.remote_toggle_pause()}
@@ -90,7 +89,7 @@ class RemoteServerBridge(QObject):
                 cmd.result = {"ok": applied, **mw.remote_get_status()}
             else:
                 cmd.result = {"ok": False, "error": f"unknown action: {cmd.action}"}
-        except Exception as exc:  # noqa: BLE001 - surface any failure back to the HTTP caller
+        except Exception as exc:  # noqa: BLE001 - surface any failure back to jingleserver
             cmd.result = {"ok": False, "error": str(exc)}
         finally:
             cmd.done.set()
@@ -120,418 +119,270 @@ class RemoteServerState:
             return dict(self._snapshot)
 
 
-class RemoteDiagnostics:
-    """Thread-safe connected-client registry and recent request log for the Diagnostics dialog."""
+class RemoteRelayDiagnostics:
+    """Thread-safe connection status + recent relayed-command log for the Diagnostics dialog."""
 
     def __init__(self, max_log_entries: int = 200) -> None:
         self._lock = threading.Lock()
-        self._clients: dict[str, dict[str, Any]] = {}
+        self._connected = False
+        self._label = ""
+        self._connected_at: float = 0.0
+        self._last_error = ""
+        self._reconnect_count = 0
         self._log: collections.deque[dict[str, Any]] = collections.deque(maxlen=max_log_entries)
 
-    def client_connected(self, client_id: str, ip: str) -> None:
+    def set_connected(self, connected: bool, label: str = "", error: str = "") -> None:
         with self._lock:
-            self._clients[client_id] = {"ip": ip, "connected_at": time.time()}
+            was_connected = self._connected
+            self._connected = connected
+            if connected:
+                self._label = label
+                self._connected_at = time.time()
+                self._last_error = ""
+            else:
+                if error:
+                    self._last_error = error
+                if was_connected:
+                    self._reconnect_count += 1
 
-    def client_disconnected(self, client_id: str) -> None:
-        with self._lock:
-            self._clients.pop(client_id, None)
-
-    def log_request(self, ip: str, action: str, target: str, ok: bool, detail: str = "") -> None:
+    def log_command(self, action: str, target: str, ok: bool, detail: str = "") -> None:
         with self._lock:
             self._log.appendleft(
-                {
-                    "time": time.time(),
-                    "ip": ip,
-                    "action": action,
-                    "target": target,
-                    "ok": ok,
-                    "detail": detail,
-                }
+                {"time": time.time(), "action": action, "target": target, "ok": ok, "detail": detail}
             )
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             return {
-                "clients": list(self._clients.items()),
+                "connected": self._connected,
+                "label": self._label,
+                "connected_at": self._connected_at,
+                "last_error": self._last_error,
+                "reconnect_count": self._reconnect_count,
                 "log": list(self._log),
             }
 
 
-def build_app(
-    bridge: RemoteServerBridge,
-    state: RemoteServerState,
-    diagnostics: RemoteDiagnostics,
-    pin_provider: Callable[[], str],
-    admin_pin_provider: Callable[[], str],
-    library_provider: Callable[..., dict[str, Any]],
-    audio_path_provider: Callable[[str], Path | None],
-    static_dir: Path | None,
-):
-    from fastapi import FastAPI
-    from fastapi.staticfiles import StaticFiles
-
-    app = FastAPI(title="JingleAllTheDay Remote", docs_url=None, redoc_url=None)
-    api = _RemoteApi(bridge, state, diagnostics, pin_provider, admin_pin_provider, library_provider, audio_path_provider)
-    api.register_routes(app)
-
-    if static_dir is not None and static_dir.exists():
-        app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="webclient")
-
-    return app
+def normalize_relay_uri(address: str) -> str:
+    """Turn a bare host[:port] or full ws(s)://... address into a `/agent/connect` URI."""
+    candidate = (address or "").strip()
+    if not candidate:
+        raise ValueError("empty server address")
+    if "://" not in candidate:
+        candidate = f"wss://{candidate}"
+    if not candidate.rstrip("/").endswith("/agent/connect"):
+        candidate = candidate.rstrip("/") + "/agent/connect"
+    return candidate
 
 
-# NOTE: route handlers below are defined as plain module-level methods (not nested
-# functions) because FastAPI's signature introspection uses `get_type_hints()` against
-# each function's module globals; combined with `from __future__ import annotations`,
-# closures defined *inside* a factory function cannot resolve their own local classes
-# (e.g. request-body models) and silently misroute parameters.
-class PlayRequest(BaseModel):
-    path: str
-    loop_mode: str = "off"
-    live: bool = True
+def relay_http_base_url(address: str) -> str:
+    """Same address the relay connects to, as an http(s) base URL (no path) for cache uploads."""
+    candidate = (address or "").strip()
+    if not candidate:
+        raise ValueError("empty server address")
+    if "://" not in candidate:
+        candidate = f"https://{candidate}"
+    elif candidate.startswith("ws://"):
+        candidate = "http://" + candidate[len("ws://") :]
+    elif candidate.startswith("wss://"):
+        candidate = "https://" + candidate[len("wss://") :]
+    return candidate.rstrip("/").removesuffix("/agent/connect")
 
 
-class LoopModeRequest(BaseModel):
-    loop_mode: str
+def test_connection(address: str, device_token: str, timeout: float = 6.0) -> tuple[bool, str]:
+    """Synchronous one-shot connectivity check used by the Options dialog's Test Connection button."""
+    if websockets is None:
+        return False, "The 'websockets' package is not installed."
+    try:
+        uri = normalize_relay_uri(address)
+    except ValueError as exc:
+        return False, str(exc)
+    try:
+        from websockets.sync.client import connect as sync_connect
+    except ImportError:
+        return False, "websockets sync client unavailable; upgrade the 'websockets' package."
+
+    start = time.monotonic()
+    try:
+        with sync_connect(uri, open_timeout=timeout, close_timeout=2) as ws:
+            ws.send(json.dumps({"token": device_token, "label": socket.gethostname()}))
+            raw = ws.recv(timeout=timeout)
+            message = json.loads(raw)
+            if not message.get("ok"):
+                return False, "Server rejected the connection."
+    except TimeoutError:
+        return False, "Timed out waiting for the server to respond."
+    except Exception as exc:  # noqa: BLE001 - surface any failure to the user
+        return False, f"Connection failed: {exc}"
+    elapsed_ms = int((time.monotonic() - start) * 1000)
+    return True, f"Connected in {elapsed_ms} ms."
 
 
-class OutputModeRequest(BaseModel):
-    live: bool
+class RemoteRelayClient:
+    """Owns the background asyncio thread that keeps a connection to jingleserver alive."""
 
-
-class LoginRequest(BaseModel):
-    pin: str
-
-
-class _RemoteApi:
-    def __init__(
-        self,
-        bridge: RemoteServerBridge,
-        state: RemoteServerState,
-        diagnostics: RemoteDiagnostics,
-        pin_provider: Callable[[], str],
-        admin_pin_provider: Callable[[], str],
-        library_provider: Callable[..., dict[str, Any]],
-        audio_path_provider: Callable[[str], Path | None],
-    ) -> None:
-        self._bridge = bridge
-        self._state = state
-        self._diagnostics = diagnostics
-        self._pin_provider = pin_provider
-        self._admin_pin_provider = admin_pin_provider
-        self._library_provider = library_provider
-        self._audio_path_provider = audio_path_provider
-
-    def register_routes(self, app) -> None:  # type: ignore[no-untyped-def]
-        from fastapi import HTTPException, Request
-        from fastapi.responses import JSONResponse
-
-        app.get("/api/status")(self.get_status)
-        app.get("/api/library")(self.get_library)
-        app.get("/api/audio")(self.get_audio)
-        app.post("/api/login")(self.login)
-        app.post("/api/playback/play")(self.play)
-        app.post("/api/playback/pause")(self.pause)
-        app.post("/api/playback/stop")(self.stop)
-        app.post("/api/playback/mode")(self.set_mode)
-        app.post("/api/playback/output")(self.set_output)
-        app.websocket("/ws/status")(self.ws_status)
-        app.exception_handler(HTTPException)(self._http_exception_handler)
-
-    def _role_for_pin(self, pin: str | None) -> str | None:
-        """Resolve a submitted PIN to a role. Admin PIN blank means no one gets admin."""
-        candidate = (pin or "").strip()
-        if not candidate:
-            return None
-        admin_pin = self._admin_pin_provider().strip()
-        if admin_pin and candidate == admin_pin:
-            return "admin"
-        guest_pin = self._pin_provider().strip()
-        if guest_pin and candidate == guest_pin:
-            return "user"
-        return None
-
-    def _resolve_role(self, x_remote_pin: str | None) -> str:
-        from fastapi import HTTPException
-
-        if not self._pin_provider().strip() and not self._admin_pin_provider().strip():
-            raise HTTPException(status_code=403, detail="Set a PIN in Options to enable remote control.")
-        role = self._role_for_pin(x_remote_pin)
-        if role is None:
-            raise HTTPException(status_code=403, detail="Invalid or missing PIN.")
-        return role
-
-    @staticmethod
-    def _client_ip(request: Request) -> str:
-        return request.client.host if request.client else "unknown"
-
-    def get_status(self) -> dict[str, Any]:
-        return self._state.get()
-
-    def get_library(
-        self,
-        search: str = "",
-        scope: str = "all",
-        category: str = "",
-        category_mode: str = "any",
-        limit: int = 200,
-        offset: int = 0,
-    ) -> dict[str, Any]:
-        return self._library_provider(
-            search=search,
-            scope=scope,
-            category=category,
-            category_mode=category_mode,
-            limit=limit,
-            offset=offset,
-        )
-
-    def login(self, body: LoginRequest) -> dict[str, Any]:
-        role = self._role_for_pin(body.pin)
-        if role is None:
-            return {"ok": False, "error": "Invalid PIN."}
-        return {"ok": True, "role": role}
-
-    def get_audio(self, path: str, request: Request, x_remote_pin: str | None = _pin_header()) -> Any:
-        import mimetypes
-
-        from fastapi import HTTPException
-        from fastapi.responses import FileResponse
-
-        ip = self._client_ip(request)
-        try:
-            self._resolve_role(x_remote_pin)
-        except HTTPException as exc:
-            self._diagnostics.log_request(ip, "audio", path, False, str(exc.detail))
-            raise
-        resolved = self._audio_path_provider(path)
-        if resolved is None:
-            self._diagnostics.log_request(ip, "audio", path, False, "not_found")
-            raise HTTPException(status_code=404, detail="Jingle not found.")
-        self._diagnostics.log_request(ip, "audio", path, True, "")
-        media_type = mimetypes.guess_type(str(resolved))[0] or "application/octet-stream"
-        return FileResponse(str(resolved), media_type=media_type)
-
-    def play(self, body: PlayRequest, request: Request, x_remote_pin: str | None = _pin_header()) -> dict[str, Any]:
-        from fastapi import HTTPException
-
-        ip = self._client_ip(request)
-        try:
-            role = self._resolve_role(x_remote_pin)
-        except HTTPException as exc:
-            self._diagnostics.log_request(ip, "play", body.path, False, str(exc.detail))
-            raise
-        # Guests can never flip the host's real Live/Preview routing via Play,
-        # even if they craft the request directly - always defer to host state.
-        effective_live = body.live if role == "admin" else bool(self._state.get().get("is_live_mode", True))
-        result = self._bridge.execute("play", path=body.path, loop_mode=body.loop_mode, is_live_mode=effective_live)
-        self._diagnostics.log_request(ip, "play", body.path, bool(result.get("ok")), str(result.get("error", "")))
-        return result
-
-    def pause(self, request: Request, x_remote_pin: str | None = _pin_header()) -> dict[str, Any]:
-        from fastapi import HTTPException
-
-        ip = self._client_ip(request)
-        try:
-            self._resolve_role(x_remote_pin)
-        except HTTPException as exc:
-            self._diagnostics.log_request(ip, "pause", "", False, str(exc.detail))
-            raise
-        result = self._bridge.execute("toggle_pause")
-        self._diagnostics.log_request(ip, "pause", "", bool(result.get("ok")), "")
-        return result
-
-    def stop(self, request: Request, x_remote_pin: str | None = _pin_header()) -> dict[str, Any]:
-        from fastapi import HTTPException
-
-        ip = self._client_ip(request)
-        try:
-            self._resolve_role(x_remote_pin)
-        except HTTPException as exc:
-            self._diagnostics.log_request(ip, "stop", "", False, str(exc.detail))
-            raise
-        result = self._bridge.execute("stop")
-        self._diagnostics.log_request(ip, "stop", "", bool(result.get("ok")), "")
-        return result
-
-    def set_mode(self, body: LoopModeRequest, request: Request, x_remote_pin: str | None = _pin_header()) -> dict[str, Any]:
-        from fastapi import HTTPException
-
-        ip = self._client_ip(request)
-        try:
-            role = self._resolve_role(x_remote_pin)
-        except HTTPException as exc:
-            self._diagnostics.log_request(ip, "loop_mode", body.loop_mode, False, str(exc.detail))
-            raise
-        if role != "admin" and not bool(self._state.get().get("is_live_mode", True)):
-            # Guests only mirror the host's loop mode while actually riding the host's Live playback.
-            error = "Cannot change the Host's playback mode while the Host is in Preview."
-            self._diagnostics.log_request(ip, "loop_mode", body.loop_mode, False, error)
-            return {"ok": False, "error": error, **self._state.get()}
-        result = self._bridge.execute("set_loop_mode", loop_mode=body.loop_mode)
-        self._diagnostics.log_request(ip, "loop_mode", body.loop_mode, bool(result.get("ok")), "")
-        return result
-
-    def set_output(self, body: OutputModeRequest, request: Request, x_remote_pin: str | None = _pin_header()) -> dict[str, Any]:
-        from fastapi import HTTPException
-
-        ip = self._client_ip(request)
-        target = "live" if body.live else "preview"
-        try:
-            role = self._resolve_role(x_remote_pin)
-        except HTTPException as exc:
-            self._diagnostics.log_request(ip, "output_mode", target, False, str(exc.detail))
-            raise
-        if role != "admin":
-            # Guests never touch the host's real device routing - only gate their own local toggle.
-            snapshot = self._state.get()
-            host_is_live = bool(snapshot.get("is_live_mode", True))
-            if body.live and not host_is_live:
-                error = "Cannot switch to Live - the Host hasn't engaged Live mode yet."
-                self._diagnostics.log_request(ip, "output_mode", target, False, error)
-                return {"ok": False, "error": error, **snapshot}
-            self._diagnostics.log_request(ip, "output_mode", target, True, "")
-            return {"ok": True, **snapshot}
-        result = self._bridge.execute("set_live_mode", is_live_mode=body.live)
-        self._diagnostics.log_request(ip, "output_mode", target, bool(result.get("ok")), "")
-        return result
-
-    async def ws_status(self, websocket: WebSocket) -> None:
-        import asyncio
-
-        await websocket.accept()
-        client_id = f"{id(websocket)}"
-        ip = websocket.client.host if websocket.client else "unknown"
-        self._diagnostics.client_connected(client_id, ip)
-        try:
-            while True:
-                await websocket.send_json(self._state.get())
-                await asyncio.sleep(0.25)
-        except Exception:
-            pass
-        finally:
-            self._diagnostics.client_disconnected(client_id)
-
-    @staticmethod
-    def _http_exception_handler(_request: Request, exc: Any) -> Any:
-        from fastapi.responses import JSONResponse
-
-        return JSONResponse(status_code=exc.status_code, content={"ok": False, "error": exc.detail})
-
-
-class RemoteServerManager:
-    """Owns the background uvicorn thread and exposes start/stop/restart."""
+    _MIN_RECONNECT_DELAY = 1.0
+    _MAX_RECONNECT_DELAY = 30.0
+    _STATUS_PUSH_INTERVAL = 0.25
+    _AUDIO_CHUNK_SIZE = 64 * 1024
+    _AUDIO_HEADER = struct.Struct(">I")
 
     def __init__(
         self,
         bridge: RemoteServerBridge,
         state: RemoteServerState,
-        diagnostics: RemoteDiagnostics,
-        pin_provider: Callable[[], str],
-        admin_pin_provider: Callable[[], str],
+        diagnostics: RemoteRelayDiagnostics,
+        address_provider: Callable[[], str],
+        device_token_provider: Callable[[], str],
         library_provider: Callable[..., dict[str, Any]],
-        audio_path_provider: Callable[[str], Path | None],
-        static_dir: Path | None,
+        audio_path_provider: Callable[[str], Path | None] | None = None,
     ) -> None:
         self._bridge = bridge
         self._state = state
         self._diagnostics = diagnostics
-        self._pin_provider = pin_provider
-        self._admin_pin_provider = admin_pin_provider
+        self._address_provider = address_provider
+        self._device_token_provider = device_token_provider
         self._library_provider = library_provider
         self._audio_path_provider = audio_path_provider
-        self._static_dir = static_dir
-        self._server: Any | None = None
         self._thread: threading.Thread | None = None
-        self._port: int = 0
-        self._last_error: str = ""
+        self._stop_event = threading.Event()
 
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
-    def port(self) -> int:
-        return self._port
+    def is_connected(self) -> bool:
+        return bool(self._diagnostics.snapshot().get("connected"))
 
-    def last_error(self) -> str:
-        return self._last_error
-
-    def start(self, port: int) -> bool:
+    def start(self) -> bool:
         if self.is_running():
             return True
-        try:
-            import uvicorn
-        except ModuleNotFoundError as exc:
-            self._last_error = f"uvicorn is not installed: {exc}"
+        if websockets is None:
+            self._diagnostics.set_connected(False, error="websockets is not installed")
             return False
-
-        app = build_app(
-            self._bridge,
-            self._state,
-            self._diagnostics,
-            self._pin_provider,
-            self._admin_pin_provider,
-            self._library_provider,
-            self._audio_path_provider,
-            self._static_dir,
-        )
-        config = uvicorn.Config(
-            app,
-            host="0.0.0.0",
-            port=port,
-            loop="asyncio",
-            http="h11",
-            ws="websockets",
-            log_level="warning",
-        )
-        # uvicorn.Server.capture_signals() auto-skips signal registration off the
-        # main thread, so no extra configuration is needed to run it here.
-        server = uvicorn.Server(config)
-
-        ready = threading.Event()
-        error: list[BaseException] = []
-
-        def _run() -> None:
-            try:
-                import asyncio
-
-                asyncio.run(_serve_with_ready_signal(server, ready))
-            except BaseException as exc:  # noqa: BLE001
-                error.append(exc)
-                ready.set()
-
-        self._server = server
-        self._thread = threading.Thread(target=_run, name="jatd-remote-server", daemon=True)
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, name="jatd-remote-relay", daemon=True)
         self._thread.start()
-        ready.wait(5.0)
-        if error:
-            self._last_error = str(error[0])
-            self._thread = None
-            self._server = None
-            return False
-        self._port = port
-        self._last_error = ""
         return True
 
     def stop(self, timeout: float = 5.0) -> None:
-        if self._server is not None:
-            self._server.should_exit = True
+        self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout)
         self._thread = None
-        self._server = None
-        self._port = 0
+        self._diagnostics.set_connected(False)
 
-    def restart(self, port: int) -> bool:
+    def restart(self) -> bool:
         self.stop()
-        return self.start(port)
+        return self.start()
 
+    def _run(self) -> None:
+        import asyncio
 
-async def _serve_with_ready_signal(server: Any, ready: threading.Event) -> None:
-    import asyncio
+        asyncio.run(self._connect_forever())
 
-    async def _signal_when_started() -> None:
-        while not server.started:
-            await asyncio.sleep(0.01)
-        ready.set()
+    async def _connect_forever(self) -> None:
+        import asyncio
 
-    await asyncio.gather(server.serve(), _signal_when_started())
+        delay = self._MIN_RECONNECT_DELAY
+        while not self._stop_event.is_set():
+            try:
+                uri = normalize_relay_uri(self._address_provider())
+            except ValueError as exc:
+                self._diagnostics.set_connected(False, error=str(exc))
+                await asyncio.sleep(self._MAX_RECONNECT_DELAY)
+                continue
+            try:
+                async with websockets.connect(uri, open_timeout=10) as ws:
+                    await ws.send(
+                        json.dumps({"token": self._device_token_provider(), "label": socket.gethostname()})
+                    )
+                    ack_raw = await asyncio.wait_for(ws.recv(), timeout=10)
+                    ack = json.loads(ack_raw)
+                    if not ack.get("ok"):
+                        raise RuntimeError("server rejected device token")
+                    self._diagnostics.set_connected(True, label=uri)
+                    delay = self._MIN_RECONNECT_DELAY
+                    # A single websocket connection cannot have multiple concurrent senders
+                    # (status pushes, command replies, and audio-chunk streaming all share it),
+                    # so every send() call funnels through this one lock for this connection's lifetime.
+                    send_lock = asyncio.Lock()
+                    await asyncio.gather(self._recv_loop(ws, send_lock), self._status_push_loop(ws, send_lock))
+            except Exception as exc:  # noqa: BLE001 - any failure just triggers a reconnect
+                self._diagnostics.set_connected(False, error=str(exc))
+            if self._stop_event.is_set():
+                break
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, self._MAX_RECONNECT_DELAY)
+
+    async def _recv_loop(self, ws: Any, send_lock: Any) -> None:
+        import asyncio
+
+        async for raw in ws:
+            if self._stop_event.is_set():
+                return
+            try:
+                message = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if message.get("type") != "command":
+                continue
+            action = str(message.get("action", ""))
+            req_id = message.get("id")
+            kwargs = message.get("kwargs") or {}
+            if action == "get_audio":
+                asyncio.ensure_future(self._stream_audio(ws, send_lock, req_id, str(kwargs.get("path", ""))))
+                continue
+            result = self._dispatch(message)
+            async with send_lock:
+                await ws.send(json.dumps({"type": "response", "id": req_id, "data": result}))
+
+    async def _stream_audio(self, ws: Any, send_lock: Any, req_id: Any, path: str) -> None:
+        """Stream a jingle's audio to jingleserver in chunks so browser preview starts immediately
+        instead of waiting for the whole file (large jingles can exceed 100MB)."""
+        resolved = self._audio_path_provider(path) if self._audio_path_provider else None
+        if resolved is None or not resolved.exists():
+            async with send_lock:
+                await ws.send(json.dumps({"type": "audio_error", "id": req_id, "error": "not_found"}))
+            return
+        try:
+            size = resolved.stat().st_size
+            content_type = mimetypes.guess_type(str(resolved))[0] or "application/octet-stream"
+            async with send_lock:
+                await ws.send(json.dumps({"type": "audio_start", "id": req_id, "size": size, "content_type": content_type}))
+            header = self._AUDIO_HEADER.pack(int(req_id))
+            with open(resolved, "rb") as audio_file:
+                while True:
+                    chunk = audio_file.read(self._AUDIO_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    async with send_lock:
+                        await ws.send(header + chunk)
+            async with send_lock:
+                await ws.send(json.dumps({"type": "audio_end", "id": req_id}))
+        except Exception as exc:  # noqa: BLE001 - surface failures back to jingleserver
+            try:
+                async with send_lock:
+                    await ws.send(json.dumps({"type": "audio_error", "id": req_id, "error": str(exc)}))
+            except Exception:
+                pass
+
+    async def _status_push_loop(self, ws: Any, send_lock: Any) -> None:
+        import asyncio
+
+        while not self._stop_event.is_set():
+            async with send_lock:
+                await ws.send(json.dumps({"type": "status", "data": self._state.get()}))
+            await asyncio.sleep(self._STATUS_PUSH_INTERVAL)
+
+    def _dispatch(self, message: dict[str, Any]) -> dict[str, Any]:
+        action = str(message.get("action", ""))
+        kwargs = message.get("kwargs") or {}
+        try:
+            if action == "get_library":
+                result = self._library_provider(**kwargs)
+            else:
+                result = self._bridge.execute(action, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - surface failures back to jingleserver
+            result = {"ok": False, "error": str(exc)}
+        self._diagnostics.log_command(action, str(kwargs.get("path", "")), bool(result.get("ok", True)))
+        return result

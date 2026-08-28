@@ -7,68 +7,77 @@
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-  <header class="topbar">
-    <h1>JingleAllTheDay Remote</h1>
-    <span id="role-badge" class="role-badge hidden"></span>
-    <button id="pin-btn" class="icon-btn" title="Set remote PIN">🔑</button>
-  </header>
-
-  <section id="now-playing" class="now-playing">
-    <div class="np-name" id="np-name">Nothing playing</div>
-    <div class="np-progress">
-      <div class="np-bar"><div class="np-fill" id="np-fill"></div></div>
-      <div class="np-time"><span id="np-position">0:00</span> / <span id="np-duration">0:00</span></div>
-    </div>
-    <div class="np-controls">
-      <button id="btn-pause" class="ctl-btn">Play Selected</button>
-      <button id="btn-stop" class="ctl-btn">Stop</button>
-    </div>
-    <div class="np-toggles">
-      <button id="btn-loop" class="toggle-btn" data-mode="off">Loop: Off</button>
-      <button id="btn-live" class="toggle-btn" data-live="true">Mode: Live</button>
-    </div>
-    <div id="status-line" class="status-line"></div>
-    <audio id="local-audio" preload="none"></audio>
-  </section>
-
-  <section class="library">
-    <div class="search-row">
-      <input id="search-input" type="search" placeholder="Search jingles..." />
-    </div>
-    <div class="page-row">
-      <label class="page-size-label">
-        Show
-        <select id="page-size-select">
-          <option value="25">25</option>
-          <option value="50">50</option>
-          <option value="100" selected>100</option>
-          <option value="200">200</option>
-          <option value="500">500</option>
-          <option value="0">All</option>
-        </select>
-      </label>
-      <div class="pager">
-        <button id="page-prev" class="pager-btn" aria-label="Previous page">&lsaquo;</button>
-        <span id="page-indicator" class="page-indicator">Page 1 of 1</span>
-        <button id="page-next" class="pager-btn" aria-label="Next page">&rsaquo;</button>
-      </div>
-    </div>
-    <div id="library-list" class="library-list"></div>
-    <div id="library-summary" class="library-summary"></div>
-  </section>
-
-  <div id="pin-modal" class="modal hidden">
+  <div id="login-screen" class="modal">
     <div class="modal-card">
-      <h2>Remote Control PIN</h2>
-      <p>Required to play/pause/stop or change modes. Set in the desktop app's Options dialog.</p>
-      <input id="pin-input" type="text" inputmode="numeric" placeholder="PIN" />
+      <h2>JingleAllTheDay Remote</h2>
+      <p>Sign in to view and control the jingle library.</p>
+      <input id="login-username" type="text" autocomplete="username" placeholder="Username" />
+      <input id="login-password" type="password" autocomplete="current-password" placeholder="Password" />
+      <div id="login-error" class="login-error"></div>
       <div class="modal-actions">
-        <button id="pin-save">Save</button>
-        <button id="pin-cancel">Cancel</button>
+        <button id="login-submit">Sign In</button>
       </div>
     </div>
+  </div>
+
+  <div id="app-root" class="hidden">
+    <header class="topbar">
+      <h1>JingleAllTheDay Remote</h1>
+      <span id="role-badge" class="role-badge hidden"></span>
+      <button id="logout-btn" class="icon-btn" title="Sign out">&#x23FB;</button>
+    </header>
+
+    <div id="offline-banner" class="offline-banner hidden">
+      <span id="offline-message">No jingle machine currently connected for control.</span>
+      <button id="offline-refresh-btn" class="pager-btn">Refresh</button>
+    </div>
+
+    <section id="now-playing" class="now-playing">
+      <div class="np-name" id="np-name">Nothing playing</div>
+      <div class="np-progress">
+        <div class="np-bar"><div class="np-fill" id="np-fill"></div></div>
+        <div class="np-time"><span id="np-position">0:00</span> / <span id="np-duration">0:00</span></div>
+      </div>
+      <div class="np-controls">
+        <button id="btn-pause" class="ctl-btn">Play Selected</button>
+        <button id="btn-stop" class="ctl-btn">Stop</button>
+      </div>
+      <div class="np-toggles">
+        <button id="btn-loop" class="toggle-btn" data-mode="off">Loop: Off</button>
+        <button id="btn-live" class="toggle-btn" data-live="true">Mode: Live</button>
+      </div>
+      <div id="status-line" class="status-line"></div>
+      <audio id="local-audio" preload="none"></audio>
+    </section>
+
+    <section class="library">
+      <div class="search-row">
+        <input id="search-input" type="search" placeholder="Search jingles..." />
+      </div>
+      <div class="page-row">
+        <label class="page-size-label">
+          Show
+          <select id="page-size-select">
+            <option value="25">25</option>
+            <option value="50">50</option>
+            <option value="100" selected>100</option>
+            <option value="200">200</option>
+            <option value="500">500</option>
+            <option value="0">All</option>
+          </select>
+        </label>
+        <div class="pager">
+          <button id="page-prev" class="pager-btn" aria-label="Previous page">&lsaquo;</button>
+          <span id="page-indicator" class="page-indicator">Page 1 of 1</span>
+          <button id="page-next" class="pager-btn" aria-label="Next page">&rsaquo;</button>
+        </div>
+      </div>
+      <div id="library-list" class="library-list"></div>
+      <div id="library-summary" class="library-summary"></div>
+    </section>
   </div>
 
   <script src="app.js"></script>
 </body>
 </html>
+

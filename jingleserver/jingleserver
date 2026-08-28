@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""Operator CLI for jingleserver.
+
+Usage examples:
+    ./jingleserver start|stop|restart|status      # wraps `systemctl <cmd> jingleserver`
+    ./jingleserver adduser tobin --role user
+    ./jingleserver setrole tobin admin
+    ./jingleserver passwd tobin
+    ./jingleserver deluser tobin
+    ./jingleserver listusers
+    ./jingleserver adddevice "front-of-house-laptop"
+    ./jingleserver listdevices
+    ./jingleserver deldevice "front-of-house-laptop"
+
+User/device management operates directly on the SQLite DB (config.DB_PATH),
+so it works whether or not the systemd service is currently running.
+"""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import os
+import subprocess
+import sys
+
+from jsrv import config, db, security
+
+_SYSTEMD_UNIT = "jingleserver"
+_SERVICE_ACCOUNT = "jingleserver"
+_DB_MUTATING_COMMANDS = {"adduser", "deluser", "setrole", "passwd", "adddevice", "deldevice"}
+
+
+def _fix_data_dir_ownership() -> None:
+    """If invoked via sudo, hand ownership of the DB/cache back to the unprivileged
+    service account so the running systemd unit can still read/write its own data."""
+    if sys.platform == "win32" or os.geteuid() != 0:
+        return
+    try:
+        import pwd
+
+        entry = pwd.getpwnam(_SERVICE_ACCOUNT)
+    except (ImportError, KeyError):
+        return
+    for root, dirs, files in os.walk(config.DATA_DIR):
+        for name in dirs + files:
+            try:
+                os.chown(os.path.join(root, name), entry.pw_uid, entry.pw_gid)
+            except OSError:
+                pass
+    try:
+        os.chown(config.DATA_DIR, entry.pw_uid, entry.pw_gid)
+    except OSError:
+        pass
+
+
+def _cmd_service(action: str) -> int:
+    result = subprocess.run(["systemctl", action, _SYSTEMD_UNIT])
+    return result.returncode
+
+
+def _cmd_adduser(args: argparse.Namespace) -> int:
+    db.init_db()
+    if db.get_user_by_username(args.username) is not None:
+        print(f"error: user '{args.username}' already exists", file=sys.stderr)
+        return 1
+    password = getpass.getpass("New password: ")
+    confirm = getpass.getpass("Confirm password: ")
+    if password != confirm:
+        print("error: passwords do not match", file=sys.stderr)
+        return 1
+    db.create_user(args.username, security.hash_password(password), args.role)
+    print(f"created user '{args.username}' with role '{args.role}'")
+    return 0
+
+
+def _cmd_deluser(args: argparse.Namespace) -> int:
+    db.init_db()
+    if not db.delete_user(args.username):
+        print(f"error: no such user '{args.username}'", file=sys.stderr)
+        return 1
+    print(f"deleted user '{args.username}'")
+    return 0
+
+
+def _cmd_setrole(args: argparse.Namespace) -> int:
+    db.init_db()
+    if not db.set_role(args.username, args.role):
+        print(f"error: no such user '{args.username}'", file=sys.stderr)
+        return 1
+    print(f"set role of '{args.username}' to '{args.role}'")
+    return 0
+
+
+def _cmd_passwd(args: argparse.Namespace) -> int:
+    db.init_db()
+    user = db.get_user_by_username(args.username)
+    if user is None:
+        print(f"error: no such user '{args.username}'", file=sys.stderr)
+        return 1
+    password = getpass.getpass("New password: ")
+    confirm = getpass.getpass("Confirm password: ")
+    if password != confirm:
+        print("error: passwords do not match", file=sys.stderr)
+        return 1
+    db.set_password(args.username, security.hash_password(password))
+    db.delete_sessions_for_user(user["id"])
+    print(f"password updated for '{args.username}' (existing sessions revoked)")
+    return 0
+
+
+def _cmd_listusers(_: argparse.Namespace) -> int:
+    db.init_db()
+    users = db.list_users()
+    if not users:
+        print("(no users)")
+        return 0
+    for user in users:
+        print(f"{user['username']:<24} role={user['role']:<6} created={user['created_at']}")
+    return 0
+
+
+def _cmd_adddevice(args: argparse.Namespace) -> int:
+    db.init_db()
+    token = security.generate_token()
+    try:
+        db.create_device(args.label, security.hash_token(token))
+    except Exception as exc:  # noqa: BLE001 - surface unique-constraint failures etc.
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"device '{args.label}' created. Device token (shown once, paste into desktop app Options):")
+    print(token)
+    return 0
+
+
+def _cmd_listdevices(_: argparse.Namespace) -> int:
+    db.init_db()
+    devices = db.list_devices()
+    if not devices:
+        print("(no devices)")
+        return 0
+    for device in devices:
+        last_seen = device["last_seen_at"] or "never"
+        print(f"{device['label']:<32} created={device['created_at']} last_seen={last_seen}")
+    return 0
+
+
+def _cmd_deldevice(args: argparse.Namespace) -> int:
+    db.init_db()
+    if not db.delete_device(args.label):
+        print(f"error: no such device '{args.label}'", file=sys.stderr)
+        return 1
+    print(f"deleted device '{args.label}'")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="jingleserver")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    for name in ("start", "stop", "restart", "status"):
+        sub.add_parser(name, help=f"systemctl {name} {_SYSTEMD_UNIT}")
+
+    p = sub.add_parser("adduser", help="create a webapp user account")
+    p.add_argument("username")
+    p.add_argument("--role", choices=["admin", "user"], default="user")
+
+    p = sub.add_parser("deluser", help="delete a webapp user account")
+    p.add_argument("username")
+
+    p = sub.add_parser("setrole", help="change a user's privilege level")
+    p.add_argument("username")
+    p.add_argument("role", choices=["admin", "user"])
+
+    p = sub.add_parser("passwd", help="change a user's password")
+    p.add_argument("username")
+
+    sub.add_parser("listusers", help="list webapp user accounts")
+
+    p = sub.add_parser("adddevice", help="issue a new desktop-app device token")
+    p.add_argument("label")
+
+    p = sub.add_parser("deldevice", help="revoke a desktop-app device token")
+    p.add_argument("label")
+
+    sub.add_parser("listdevices", help="list known desktop-app devices")
+
+    args = parser.parse_args(argv)
+
+    if args.command in ("start", "stop", "restart", "status"):
+        return _cmd_service(args.command)
+    handlers = {
+        "adduser": _cmd_adduser,
+        "deluser": _cmd_deluser,
+        "setrole": _cmd_setrole,
+        "passwd": _cmd_passwd,
+        "listusers": _cmd_listusers,
+        "adddevice": _cmd_adddevice,
+        "deldevice": _cmd_deldevice,
+        "listdevices": _cmd_listdevices,
+    }
+    if args.command in _DB_MUTATING_COMMANDS:
+        result = handlers[args.command](args)
+        _fix_data_dir_ownership()
+        return result
+    return handlers[args.command](args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

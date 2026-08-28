@@ -22,12 +22,11 @@ Default result:
 
 ## Remote Control Server Note
 
-The app bundles a LAN remote-control server (FastAPI/Uvicorn) that auto-starts on a
-non-standard port (Options > Server Port, default `8765`). On first run of a packaged
-build, Windows Defender Firewall may prompt to allow the app to accept inbound
-connections on the private network — allow it if remote control from a phone/browser
-on the LAN is desired, or leave the "Enable remote server" option in Options unchecked
-to disable auto-start entirely.
+The app no longer hosts an inbound LAN server. Instead it dials **out** to a
+jingleserver relay (Options > Remote Server: Server Address + Device Token),
+so no inbound firewall prompt is expected for remote control. See
+[REMOTE_API.md](REMOTE_API.md) and [jingleserver/README.md](jingleserver/README.md)
+for the relay architecture and server-side setup.
 
 ## Script 1: build_exe.ps1
 

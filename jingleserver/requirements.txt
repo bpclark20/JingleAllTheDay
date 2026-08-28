@@ -1,0 +1,4 @@
+fastapi>=0.110,<1
+uvicorn[standard]>=0.29,<1
+websockets>=12,<13
+python-multipart>=0.0.9,<1

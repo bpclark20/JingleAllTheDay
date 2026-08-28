@@ -8,7 +8,6 @@ a = Analysis(
     datas=[
         ('icon.ico', '.'),
         ('icon.png', '.'),  # ico for bootloader/EXE; png for Qt setWindowIcon
-        ('webclient', 'webclient'),  # static mobile remote-control web client
     ],
     hiddenimports=[
         'sounddevice',
@@ -17,20 +16,9 @@ a = Analysis(
         'sample_pad_audio_engine',
         'remote_server',
         'mainwindow_server_mixin',
-        'fastapi',
-        'starlette',
-        'uvicorn',
-        'uvicorn.logging',
-        'uvicorn.loops',
-        'uvicorn.loops.asyncio',
-        'uvicorn.protocols',
-        'uvicorn.protocols.http',
-        'uvicorn.protocols.http.h11_impl',
-        'uvicorn.protocols.websockets',
-        'uvicorn.protocols.websockets.websockets_impl',
-        'uvicorn.lifespan',
-        'uvicorn.lifespan.on',
         'websockets',
+        'websockets.sync',
+        'websockets.sync.client',
     ],
     hookspath=[],
     hooksconfig={},

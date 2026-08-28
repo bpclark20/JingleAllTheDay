@@ -1,7 +1,21 @@
 (() => {
   "use strict";
 
-  const PIN_STORAGE_KEY = "jatd-remote-pin";
+  const PAGE_SIZE_STORAGE_KEY = "jatd-remote-page-size";
+
+  const loginScreen = document.getElementById("login-screen");
+  const loginUsername = document.getElementById("login-username");
+  const loginPassword = document.getElementById("login-password");
+  const loginError = document.getElementById("login-error");
+  const loginSubmit = document.getElementById("login-submit");
+  const appRoot = document.getElementById("app-root");
+  const logoutBtn = document.getElementById("logout-btn");
+  const roleBadge = document.getElementById("role-badge");
+
+  const offlineBanner = document.getElementById("offline-banner");
+  const offlineMessage = document.getElementById("offline-message");
+  const offlineRefreshBtn = document.getElementById("offline-refresh-btn");
+
   const npName = document.getElementById("np-name");
   const npFill = document.getElementById("np-fill");
   const npPosition = document.getElementById("np-position");
@@ -14,24 +28,19 @@
   const searchInput = document.getElementById("search-input");
   const libraryList = document.getElementById("library-list");
   const librarySummary = document.getElementById("library-summary");
-  const pinBtn = document.getElementById("pin-btn");
-  const pinModal = document.getElementById("pin-modal");
-  const pinInput = document.getElementById("pin-input");
-  const pinSave = document.getElementById("pin-save");
-  const pinCancel = document.getElementById("pin-cancel");
   const pageSizeSelect = document.getElementById("page-size-select");
   const pagePrevBtn = document.getElementById("page-prev");
   const pageNextBtn = document.getElementById("page-next");
   const pageIndicator = document.getElementById("page-indicator");
-  const roleBadge = document.getElementById("role-badge");
   const localAudio = document.getElementById("local-audio");
 
-  const PAGE_SIZE_STORAGE_KEY = "jatd-remote-page-size";
+  let currentRole = null;
   let currentPath = "";
   let pageOffset = 0;
   let pageTotal = 0;
-  let currentRole = null;
+  let agentConnected = false;
   let localPreviewActive = false;
+  let localPreviewBuffering = false;
   let lastHostIsLive = true;
   let guestLiveIntent = false;
   let lastHostLoopMode = "off";
@@ -39,13 +48,25 @@
   let lastHostPlayState = "stopped";
   let currentLibraryItems = [];
   let localPreviewIndex = -1;
+  let statusSocket = null;
 
-  function getPin() {
-    return localStorage.getItem(PIN_STORAGE_KEY) || "";
+  // -------------------------------------------------------------------------
+  // Session / login
+  // -------------------------------------------------------------------------
+
+  function showLoginScreen() {
+    loginScreen.classList.remove("hidden");
+    appRoot.classList.add("hidden");
+    if (statusSocket) {
+      statusSocket.onclose = null;
+      statusSocket.close();
+      statusSocket = null;
+    }
   }
 
-  function setPin(value) {
-    localStorage.setItem(PIN_STORAGE_KEY, value);
+  function showAppRoot() {
+    loginScreen.classList.add("hidden");
+    appRoot.classList.remove("hidden");
   }
 
   function updateRoleBadge() {
@@ -53,39 +74,116 @@
       roleBadge.textContent = "Admin";
       roleBadge.classList.remove("hidden");
     } else if (currentRole === "user") {
-      roleBadge.textContent = "Guest";
+      roleBadge.textContent = "User";
       roleBadge.classList.remove("hidden");
     } else {
       roleBadge.classList.add("hidden");
     }
   }
 
-  async function resolveRole() {
-    const pin = getPin();
-    if (!pin) {
-      currentRole = null;
-      updateRoleBadge();
-      renderModeButton();
-      renderLoopButton();
-      renderPlayButton();
+  async function checkSession() {
+    try {
+      const response = await fetch("/api/session");
+      const data = await response.json();
+      if (data.authenticated) {
+        currentRole = data.role;
+        updateRoleBadge();
+        showAppRoot();
+        initApp();
+        return;
+      }
+    } catch (err) {
+      // fall through to login screen
+    }
+    currentRole = null;
+    updateRoleBadge();
+    showLoginScreen();
+  }
+
+  async function submitLogin() {
+    loginError.textContent = "";
+    const username = loginUsername.value.trim();
+    const password = loginPassword.value;
+    if (!username || !password) {
+      loginError.textContent = "Enter a username and password.";
       return;
     }
     try {
       const response = await fetch("/api/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ pin }),
+        body: JSON.stringify({ username, password }),
       });
       const data = await response.json();
-      currentRole = data.ok ? data.role : null;
+      if (!response.ok || !data.ok) {
+        loginError.textContent = "Invalid username or password.";
+        return;
+      }
+      currentRole = data.role;
+      loginPassword.value = "";
+      updateRoleBadge();
+      showAppRoot();
+      initApp();
     } catch (err) {
-      currentRole = null;
+      loginError.textContent = "Could not reach the server.";
     }
-    updateRoleBadge();
-    renderModeButton();
-    renderLoopButton();
-    renderPlayButton();
   }
+
+  async function logout() {
+    try {
+      await fetch("/api/logout", { method: "POST" });
+    } catch (err) {
+      // ignore - we're logging out client-side regardless
+    }
+    currentRole = null;
+    updateRoleBadge();
+    showLoginScreen();
+  }
+
+  loginSubmit.addEventListener("click", submitLogin);
+  loginPassword.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") submitLogin();
+  });
+  logoutBtn.addEventListener("click", logout);
+
+  // -------------------------------------------------------------------------
+  // Offline / agent-connection state
+  // -------------------------------------------------------------------------
+
+  function setAgentConnected(connected, offlineText) {
+    const changed = connected !== agentConnected;
+    agentConnected = connected;
+    if (connected) {
+      offlineBanner.classList.add("hidden");
+    } else {
+      offlineMessage.textContent = offlineText || "No jingle machine currently connected for control.";
+      offlineBanner.classList.remove("hidden");
+      if (localPreviewActive) {
+        stopLocalPreview();
+      }
+    }
+    updateControlsEnabled();
+    if (changed) {
+      fetchLibrary();
+    }
+  }
+
+  function updateControlsEnabled() {
+    const enabled = agentConnected;
+    btnPause.disabled = !enabled && !localPreviewActive;
+    btnStop.disabled = !enabled && !localPreviewActive;
+    btnLoop.disabled = !enabled;
+    btnLive.disabled = !enabled;
+  }
+
+  offlineRefreshBtn.addEventListener("click", () => {
+    refreshStatusOnce();
+    fetchLibrary();
+  });
+
+  // -------------------------------------------------------------------------
+  // Now-playing / status
+  // -------------------------------------------------------------------------
 
   function formatSeconds(seconds) {
     const total = Math.max(0, Math.floor(seconds || 0));
@@ -108,21 +206,21 @@
   async function callControl(path, body) {
     const response = await fetch(path, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Remote-Pin": getPin(),
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body || {}),
     });
+    if (response.status === 401) {
+      showLoginScreen();
+      return { ok: false, error: "Not signed in." };
+    }
     let data = {};
     try {
       data = await response.json();
     } catch (err) {
       data = { ok: false, error: "Invalid response from server." };
     }
-    if (response.status === 403) {
-      showStatus(data.error || "PIN required or incorrect.", true);
-      openPinModal();
+    if (response.status === 409) {
+      showStatus("The jingle machine is not currently connected.", true);
       return data;
     }
     if (!data.ok) {
@@ -132,6 +230,10 @@
   }
 
   function applyStatus(status) {
+    setAgentConnected(Boolean(status.agent_connected), status.message);
+    if (!agentConnected) {
+      return;
+    }
     const isLive = status.is_live_mode !== false;
     if (currentRole !== "admin" && guestLiveIntent && !isLive) {
       // Host dropped out of Live while this guest was mirroring it - fall back to local preview
@@ -178,6 +280,10 @@
   }
 
   function renderPlayButton() {
+    if (localPreviewBuffering) {
+      btnPause.textContent = "Loading\u2026";
+      return;
+    }
     let state;
     if (isMirroringHost()) {
       state = lastHostPlayState;
@@ -204,6 +310,7 @@
   function connectWebSocket() {
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const ws = new WebSocket(`${protocol}//${window.location.host}/ws/status`);
+    statusSocket = ws;
     ws.onmessage = (event) => {
       try {
         applyStatus(JSON.parse(event.data));
@@ -212,7 +319,9 @@
       }
     };
     ws.onclose = () => {
-      window.setTimeout(connectWebSocket, 2000);
+      if (statusSocket === ws) {
+        window.setTimeout(connectWebSocket, 2000);
+      }
     };
     ws.onerror = () => ws.close();
   }
@@ -220,13 +329,24 @@
   async function refreshStatusOnce() {
     try {
       const response = await fetch("/api/status");
+      if (response.status === 401) {
+        showLoginScreen();
+        return;
+      }
       applyStatus(await response.json());
     } catch (err) {
       // handled by websocket retry
     }
   }
 
+  // -------------------------------------------------------------------------
+  // Playback (live/admin control + guest local preview)
+  // -------------------------------------------------------------------------
+
   function triggerPlay(item) {
+    if (!agentConnected) {
+      return;
+    }
     if (currentRole !== "admin" && !guestLiveIntent) {
       startLocalPreview(item);
       return;
@@ -238,42 +358,39 @@
     });
   }
 
-  async function startLocalPreview(item) {
-    try {
-      const response = await fetch(`/api/audio?path=${encodeURIComponent(item.path)}`, {
-        headers: { "X-Remote-Pin": getPin() },
-      });
-      if (response.status === 403) {
-        showStatus("PIN required or incorrect.", true);
-        openPinModal();
-        return;
-      }
-      if (!response.ok) {
-        showStatus("Could not load jingle for preview.", true);
-        return;
-      }
-      const blob = await response.blob();
-      if (localAudio.src) {
-        URL.revokeObjectURL(localAudio.src);
-      }
-      localAudio.src = URL.createObjectURL(blob);
-      localAudio.loop = localLoopMode === "loop";
-      localPreviewActive = true;
-      localPreviewIndex = currentLibraryItems.findIndex((entry) => entry.path === item.path);
-      currentPath = item.path;
-      npName.textContent = `${item.name} (local preview)`;
-      highlightPlayingRow();
-      await localAudio.play();
-    } catch (err) {
+  function startLocalPreview(item) {
+    // The <audio> element fetches directly from /api/audio so the browser can progressively
+    // buffer/stream large jingles instead of waiting for a full blob download before playback.
+    localPreviewBuffering = true;
+    localAudio.src = `/api/audio?path=${encodeURIComponent(item.path)}`;
+    localAudio.loop = localLoopMode === "loop";
+    localPreviewActive = true;
+    localPreviewIndex = currentLibraryItems.findIndex((entry) => entry.path === item.path);
+    currentPath = item.path;
+    npName.textContent = `${item.name} (buffering\u2026)`;
+    npName.classList.add("buffering");
+    highlightPlayingRow();
+    updateControlsEnabled();
+    renderPlayButton();
+    localAudio.play().catch(() => {
+      localPreviewBuffering = false;
+      localPreviewActive = false;
+      npName.classList.remove("buffering");
+      updateControlsEnabled();
+      renderPlayButton();
       showStatus("Could not preview jingle in browser.", true);
-    }
+    });
   }
 
   function stopLocalPreview() {
     localAudio.pause();
-    localAudio.currentTime = 0;
+    localAudio.removeAttribute("src");
+    localAudio.load();
     localPreviewActive = false;
+    localPreviewBuffering = false;
     localPreviewIndex = -1;
+    npName.classList.remove("buffering");
+    updateControlsEnabled();
     refreshStatusOnce();
   }
 
@@ -299,14 +416,47 @@
   localAudio.addEventListener("play", renderPlayButton);
   localAudio.addEventListener("pause", renderPlayButton);
 
+  // Fired whenever playback stalls waiting on more chunks to arrive (initial
+  // load or mid-playback rebuffer on a slow connection) - show a graceful
+  // loading state instead of an error, and clear it once enough data is buffered.
+  localAudio.addEventListener("waiting", () => {
+    if (!localPreviewActive) return;
+    localPreviewBuffering = true;
+    npName.classList.add("buffering");
+    renderPlayButton();
+  });
+
+  localAudio.addEventListener("playing", () => {
+    if (!localPreviewActive) return;
+    localPreviewBuffering = false;
+    npName.classList.remove("buffering");
+    const item = currentLibraryItems.find((entry) => entry.path === currentPath);
+    npName.textContent = item ? `${item.name} (local preview)` : "Local preview";
+    renderPlayButton();
+  });
+
+  localAudio.addEventListener("error", () => {
+    if (!localPreviewActive) return;
+    localPreviewBuffering = false;
+    npName.classList.remove("buffering");
+    localPreviewActive = false;
+    updateControlsEnabled();
+    renderPlayButton();
+    showStatus("Preview playback failed (connection issue) - try again.", true);
+  });
+
+  // -------------------------------------------------------------------------
+  // Library
+  // -------------------------------------------------------------------------
+
   function renderLibrary(items) {
     currentLibraryItems = items;
     libraryList.innerHTML = "";
     for (const item of items) {
       const row = document.createElement("div");
       row.className = "library-item";
-      row.dataset.path = item.path;
-      row.title = "Double-click to play";
+      row.dataset.path = item.path || "";
+      row.title = agentConnected ? "Double-click to play" : "";
 
       const info = document.createElement("div");
       info.className = "info";
@@ -315,24 +465,27 @@
       name.textContent = item.name;
       const meta = document.createElement("div");
       meta.className = "meta";
-      meta.textContent = `${item.folder} • ${formatSeconds(item.duration_seconds)}`;
+      const folderPart = item.folder ? `${item.folder} • ` : "";
+      meta.textContent = `${folderPart}${formatSeconds(item.duration_seconds)}`;
       info.appendChild(name);
       info.appendChild(meta);
-
-      const playBtn = document.createElement("button");
-      playBtn.textContent = "Play";
-      playBtn.addEventListener("click", () => triggerPlay(item));
-
-      // Desktop convenience: double-click anywhere in the row plays it (mobile keeps the explicit Play tap target).
-      row.addEventListener("dblclick", (event) => {
-        if (event.target.closest("button")) {
-          return;
-        }
-        triggerPlay(item);
-      });
-
       row.appendChild(info);
-      row.appendChild(playBtn);
+
+      if (agentConnected) {
+        const playBtn = document.createElement("button");
+        playBtn.textContent = "Play";
+        playBtn.addEventListener("click", () => triggerPlay(item));
+        row.appendChild(playBtn);
+
+        // Desktop convenience: double-click anywhere in the row plays it (mobile keeps the explicit Play tap target).
+        row.addEventListener("dblclick", (event) => {
+          if (event.target.closest("button")) {
+            return;
+          }
+          triggerPlay(item);
+        });
+      }
+
       libraryList.appendChild(row);
     }
     highlightPlayingRow();
@@ -357,11 +510,22 @@
     const limit = currentPageSize();
     try {
       const response = await fetch(`/api/library?search=${search}&limit=${limit}&offset=${pageOffset}`);
+      if (response.status === 401) {
+        showLoginScreen();
+        return;
+      }
       const data = await response.json();
-      pageTotal = data.total || 0;
+      setAgentConnected(Boolean(data.agent_connected));
+      pageTotal = data.total || (data.items || []).length;
       renderLibrary(data.items || []);
       const shown = (data.items || []).length;
-      librarySummary.textContent = `Showing ${shown} of ${pageTotal} jingles`;
+      if (agentConnected) {
+        librarySummary.textContent = `Showing ${shown} of ${pageTotal} jingles`;
+      } else if (shown === 0) {
+        librarySummary.textContent = data.message || "No jingle machine currently connected, and no cached library is available.";
+      } else {
+        librarySummary.textContent = `Showing ${shown} cached jingle(s) - jingle machine offline.`;
+      }
       updatePagerControls();
     } catch (err) {
       librarySummary.textContent = "Could not load library.";
@@ -397,6 +561,10 @@
     fetchLibrary();
   });
 
+  // -------------------------------------------------------------------------
+  // Now-playing controls
+  // -------------------------------------------------------------------------
+
   btnPause.addEventListener("click", () => {
     if (localPreviewActive) {
       if (localAudio.paused) {
@@ -406,6 +574,7 @@
       }
       return;
     }
+    if (!agentConnected) return;
     callControl("/api/playback/pause");
   });
   btnStop.addEventListener("click", () => {
@@ -413,10 +582,12 @@
       stopLocalPreview();
       return;
     }
+    if (!agentConnected) return;
     callControl("/api/playback/stop");
   });
 
   btnLoop.addEventListener("click", () => {
+    if (!agentConnected) return;
     const order = ["off", "loop", "continuous"];
     const next = order[(order.indexOf(btnLoop.dataset.mode || "off") + 1) % order.length];
     if (!isMirroringHost()) {
@@ -431,6 +602,7 @@
   });
 
   btnLive.addEventListener("click", async () => {
+    if (!agentConnected) return;
     const nextLive = btnLive.dataset.live === "false";
     const data = await callControl("/api/playback/output", { live: nextLive });
     if (!data.ok) {
@@ -450,37 +622,23 @@
     renderPlayButton();
   });
 
-  function openPinModal() {
-    pinInput.value = getPin();
-    pinModal.classList.remove("hidden");
+  // -------------------------------------------------------------------------
+  // App init (called once per successful login/session check)
+  // -------------------------------------------------------------------------
+
+  function initApp() {
+    const storedPageSize = localStorage.getItem(PAGE_SIZE_STORAGE_KEY);
+    if (storedPageSize && pageSizeSelect.querySelector(`option[value="${storedPageSize}"]`)) {
+      pageSizeSelect.value = storedPageSize;
+    }
+    updateControlsEnabled();
+    refreshStatusOnce();
+    connectWebSocket();
+    fetchLibrary();
+    renderModeButton();
+    renderLoopButton();
+    renderPlayButton();
   }
 
-  function closePinModal() {
-    pinModal.classList.add("hidden");
-  }
-
-  pinBtn.addEventListener("click", openPinModal);
-  pinCancel.addEventListener("click", closePinModal);
-  pinSave.addEventListener("click", () => {
-    setPin(pinInput.value.trim());
-    closePinModal();
-    showStatus("PIN saved.");
-    resolveRole();
-  });
-
-  const storedPageSize = localStorage.getItem(PAGE_SIZE_STORAGE_KEY);
-  if (storedPageSize && pageSizeSelect.querySelector(`option[value="${storedPageSize}"]`)) {
-    pageSizeSelect.value = storedPageSize;
-  }
-
-  refreshStatusOnce();
-  connectWebSocket();
-  fetchLibrary();
-  resolveRole();
-  renderModeButton();
-  renderLoopButton();
-  renderPlayButton();
-  if (!getPin()) {
-    openPinModal();
-  }
+  checkSession();
 })();

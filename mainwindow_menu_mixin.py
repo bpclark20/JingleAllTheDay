@@ -28,6 +28,13 @@ class MainWindowMenuMixin:
 
         file_menu.addSeparator()
 
+        self._offline_cache_backup_action = QAction("Offline Cache Backup...", self)
+        self._offline_cache_backup_action.triggered.connect(self._on_file_offline_cache_backup)
+        file_menu.addAction(self._offline_cache_backup_action)
+        file_menu.aboutToShow.connect(self._update_offline_cache_backup_action_enabled)
+
+        file_menu.addSeparator()
+
         exit_action = QAction("Exit", self)
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)

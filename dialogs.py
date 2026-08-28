@@ -10,6 +10,7 @@ from app_helpers import coerce_recent_window_days as _coerce_recent_window_days
 from app_helpers import format_duration_hms as _format_duration_hms
 from app_helpers import format_size_label as _format_size_label
 import sample_pad_audio_engine as _sp_engine_mod
+import remote_server as _remote_server
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QKeySequence, QPixmap
 from PyQt6.QtWidgets import (
@@ -138,9 +139,9 @@ class OptionsDialog(QDialog):
         sample_pad_streaming_min_seconds: int,
         samples_dir: Path | None = None,
         server_enabled: bool = True,
-        server_port: int = 8765,
-        server_pin: str = "",
-        server_admin_pin: str = "",
+        server_address: str = "",
+        server_device_token: str = "",
+        cache_backup_reminder_days: int = 7,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -367,56 +368,70 @@ class OptionsDialog(QDialog):
         server_enabled_label = QLabel("Remote Server")
         server_enabled_label.setFixedWidth(100)
         server_enabled_row.addWidget(server_enabled_label)
-        self._server_enabled_checkbox = QCheckBox("Auto-start on launch")
+        self._server_enabled_checkbox = QCheckBox("Auto-connect on launch")
         self._server_enabled_checkbox.setChecked(bool(server_enabled))
         self._server_enabled_checkbox.setToolTip(
-            "When enabled, the LAN remote-control server starts automatically when the app opens. "
-            "It can always be started/stopped manually from the Server menu."
+            "When enabled, the desktop app automatically connects to the remote-control server "
+            "when it opens. It can always be connected/disconnected manually from the Server menu."
         )
         server_enabled_row.addWidget(self._server_enabled_checkbox)
         server_enabled_row.addStretch()
         root.addLayout(server_enabled_row)
 
-        server_port_row = QHBoxLayout()
-        server_port_label = QLabel("Server Port")
-        server_port_label.setFixedWidth(100)
-        server_port_row.addWidget(server_port_label)
-        self._server_port_spin = QSpinBox()
-        self._server_port_spin.setRange(1024, 65535)
-        self._server_port_spin.setValue(max(1024, min(65535, int(server_port))))
-        self._server_port_spin.setToolTip("Non-standard TCP port the remote-control server listens on.")
-        self._server_port_spin.setMinimumWidth(160)
-        server_port_row.addWidget(self._server_port_spin)
-        server_port_row.addStretch()
-        root.addLayout(server_port_row)
+        server_address_row = QHBoxLayout()
+        server_address_label = QLabel("Server Address")
+        server_address_label.setFixedWidth(100)
+        server_address_row.addWidget(server_address_label)
+        self._server_address_edit = QLineEdit(str(server_address or ""))
+        self._server_address_edit.setPlaceholderText("e.g. jingles.brianpclark.com or 192.168.1.50:47030")
+        self._server_address_edit.setMinimumWidth(220)
+        server_address_row.addWidget(self._server_address_edit)
+        server_address_row.addStretch()
+        root.addLayout(server_address_row)
 
-        server_pin_row = QHBoxLayout()
-        server_pin_label = QLabel("Guest PIN")
-        server_pin_label.setFixedWidth(100)
-        server_pin_row.addWidget(server_pin_label)
-        self._server_pin_edit = QLineEdit(str(server_pin or ""))
-        self._server_pin_edit.setPlaceholderText("Lets guests browse/preview in their own browser only")
-        self._server_pin_edit.setMinimumWidth(160)
-        server_pin_row.addWidget(self._server_pin_edit)
-        server_pin_row.addStretch()
-        root.addLayout(server_pin_row)
+        server_token_row = QHBoxLayout()
+        server_token_label = QLabel("Device Token")
+        server_token_label.setFixedWidth(100)
+        server_token_row.addWidget(server_token_label)
+        self._server_device_token_edit = QLineEdit(str(server_device_token or ""))
+        self._server_device_token_edit.setPlaceholderText("From 'jingleserver adddevice <label>' on the server")
+        self._server_device_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._server_device_token_edit.setMinimumWidth(220)
+        server_token_row.addWidget(self._server_device_token_edit)
+        server_token_row.addStretch()
+        root.addLayout(server_token_row)
 
-        server_admin_pin_row = QHBoxLayout()
-        server_admin_pin_label = QLabel("Admin PIN")
-        server_admin_pin_label.setFixedWidth(100)
-        server_admin_pin_row.addWidget(server_admin_pin_label)
-        self._server_admin_pin_edit = QLineEdit(str(server_admin_pin or ""))
-        self._server_admin_pin_edit.setPlaceholderText("Required to control the real Live/Preview output remotely")
-        self._server_admin_pin_edit.setMinimumWidth(160)
-        server_admin_pin_row.addWidget(self._server_admin_pin_edit)
-        server_admin_pin_row.addStretch()
-        root.addLayout(server_admin_pin_row)
+        server_test_row = QHBoxLayout()
+        server_test_spacer = QLabel("")
+        server_test_spacer.setFixedWidth(100)
+        server_test_row.addWidget(server_test_spacer)
+        test_connection_btn = QPushButton("Test Connection")
+        test_connection_btn.clicked.connect(self._on_test_connection_clicked)
+        server_test_row.addWidget(test_connection_btn)
+        self._server_test_result_label = QLabel("")
+        self._server_test_result_label.setWordWrap(True)
+        server_test_row.addWidget(self._server_test_result_label, 1)
+        root.addLayout(server_test_row)
+
+        cache_reminder_row = QHBoxLayout()
+        cache_reminder_label = QLabel("Cache Backup")
+        cache_reminder_label.setFixedWidth(100)
+        cache_reminder_row.addWidget(cache_reminder_label)
+        self._cache_backup_reminder_spin = QSpinBox()
+        self._cache_backup_reminder_spin.setRange(1, 90)
+        self._cache_backup_reminder_spin.setValue(max(1, min(90, int(cache_backup_reminder_days))))
+        self._cache_backup_reminder_spin.setSuffix(" day(s) between reminders")
+        self._cache_backup_reminder_spin.setMinimumWidth(220)
+        cache_reminder_row.addWidget(self._cache_backup_reminder_spin)
+        cache_reminder_row.addStretch()
+        root.addLayout(cache_reminder_row)
 
         refresh_btn = QPushButton("Refresh Devices")
         refresh_btn.clicked.connect(self._on_refresh_clicked)
         refresh_row = QHBoxLayout()
         refresh_row.addWidget(refresh_btn)
         refresh_row.addStretch()
+
 
         root.addLayout(refresh_row)
 
@@ -693,14 +708,26 @@ class OptionsDialog(QDialog):
     def selected_server_enabled(self) -> bool:
         return bool(self._server_enabled_checkbox.isChecked())
 
-    def selected_server_port(self) -> int:
-        return max(1024, min(65535, int(self._server_port_spin.value())))
+    def selected_server_address(self) -> str:
+        return self._server_address_edit.text().strip()
 
-    def selected_server_pin(self) -> str:
-        return self._server_pin_edit.text().strip()
+    def selected_server_device_token(self) -> str:
+        return self._server_device_token_edit.text().strip()
 
-    def selected_server_admin_pin(self) -> str:
-        return self._server_admin_pin_edit.text().strip()
+    def selected_cache_backup_reminder_days(self) -> int:
+        return max(1, min(90, int(self._cache_backup_reminder_spin.value())))
+
+    def _on_test_connection_clicked(self) -> None:
+        address = self.selected_server_address()
+        token = self.selected_server_device_token()
+        if not address or not token:
+            self._server_test_result_label.setText("Enter a Server Address and Device Token first.")
+            return
+        self._server_test_result_label.setText("Testing...")
+        QApplication.processEvents()
+        ok, message = _remote_server.test_connection(address, token)
+        prefix = "✓" if ok else "✗"
+        self._server_test_result_label.setText(f"{prefix} {message}")
 
 
     def selected_sample_pad_streaming_min_seconds(self) -> int:
@@ -1158,8 +1185,8 @@ class RemoteDiagnosticsDialog(QDialog):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Remote Server Diagnostics")
-        self.resize(720, 520)
+        self.setWindowTitle("Remote Relay Diagnostics")
+        self.resize(720, 480)
         self._snapshot_provider = snapshot_provider
 
         root = QVBoxLayout(self)
@@ -1168,16 +1195,9 @@ class RemoteDiagnosticsDialog(QDialog):
         self._status_label.setWordWrap(True)
         root.addWidget(self._status_label)
 
-        root.addWidget(QLabel("Connected Clients", self))
-        self._clients_table = QTableWidget(0, 2, self)
-        self._clients_table.setHorizontalHeaderLabels(["IP Address", "Connected Since"])
-        self._clients_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self._clients_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        root.addWidget(self._clients_table, 1)
-
-        root.addWidget(QLabel("Recent Requests", self))
-        self._log_table = QTableWidget(0, 5, self)
-        self._log_table.setHorizontalHeaderLabels(["Time", "IP Address", "Action", "Target", "Result"])
+        root.addWidget(QLabel("Recent Relayed Commands", self))
+        self._log_table = QTableWidget(0, 4, self)
+        self._log_table.setHorizontalHeaderLabels(["Time", "Action", "Target", "Result"])
         self._log_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self._log_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         root.addWidget(self._log_table, 2)
@@ -1195,34 +1215,30 @@ class RemoteDiagnosticsDialog(QDialog):
 
     def refresh(self) -> None:
         snapshot = self._snapshot_provider()
-        running = bool(snapshot.get("running", False))
-        port = snapshot.get("port", 0)
+        connected = bool(snapshot.get("connected", False))
+        address = str(snapshot.get("address", ""))
         last_error = str(snapshot.get("last_error", ""))
-        if running:
-            self._status_label.setText(f"Server running on port {port}.")
-        elif last_error:
-            self._status_label.setText(f"Server stopped. Last error: {last_error}")
-        else:
-            self._status_label.setText("Server stopped.")
-
-        clients = snapshot.get("clients", [])
-        self._clients_table.setRowCount(len(clients))
-        for row, (_client_id, info) in enumerate(clients):
-            connected_at = float(info.get("connected_at", 0.0))
+        reconnect_count = int(snapshot.get("reconnect_count", 0))
+        if connected:
+            connected_at = float(snapshot.get("connected_at", 0.0))
             timestamp = time.strftime("%H:%M:%S", time.localtime(connected_at)) if connected_at else ""
-            self._clients_table.setItem(row, 0, QTableWidgetItem(str(info.get("ip", ""))))
-            self._clients_table.setItem(row, 1, QTableWidgetItem(timestamp))
+            self._status_label.setText(f"Connected to {address} since {timestamp}. Reconnects: {reconnect_count}.")
+        elif last_error:
+            self._status_label.setText(
+                f"Not connected. Last error: {last_error} (reconnect attempts: {reconnect_count})"
+            )
+        else:
+            self._status_label.setText("Not connected.")
 
         log_entries = snapshot.get("log", [])
         self._log_table.setRowCount(len(log_entries))
         for row, entry in enumerate(log_entries):
             timestamp = time.strftime("%H:%M:%S", time.localtime(float(entry.get("time", 0.0))))
-            result_text = "OK" if entry.get("ok") else f"Denied: {entry.get('detail', '')}"
+            result_text = "OK" if entry.get("ok") else f"Failed: {entry.get('detail', '')}"
             self._log_table.setItem(row, 0, QTableWidgetItem(timestamp))
-            self._log_table.setItem(row, 1, QTableWidgetItem(str(entry.get("ip", ""))))
-            self._log_table.setItem(row, 2, QTableWidgetItem(str(entry.get("action", ""))))
-            self._log_table.setItem(row, 3, QTableWidgetItem(str(entry.get("target", ""))))
-            self._log_table.setItem(row, 4, QTableWidgetItem(result_text))
+            self._log_table.setItem(row, 1, QTableWidgetItem(str(entry.get("action", ""))))
+            self._log_table.setItem(row, 2, QTableWidgetItem(str(entry.get("target", ""))))
+            self._log_table.setItem(row, 3, QTableWidgetItem(result_text))
 
     def closeEvent(self, event) -> None:  # noqa: ANN001 - Qt override signature
         self._refresh_timer.stop()

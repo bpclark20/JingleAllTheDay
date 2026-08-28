@@ -1,238 +1,220 @@
 # JingleAllTheDay Remote Control API
 
-This document describes the LAN remote-control HTTP/WebSocket API exposed by the
-desktop app (`remote_server.py`), used by the bundled web client under
-[webclient/](webclient/) and available to any other client on the same network.
-
-## Overview
-
-- **Transport**: plain HTTP (no TLS) on a configurable, non-standard TCP port.
-  Not intended for exposure beyond a trusted LAN.
-- **Default port**: `8765` (Options > Server Port). Changeable at runtime; a
-  restart of the server (Server menu, or automatically on port change) is
-  required to rebind.
-- **Enable/disable**: Options > "Auto-start on launch" controls whether the
-  server starts automatically when the app opens. It can always be
-  started/stopped/restarted manually from the **Server** menu regardless of
-  that setting.
-- **Auth model**: two shared PINs, set in Options — **Guest PIN** and **Admin
-  PIN**. Status and library browsing are public/read-only (no PIN required).
-  Anything that changes playback requires a PIN; which PIN was sent decides
-  the caller's **role** (`admin` or `user`/guest, see [Roles](#roles) below).
-  If neither PIN is configured, all control endpoints return `403`.
-- **Content type**: all request/response bodies are JSON.
-
-## Roles
-
-Every PIN-protected request is evaluated server-side against both configured
-PINs to resolve a role — the client never gets to declare its own role:
-
-- **`admin`** — PIN matches the Admin PIN. Full legacy behavior: `POST
-  /api/playback/output` and the `live` flag on `POST /api/playback/play`
-  actually change the desktop app's real output device, exactly as before
-  this feature existed.
-- **`user`** (guest) — PIN matches the Guest PIN. Guests can never change the
-  host's real Live/Preview device routing, even by calling the API directly:
-  - `POST /api/playback/output` never touches the host; it only reports
-    whether the requested mode is currently allowed (see below).
-  - `POST /api/playback/play` ignores the request's `live` flag and always
-    plays through the host at the host's *actual current* Live/Preview state.
-  - Guests are expected to preview jingles locally in their own browser via
-    `GET /api/audio` instead (see [Local preview](#local-preview-guest-only)).
-
-**Admin PIN has no fallback.** If the Admin PIN is left blank, nobody gets
-the `admin` role — not even Guest PIN holders. Leave it blank to keep every
-remote user in guest/preview-only mode.
-
-## Authentication
-
-Control endpoints (everything under `/api/playback/*`) require the header:
+This document describes the remote-control architecture as of the
+jingleserver relay redesign: the desktop app no longer hosts an inbound
+server. Instead it dials **out** to a middleman server called
+**jingleserver** (see [jingleserver/](jingleserver/)), and browsers talk to
+jingleserver too. jingleserver relays commands between the two.
 
 ```
-X-Remote-Pin: <pin>
+Browser  <--HTTP/WS, session cookie-->  jingleserver  <--WebSocket, device token-->  Desktop app
+(webclient/)                            (jingleserver/)                              (remote_server.py)
 ```
 
-Behavior:
-- No PIN configured in Options → `403 { "ok": false, "error": "Set a PIN in Options to enable remote control." }`
-- Wrong/missing header value (matches neither PIN) → `403 { "ok": false, "error": "Invalid or missing PIN." }`
-- `GET /api/status` and `GET /api/library` never require the PIN.
+- The desktop app is always the one initiating the connection (outbound),
+  so no port-forwarding is needed on the jingle machine's network.
+- jingleserver is a standalone Python/FastAPI service you run on a server
+  you control (see [jingleserver/README.md](jingleserver/README.md) for
+  setup, the CLI, systemd unit, and Caddy reverse-proxy config).
+- Real user accounts (username/password, role `admin` or `user`) replace
+  the old shared PINs for the web app. A separate per-machine **device
+  token** (issued via `jingleserver adddevice`) authenticates the desktop
+  app's connection to jingleserver.
 
-Use `POST /api/login` (see below) to resolve which role a PIN has *before*
-sending it on every subsequent request — useful for a client to decide how
-to present the Live/Preview toggle and Play button.
+## Desktop app configuration
 
-Every control request (successful or rejected) is recorded in the in-app
-Server > Diagnostics log with the caller's IP, action, target, and result.
+Tools > Options > Remote Server:
 
-## Endpoints
+- **Auto-connect on launch** — whether the app dials jingleserver
+  automatically on startup (Server menu always has manual Connect/
+  Disconnect/Reconnect regardless of this setting).
+- **Server Address** — jingleserver's host, e.g. `jingles.brianpclark.com`
+  or `192.168.1.50:47030`. Bare hosts default to `wss://`; you can specify
+  `ws://host:port` explicitly for a plain (non-TLS) LAN jingleserver.
+- **Device Token** — from `jingleserver adddevice <label>` on the server.
+- **Test Connection** — attempts a one-shot handshake against the
+  configured address/token and reports success/failure inline.
+- **Cache Backup** reminder interval — see [Offline cache](#offline-cache).
+
+## Desktop ↔ jingleserver: agent protocol
+
+WebSocket endpoint: `wss://<jingleserver>/agent/connect`.
+
+1. Desktop connects and sends a JSON hello frame:
+   ```json
+   { "token": "<device token>", "label": "my-hostname" }
+   ```
+2. jingleserver validates the token against its `devices` table. On success
+   it replies `{ "type": "ack", "ok": true }`; on failure it closes the
+   socket (code `4401`). A new agent connection always replaces any
+   previously connected one (only one jingle machine drives the webapp at a
+   time in this version).
+3. After the ack, both JSON text frames and binary frames flow over the
+   same connection:
+
+   **jingleserver → desktop** (JSON text): a command envelope
+   ```json
+   { "type": "command", "id": 42, "action": "play", "kwargs": { "path": "...", "loop_mode": "off", "live": true } }
+   ```
+   Actions: `play`, `toggle_pause`, `stop`, `set_loop_mode`, `set_live_mode`,
+   `get_library`, `get_audio` (see [Audio streaming](#audio-streaming-guest-local-preview)
+   for why `get_audio` doesn't use the normal response shape).
+
+   **desktop → jingleserver** (JSON text): a matching reply
+   ```json
+   { "type": "response", "id": 42, "data": { "ok": true, "state": "playing", "...": "..." } }
+   ```
+
+   **desktop → jingleserver** (JSON text, unsolicited, ~4×/sec): a status push
+   ```json
+   { "type": "status", "data": { "state": "playing", "is_live_mode": true, "current_name": "...", "current_path": "...", "position_seconds": 3.4, "duration_seconds": 9.2, "loop_mode": "off" } }
+   ```
+
+Desktop-side implementation: `remote_server.py`'s `RemoteRelayClient` (background
+asyncio thread, reconnects with backoff 1s→30s on any failure). Incoming
+commands are marshaled onto the Qt main thread via `RemoteServerBridge`
+using `Qt.ConnectionType.BlockingQueuedConnection`, calling the same
+`MainWindow.remote_*` methods the old inbound server used
+(`remote_play`, `remote_get_status`, `remote_get_library`, etc.) — only the
+transport changed, not the desktop-side playback integration surface.
+
+## Browser ↔ jingleserver: web API
+
+All endpoints are served by jingleserver (`jingleserver/jsrv/web.py`), which
+also hosts the static webclient (`webclient/`) at `/`.
+
+### Authentication
+
+Session-cookie based (`jsid`, httponly + secure + `SameSite=Lax`), backed by
+a server-side `sessions` table (so `jingleserver deluser`/`setrole` can
+revoke access immediately — no stateless tokens to wait out).
+
+- `POST /api/login` — body `{ "username": "...", "password": "..." }`.
+  Sets the session cookie. Response: `{ "ok": true, "username", "role" }`
+  (role is `admin` or `user`) or `401`.
+- `POST /api/logout` — clears the session.
+- `GET /api/session` — `{ "authenticated": true, "username", "role" }` or
+  `{ "authenticated": false }`. Used by the webclient on load to decide
+  whether to show the login screen or the app.
+
+All other `/api/*` endpoints below require a valid session (`401` if not
+authenticated).
 
 ### `GET /api/status`
 
-Public. Returns the current now-playing snapshot (same shape pushed over the
-WebSocket — see [Status object](#status-object)).
-
-### `GET /api/library`
-
-Public. Query parameters (all optional):
-
-| Param           | Type   | Default | Meaning                                                    |
-|-----------------|--------|---------|--------------------------------------------------------------|
-| `search`        | string | `""`    | Free-text query.                                            |
-| `scope`         | string | `all`   | Where to match: `all`, `name`, `tag`, or `path`.             |
-| `category`      | string | `""`    | Comma/semicolon-separated category filter.                  |
-| `category_mode` | string | `any`   | `any` (OR) or `all` (AND) match against `category`.          |
-| `limit`         | int    | `200`   | Max items to return. `0` means "all matching items".        |
-| `offset`        | int    | `0`     | Pagination offset into the filtered result set.              |
-
-This mirrors the exact search/filter semantics used by the desktop library
-table (same `filter_jingle_records()` helper), so a search here matches what
-you'd see typing the same query into the desktop app.
-
-Response:
-
-```json
-{
-  "total": 2727,
-  "items": [
-    {
-      "path": "C:\\Users\\me\\Samples\\Applause.mp3",
-      "name": "Applause",
-      "folder": "Samples",
-      "categories": ["sound effect"],
-      "duration_seconds": 9.24,
-      "size_bytes": 152034
-    }
-  ]
-}
-```
-
-`total` is the count of items matching the filter (before `limit`/`offset`
-are applied), so clients can page with `offset += limit` until
-`offset >= total`.
-
-### `POST /api/login`
-
-Public (body-based, not header-based — used to *discover* a role before
-sending a PIN as a header elsewhere). Request body:
-
-```json
-{ "pin": "1234" }
-```
-
-Response: `{ "ok": true, "role": "admin" | "user" }` or
-`{ "ok": false, "error": "Invalid PIN." }`.
-
-### `GET /api/audio`
-
-**PIN required** (either Guest or Admin PIN). Streams the raw audio bytes for
-a jingle so a client can play it locally (e.g. in an HTML `<audio>` element)
-without affecting the desktop app at all.
-
-```
-GET /api/audio?path=C%3A%5CUsers%5Cme%5CSamples%5CApplause.mp3
-X-Remote-Pin: 1234
-```
-
-`path` must exactly match a `path` from `/api/library` — the server
-validates it against the scanned library index (not raw filesystem access),
-so arbitrary files outside the library can't be read this way. Returns the
-file bytes with a guessed `Content-Type`, or `404` if the path doesn't match
-a known jingle.
-
-### `POST /api/playback/play`
-
-**PIN required.** Selects the jingle by path, applies loop mode and Live/
-Preview mode, then starts playback (equivalent to selecting the row and
-pressing Play in the desktop app).
-
-Request body:
-
-```json
-{
-  "path": "C:\\Users\\me\\Samples\\Applause.mp3",
-  "loop_mode": "off",
-  "live": true
-}
-```
-
-| Field       | Type   | Default | Notes                                             |
-|-------------|--------|---------|----------------------------------------------------|
-| `path`      | string | —       | Must exactly match a `path` from `/api/library`.   |
-| `loop_mode` | string | `"off"` | `off`, `loop`, or `continuous`.                    |
-| `live`      | bool   | `true`  | `true` = Live output, `false` = Preview output. **Admin PIN only** — guest requests always play at the host's actual current Live/Preview state regardless of this field. |
-
-Response: `{ "ok": true, ...status }` on success, or
-`{ "ok": false, "error": "not_found" | "missing_file" | "playback_failed" }`.
-
-### `POST /api/playback/pause`
-
-**PIN required.** No body. Toggles pause/resume (same as pressing the
-Play/Pause button while something is playing or paused). Response:
-`{ "ok": true, ...status }`.
-
-### `POST /api/playback/stop`
-
-**PIN required.** No body. Stops playback entirely. Response:
-`{ "ok": true, ...status }`.
-
-### `POST /api/playback/mode`
-
-**PIN required.** Sets the loop mode explicitly (not a cycle/toggle).
-
-```json
-{ "loop_mode": "loop" }
-```
-
-`loop_mode` must be `off`, `loop`, or `continuous`. Response:
-`{ "ok": true, ...status }`.
-
-### `POST /api/playback/output`
-
-**PIN required.** Behavior depends on role:
-
-- **Admin**: sets Live/Preview mode explicitly, changing the real device —
-  identical to the legacy behavior.
-- **Guest**: never changes the real device. Requesting `live: true` while the
-  host is currently in Preview is rejected with an error the client should
-  surface as an alert; requesting `live: false` (or `live: true` while the
-  host is already Live) is acknowledged as `ok` and only affects the guest's
-  own local toggle/UI state.
-
-```json
-{ "live": false }
-```
-
-Response (admin): `{ "ok": <applied>, ...status }`. `ok` is `false` if
-Preview mode was requested but is currently disabled (Live and Preview
-devices are the same in Options).
-
-Response (guest, denied): `{ "ok": false, "error": "Cannot switch to Live - the Host hasn't engaged Live mode yet.", ...status }`.
-
-Response (guest, allowed): `{ "ok": true, ...status }`.
-
-### Local preview (guest only)
-
-When a guest's local toggle is set to Preview, the bundled web client never
-calls `/api/playback/play` — it instead fetches `GET /api/audio` for the
-selected jingle and plays it in the browser via a hidden `<audio>` element,
-so the desktop app and its real output are completely unaffected. Play/
-Pause/Stop in that state control the local `<audio>` element rather than the
-remote endpoints. If the guest flips their toggle to Live (only meaningful
-once the host is actually Live), Play goes back to calling
-`/api/playback/play` normally.
+If no desktop agent is connected: `{ "agent_connected": false }`.
+Otherwise: `{ "agent_connected": true, ...status }` (see
+[Status object](#status-object)) — served from jingleserver's cached copy of
+the agent's last status push, so this never blocks on the agent.
 
 ### `WS /ws/status`
 
-Public, no PIN. On connect, the server registers the client (IP + connect
-time) in Server > Diagnostics, then pushes a [status object](#status-object)
-as a JSON text frame roughly every 250 ms until the connection closes.
-Clients should reconnect (with backoff) on close/error — the bundled web
-client retries every 2 seconds.
+Same payload shape as `GET /api/status`, pushed every ~500ms. Requires the
+session cookie to be present at handshake time (closes with code `4401`
+otherwise).
+
+### `GET /api/library`
+
+Query params: `search`, `scope` (`all`/`name`/`tag`/`path`), `category`,
+`category_mode` (`any`/`all`), `limit` (default 200, `0` = all), `offset`.
+These are relayed verbatim to the desktop's `remote_get_library()`, so
+search semantics match the desktop app's own library table exactly.
+
+- **Agent connected**: `{ "agent_connected": true, "total": N, "items": [...] }`,
+  each item `{ path, name, folder, categories, duration_seconds, size_bytes }`.
+- **Agent not connected**: falls back to jingleserver's offline cache —
+  `{ "agent_connected": false, "offline": true, "generated_at": <epoch>, "items": [...] }`
+  (items here have `{ name, categories, duration_seconds, cached_audio_relpath }`
+  — no live `path`, since there's no agent to resolve one against). If
+  nothing has ever been cached: `{ "agent_connected": false, "offline": true, "items": [], "message": "no jingle machine currently connected" }`.
+
+### `POST /api/playback/play` / `pause` / `stop` / `mode` / `output`
+
+Same request/response contract as the pre-relay API (bodies below), relayed
+to the connected agent. `409 { "ok": false, "error": "agent_not_connected" }`
+if no desktop app is connected; `504 { "ok": false, "error": "agent_timeout" }`
+if the agent doesn't answer in time.
+
+- `POST /api/playback/play` — `{ "path": "...", "loop_mode": "off", "live": true }`.
+  For non-admin users, `live` is always overridden server-side to the host's
+  actual current `is_live_mode` (guests can never force real Live/Preview
+  routing, even via a crafted request).
+- `POST /api/playback/pause` / `POST /api/playback/stop` — no body.
+- `POST /api/playback/mode` — `{ "loop_mode": "off" | "loop" | "continuous" }`.
+  Rejected (`403`) for non-admins while the host is in Preview (guests only
+  mirror the host's loop mode while actually riding the host's Live output).
+- `POST /api/playback/output` — `{ "live": true|false }`. Admins actually
+  change the host's device routing. Non-admins never touch the real device:
+  requesting `live: true` while the host isn't already Live is rejected
+  (`403`); anything else is acknowledged as a no-op affecting only the
+  caller's own local UI state.
+
+### Audio streaming (guest local preview)
+
+`GET /api/audio?path=<library path>` (agent-connected/live item) or
+`GET /api/audio?cached_relpath=<relpath>` (offline-cache item, from an
+`/api/library` item's `cached_audio_relpath`).
+
+This intentionally streams progressively instead of buffering the whole
+file, so large jingles (100MB+) start playing immediately instead of after
+a full download:
+
+1. If the file is already cached on jingleserver's disk (`cache/audio/`),
+   it's served directly via `FileResponse`, which supports HTTP Range
+   requests natively (instant seek, minimal latency).
+2. Otherwise, if an agent is connected, jingleserver asks it to stream the
+   file: the desktop app sends the bytes over the *same* `/agent/connect`
+   WebSocket in 64KB **binary** frames (each prefixed with a 4-byte
+   big-endian request id, so multiple concurrent previews never get their
+   chunks crossed), bracketed by JSON control frames
+   `{ "type": "audio_start", "id", "size", "content_type" }` and
+   `{ "type": "audio_end", "id" }` (or `{ "type": "audio_error", "id", "error" }`).
+   jingleserver forwards each chunk to the browser as it arrives
+   (`StreamingResponse`) while simultaneously writing it to
+   `cache/audio/live_<sha256(path)>.<ext>` — so only the *first* guest to
+   preview a given file pays the round-trip through the agent; everyone
+   after gets the fast Range-capable path above.
+3. `409` if neither a cache entry nor a connected agent is available.
+
+The webclient plays this by pointing `<audio src>` straight at the endpoint
+(no `fetch`/`blob()` — letting the browser's own HTTP client handle
+progressive buffering and Range requests is what makes large-file preview
+start quickly).
+
+## Offline mode (no agent connected)
+
+When a user is logged in but no jingle machine is connected:
+
+- The webclient shows an offline banner with a **Refresh** button and
+  disables all playback controls (Play buttons aren't even rendered).
+- The library still displays from jingleserver's cache (see
+  `GET /api/library` above) if one exists; otherwise a "no jingle machine
+  currently connected" message is shown.
+- As soon as a desktop app connects, `agent_connected` flips to `true` on
+  the next status push/library fetch and the webapp returns to full live
+  control automatically.
+
+## Offline cache
+
+jingleserver persists a jingle library snapshot + the audio files
+themselves under `JINGLESERVER_CACHE_DIR` (`cache/library_cache.json` +
+`cache/audio/`), so guests can still browse (and preview, once cached) the
+library while no jingle machine is connected.
+
+- **Desktop app**: File > "Offline Cache Backup..." (enabled only while
+  connected) uploads every existing jingle file plus a manifest to
+  jingleserver via `POST /agent/cache/file?relpath=...` and
+  `POST /agent/cache/manifest` (both authenticated with the `X-Device-Token`
+  header, not the session cookie — these are agent-to-server calls, not
+  browser calls).
+- A reminder dialog (Options > Cache Backup interval, default 7 days) offers
+  **Backup Now** / **Remind me in 24 hours** / **Ignore for N days**.
+- The write-through cache described in
+  [Audio streaming](#audio-streaming-guest-local-preview) also populates
+  this same cache incrementally as guests preview jingles live, independent
+  of the manual backup action.
 
 ## Status object
-
-Returned by `GET /api/status`, embedded in every `/api/playback/*` response,
-and streamed over `/ws/status`:
 
 ```json
 {
@@ -261,22 +243,30 @@ and streamed over `/ws/status`:
 - Mirrors **main window** playback only: library search/browse, play/pause/
   stop, loop/continuous, Live/Preview, and progress. Sample Pads and
   Playlists are not exposed through this API.
-- No TLS, no per-client accounts — two shared PINs (Guest/Admin) gate control
-  actions and resolve a role server-side. Treat this as a trusted-LAN
-  convenience feature, not a hardened public API.
+- Only one desktop agent can drive the webapp at a time (v1 scope); the
+  `devices` table supports issuing multiple device tokens for future
+  multi-machine support, but jingleserver only tracks one "current" agent
+  connection.
+- jingleserver should bind to `127.0.0.1` only, with Caddy (or another
+  reverse proxy) terminating TLS and forwarding the public domain to it —
+  see [jingleserver/README.md](jingleserver/README.md).
 
 ## Example (curl)
 
 ```bash
-# Browse/search (no PIN needed)
-curl "http://192.168.1.50:8765/api/library?search=applause&limit=10"
-
-# Play a jingle (PIN required)
-curl -X POST "http://192.168.1.50:8765/api/playback/play" \
+# Log in (stores the session cookie in cookies.txt)
+curl -c cookies.txt -X POST "https://jingles.brianpclark.com/api/login" \
   -H "Content-Type: application/json" \
-  -H "X-Remote-Pin: 1234" \
+  -d '{"username": "brian", "password": "..."}'
+
+# Browse/search
+curl -b cookies.txt "https://jingles.brianpclark.com/api/library?search=applause&limit=10"
+
+# Play a jingle
+curl -b cookies.txt -X POST "https://jingles.brianpclark.com/api/playback/play" \
+  -H "Content-Type: application/json" \
   -d '{"path": "C:\\Users\\me\\Samples\\Applause.mp3", "loop_mode": "off", "live": true}'
 
 # Stop
-curl -X POST "http://192.168.1.50:8765/api/playback/stop" -H "X-Remote-Pin: 1234"
+curl -b cookies.txt -X POST "https://jingles.brianpclark.com/api/playback/stop"
 ```
