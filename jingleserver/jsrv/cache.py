@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from typing import Any
 from . import config
 
 _MANIFEST_NAME = "library_cache.json"
+_CACHE_ID_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 def manifest_path() -> Path:
@@ -59,8 +61,35 @@ def save_audio_file(relpath: str, content: bytes) -> Path:
 
 def live_cache_relpath(path: str) -> str:
     """Stable, path-derived filename for write-through caching of live agent-streamed audio."""
-    suffix = Path(path).suffix
-    return "live_" + hashlib.sha256(path.encode("utf-8")).hexdigest() + suffix
+    return "live_" + cache_id_for_path(path) + Path(path).suffix
+
+
+def preview_cache_relpath(cache_id: str) -> str:
+    """Stable M4A cache filename for a user-facing compressed preview."""
+    return "preview_" + cache_id + ".m4a"
+
+
+def cache_id_for_path(path: str) -> str:
+    """Return the opaque, stable browser identifier for a library path."""
+    return hashlib.sha256(path.encode("utf-8")).hexdigest()
+
+
+def is_valid_cache_id(cache_id: str) -> bool:
+    return bool(_CACHE_ID_PATTERN.fullmatch(cache_id))
+
+
+def find_manifest_item(cache_id: str) -> dict[str, Any] | None:
+    """Resolve a browser cache ID to its private manifest record, if present."""
+    if not is_valid_cache_id(cache_id):
+        return None
+    manifest = read_manifest()
+    if manifest is None:
+        return None
+    for item in manifest.get("items", []):
+        path = item.get("path")
+        if isinstance(path, str) and cache_id_for_path(path) == cache_id:
+            return item
+    return None
 
 
 def is_traversal_unsafe(relpath: str) -> bool:

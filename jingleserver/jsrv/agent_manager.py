@@ -171,7 +171,11 @@ class AgentManager:
         try:
             async with self._send_lock:
                 await self._socket.send_json({"type": "command", "id": req_id, "action": "get_audio", "kwargs": {"path": path}})
-            meta = await asyncio.wait_for(meta_future, timeout=config.AGENT_COMMAND_TIMEOUT_SECONDS)
+            meta = await asyncio.wait_for(meta_future, timeout=config.AGENT_AUDIO_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError as exc:
+            self._audio_queues.pop(req_id, None)
+            self._audio_meta.pop(req_id, None)
+            raise AgentCommandTimeout() from exc
         except Exception as exc:
             self._audio_queues.pop(req_id, None)
             self._audio_meta.pop(req_id, None)
@@ -183,9 +187,9 @@ class AgentManager:
             try:
                 while True:
                     try:
-                        item = await asyncio.wait_for(queue.get(), timeout=config.AGENT_COMMAND_TIMEOUT_SECONDS)
+                        item = await asyncio.wait_for(queue.get(), timeout=config.AGENT_AUDIO_TIMEOUT_SECONDS)
                     except asyncio.TimeoutError as exc:
-                        raise AgentNotConnected() from exc
+                        raise AgentCommandTimeout() from exc
                     if item is None:
                         return
                     if isinstance(item, BaseException):

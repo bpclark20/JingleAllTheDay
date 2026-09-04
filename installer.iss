@@ -1,7 +1,7 @@
 #define MyAppId "{{CB8F471A-B9B6-49D6-A975-FC0F9FF7C67F}}"
 #define MyAppName "JingleAllTheDay"
 #ifndef MyAppVersion
-  #define MyAppVersion "1.9.1.071326"
+  #define MyAppVersion "2.0.0.090426"
 #endif
 #define MyAppPublisher "Brian Clark"
 #define MyAppExeName "JingleAllTheDay.exe"
@@ -42,7 +42,11 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional icons:"; Flags: unchecked
 
 [Files]
-Source: "{#SourceRoot}\\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
+; Package the PyInstaller dist output only. The Excludes list is a guard for a
+; mispointed -SourceDir (e.g. the repo root): server-side code (jingleserver,
+; webclient) is deployed manually and must never ship in the desktop installer.
+; Each directory needs both "name" and "name\*" forms to exclude its contents.
+Source: "{#SourceRoot}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion; Excludes: "jingleserver,jingleserver\*,webclient,webclient\*,sequences,sequences\*,.venv,.venv\*,.git,.git\*,.vscode,.vscode\*,build,build\*,dist,dist\*,installer,installer\*,__pycache__,__pycache__\*,*.pyc,*.pyo,*.spec,installer.iss"
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

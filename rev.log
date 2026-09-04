@@ -1,3 +1,10 @@
+## 2.0.0.090426
+- New remote control feature added.
+- New Control API (REMOTE_API.md) to allow a remote server to behave as a middle man for controlling the application remotely.
+- Remote control web server will also allow a user to preview jingles even when the jingle machine is offline.
+- Improved remote control security with authentication and access control mechanisms.
+- Offline Cache Backup functionality in desktop application. Use to backup jingles to the remote server for offline preview functionality to work.
+
 ## 1.9.1.071326
 - Dark mode support added.
 

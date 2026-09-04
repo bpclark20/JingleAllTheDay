@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QKeySequenceEdit,
     QSizePolicy,
@@ -1176,6 +1177,92 @@ class RevisionHistoryDialog(QDialog):
         buttons.rejected.connect(self.reject)
         buttons.accepted.connect(self.accept)
         root.addWidget(buttons)
+
+
+class OfflineCacheBackupDialog(QDialog):
+    def __init__(
+        self,
+        progress_provider: Callable[[], dict[str, Any]],
+        start_callback: Callable[[], None],
+        cancel_callback: Callable[[], None],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Offline Cache Backup")
+        self.setMinimumWidth(560)
+        self.setModal(False)
+        self._progress_provider = progress_provider
+        self._start_callback = start_callback
+        self._cancel_callback = cancel_callback
+
+        root = QVBoxLayout(self)
+        self._summary_label = QLabel("Ready to back up the jingle library to the remote cache.", self)
+        self._summary_label.setWordWrap(True)
+        root.addWidget(self._summary_label)
+
+        self._progress_bar = QProgressBar(self)
+        self._progress_bar.setRange(0, 1)
+        self._progress_bar.setValue(0)
+        root.addWidget(self._progress_bar)
+
+        self._detail_label = QLabel("Click Start to begin.", self)
+        self._detail_label.setWordWrap(True)
+        root.addWidget(self._detail_label)
+
+        buttons = QDialogButtonBox(self)
+        self._start_button = buttons.addButton("Start", QDialogButtonBox.ButtonRole.AcceptRole)
+        self._cancel_button = buttons.addButton("Cancel", QDialogButtonBox.ButtonRole.RejectRole)
+        self._start_button.clicked.connect(self._on_start)
+        self._cancel_button.clicked.connect(self._on_cancel)
+        root.addWidget(buttons)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(150)
+        self._timer.timeout.connect(self.refresh)
+
+    def _on_start(self) -> None:
+        self._start_button.setEnabled(False)
+        self._cancel_button.setText("Cancel Backup")
+        self._start_callback()
+        self._timer.start()
+        self.refresh()
+
+    def _on_cancel(self) -> None:
+        progress = self._progress_provider()
+        if not progress.get("running"):
+            self.reject()
+            return
+        self._cancel_button.setEnabled(False)
+        self._cancel_button.setText("Cancelling...")
+        self._detail_label.setText("Cancelling after the current file finishes...")
+        self._cancel_callback()
+
+    def refresh(self) -> None:
+        progress = self._progress_provider()
+        total = max(1, int(progress.get("total", 0)))
+        completed = min(total, int(progress.get("completed", 0)))
+        self._progress_bar.setRange(0, total)
+        self._progress_bar.setValue(completed)
+        self._summary_label.setText(
+            f"{completed} of {int(progress.get('total', 0))} files processed | "
+            f"{int(progress.get('uploaded', 0))} uploaded | "
+            f"{int(progress.get('skipped', 0))} already up to date"
+        )
+        self._detail_label.setText(str(progress.get("detail", "Preparing...")))
+        if not progress.get("running") and progress.get("started"):
+            self._timer.stop()
+
+    def finish(self) -> None:
+        self._timer.stop()
+        self.accept()
+
+    def closeEvent(self, event) -> None:  # noqa: ANN001 - Qt override signature
+        if self._progress_provider().get("running"):
+            self._on_cancel()
+            event.ignore()
+            return
+        self._timer.stop()
+        super().closeEvent(event)
 
 
 class RemoteDiagnosticsDialog(QDialog):

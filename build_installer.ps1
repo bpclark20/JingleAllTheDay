@@ -2,6 +2,7 @@ param(
     [string]$OutRoot = "$env:LOCALAPPDATA\JingleAllTheDay\pyinstaller",
     [string]$SourceDir = "",
     [string]$ScriptPath = (Join-Path $PSScriptRoot "installer.iss"),
+    # Empty = auto-detect from app.py's APP_VERSION (single source of truth).
     [string]$AppVersion = "",
     [string]$OutputDir = (Join-Path $PSScriptRoot "installer")
 )

@@ -189,6 +189,20 @@ def relay_http_base_url(address: str) -> str:
     return candidate.rstrip("/").removesuffix("/agent/connect")
 
 
+def cache_relpath_for_path(path: str) -> str:
+    """Deterministic cache filename for a jingle's library path.
+
+    Must exactly match jingleserver's `jsrv.cache.live_cache_relpath()` so that a file
+    uploaded via Offline Cache Backup lands in the same cache slot jingleserver's own
+    write-through live-preview cache would use for that same path - letting `/api/audio`
+    find it whether it got there via a manual backup or a prior live preview.
+    """
+    import hashlib
+
+    suffix = Path(path).suffix
+    return "live_" + hashlib.sha256(path.encode("utf-8")).hexdigest() + suffix
+
+
 def test_connection(address: str, device_token: str, timeout: float = 6.0) -> tuple[bool, str]:
     """Synchronous one-shot connectivity check used by the Options dialog's Test Connection button."""
     if websockets is None:

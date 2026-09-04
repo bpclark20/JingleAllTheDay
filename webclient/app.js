@@ -35,7 +35,7 @@
   const localAudio = document.getElementById("local-audio");
 
   let currentRole = null;
-  let currentPath = "";
+  let currentCacheId = "";
   let pageOffset = 0;
   let pageTotal = 0;
   let agentConnected = false;
@@ -156,12 +156,14 @@
     if (connected) {
       offlineBanner.classList.add("hidden");
     } else {
+      lastHostIsLive = false;
       offlineMessage.textContent = offlineText || "No jingle machine currently connected for control.";
       offlineBanner.classList.remove("hidden");
-      if (localPreviewActive) {
+      if (changed && localPreviewActive) {
         stopLocalPreview();
       }
     }
+    renderModeButton();
     updateControlsEnabled();
     if (changed) {
       fetchLibrary();
@@ -172,7 +174,7 @@
     const enabled = agentConnected;
     btnPause.disabled = !enabled && !localPreviewActive;
     btnStop.disabled = !enabled && !localPreviewActive;
-    btnLoop.disabled = !enabled;
+    btnLoop.disabled = false;
     btnLive.disabled = !enabled;
   }
 
@@ -250,7 +252,7 @@
       renderPlayButton();
       return;
     }
-    currentPath = status.current_path || "";
+    currentCacheId = status.current_cache_id || "";
     npName.textContent = status.current_name || "Nothing playing";
     const duration = status.duration_seconds || 0;
     const position = status.position_seconds || 0;
@@ -269,7 +271,7 @@
   }
 
   function isMirroringHost() {
-    return currentRole === "admin" || guestLiveIntent;
+    return agentConnected && (currentRole === "admin" || guestLiveIntent);
   }
 
   function renderLoopButton() {
@@ -303,7 +305,7 @@
 
   function highlightPlayingRow() {
     document.querySelectorAll(".library-item").forEach((el) => {
-      el.classList.toggle("playing", el.dataset.path === currentPath);
+      el.classList.toggle("playing", el.dataset.cacheId === currentCacheId);
     });
   }
 
@@ -344,41 +346,52 @@
   // -------------------------------------------------------------------------
 
   function triggerPlay(item) {
-    if (!agentConnected) {
+    if (!item.cache_id) {
+      showStatus("This jingle isn't available for preview.", true);
       return;
     }
-    if (currentRole !== "admin" && !guestLiveIntent) {
-      startLocalPreview(item);
+    // Only mirror the real host's Live/Preview output when a jingle machine is actually
+    // connected; otherwise (offline, or a guest not mirroring the host) always fall back to
+    // browser-local preview - which works from the jingleserver cache even with no agent.
+    if (agentConnected && isMirroringHost()) {
+      callControl("/api/playback/play", {
+        cache_id: item.cache_id,
+        loop_mode: btnLoop.dataset.mode || "off",
+        live: btnLive.dataset.live !== "false",
+      });
       return;
     }
-    callControl("/api/playback/play", {
-      path: item.path,
-      loop_mode: btnLoop.dataset.mode || "off",
-      live: btnLive.dataset.live !== "false",
-    });
+    startLocalPreview(item);
   }
 
   function startLocalPreview(item) {
     // The <audio> element fetches directly from /api/audio so the browser can progressively
     // buffer/stream large jingles instead of waiting for a full blob download before playback.
+    // This works whether the jingle machine is connected (live relay) or not (served from
+    // jingleserver's offline cache), as long as the jingle has been cached at least once.
+    const audioUrl = `/api/audio/${encodeURIComponent(item.cache_id)}`;
     localPreviewBuffering = true;
-    localAudio.src = `/api/audio?path=${encodeURIComponent(item.path)}`;
+    localAudio.src = audioUrl;
     localAudio.loop = localLoopMode === "loop";
     localPreviewActive = true;
-    localPreviewIndex = currentLibraryItems.findIndex((entry) => entry.path === item.path);
-    currentPath = item.path;
+    localPreviewIndex = currentLibraryItems.findIndex((entry) => entry.cache_id === item.cache_id);
+    currentCacheId = item.cache_id;
     npName.textContent = `${item.name} (buffering\u2026)`;
     npName.classList.add("buffering");
     highlightPlayingRow();
     updateControlsEnabled();
     renderPlayButton();
-    localAudio.play().catch(() => {
+    localAudio.play().catch((error) => {
       localPreviewBuffering = false;
       localPreviewActive = false;
       npName.classList.remove("buffering");
       updateControlsEnabled();
       renderPlayButton();
-      showStatus("Could not preview jingle in browser.", true);
+      if (error.name === "NotAllowedError") {
+        showStatus("Browser playback was blocked. Tap Play again.", true);
+      } else {
+        showStatus("Preview could not start. The audio file may be unavailable or unsupported.", true);
+      }
     });
   }
 
@@ -430,7 +443,7 @@
     if (!localPreviewActive) return;
     localPreviewBuffering = false;
     npName.classList.remove("buffering");
-    const item = currentLibraryItems.find((entry) => entry.path === currentPath);
+    const item = currentLibraryItems.find((entry) => entry.cache_id === currentCacheId);
     npName.textContent = item ? `${item.name} (local preview)` : "Local preview";
     renderPlayButton();
   });
@@ -455,8 +468,8 @@
     for (const item of items) {
       const row = document.createElement("div");
       row.className = "library-item";
-      row.dataset.path = item.path || "";
-      row.title = agentConnected ? "Double-click to play" : "";
+      row.dataset.cacheId = item.cache_id || "";
+      row.title = item.cache_id ? "Double-click to play" : "";
 
       const info = document.createElement("div");
       info.className = "info";
@@ -465,13 +478,12 @@
       name.textContent = item.name;
       const meta = document.createElement("div");
       meta.className = "meta";
-      const folderPart = item.folder ? `${item.folder} • ` : "";
-      meta.textContent = `${folderPart}${formatSeconds(item.duration_seconds)}`;
+      meta.textContent = formatSeconds(item.duration_seconds);
       info.appendChild(name);
       info.appendChild(meta);
       row.appendChild(info);
 
-      if (agentConnected) {
+      if (item.cache_id) {
         const playBtn = document.createElement("button");
         playBtn.textContent = "Play";
         playBtn.addEventListener("click", () => triggerPlay(item));
@@ -505,8 +517,24 @@
   }
 
   let searchDebounce = null;
+
+  function filterOfflineLibrary(items, query, limit, offset) {
+    const search = query.trim().toLocaleLowerCase();
+    const matches = !search
+      ? items
+      : items.filter((item) => {
+          const haystack = [item.name || "", ...(item.categories || [])].join(" ").toLocaleLowerCase();
+          return haystack.includes(search);
+        });
+    return {
+      items: limit > 0 ? matches.slice(offset, offset + limit) : matches.slice(offset),
+      total: matches.length,
+    };
+  }
+
   async function fetchLibrary() {
-    const search = encodeURIComponent(searchInput.value.trim());
+    const searchText = searchInput.value.trim();
+    const search = encodeURIComponent(searchText);
     const limit = currentPageSize();
     try {
       const response = await fetch(`/api/library?search=${search}&limit=${limit}&offset=${pageOffset}`);
@@ -516,9 +544,15 @@
       }
       const data = await response.json();
       setAgentConnected(Boolean(data.agent_connected));
-      pageTotal = data.total || (data.items || []).length;
-      renderLibrary(data.items || []);
-      const shown = (data.items || []).length;
+      let items = data.items || [];
+      pageTotal = data.total || items.length;
+      if (!data.agent_connected && searchText && !data.offline_filter_applied) {
+        const fallback = filterOfflineLibrary(items, searchText, limit, pageOffset);
+        items = fallback.items;
+        pageTotal = fallback.total;
+      }
+      renderLibrary(items);
+      const shown = items.length;
       if (agentConnected) {
         librarySummary.textContent = `Showing ${shown} of ${pageTotal} jingles`;
       } else if (shown === 0) {
@@ -587,10 +621,10 @@
   });
 
   btnLoop.addEventListener("click", () => {
-    if (!agentConnected) return;
     const order = ["off", "loop", "continuous"];
     const next = order[(order.indexOf(btnLoop.dataset.mode || "off") + 1) % order.length];
-    if (!isMirroringHost()) {
+    if (!(agentConnected && isMirroringHost())) {
+      // No host to mirror (offline, or not admin/mirroring) - loop mode is purely local state.
       localLoopMode = next;
       renderLoopButton();
       if (localPreviewActive) {

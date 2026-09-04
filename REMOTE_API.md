@@ -57,7 +57,7 @@ WebSocket endpoint: `wss://<jingleserver>/agent/connect`.
    { "type": "command", "id": 42, "action": "play", "kwargs": { "path": "...", "loop_mode": "off", "live": true } }
    ```
    Actions: `play`, `toggle_pause`, `stop`, `set_loop_mode`, `set_live_mode`,
-   `get_library`, `get_audio` (see [Audio streaming](#audio-streaming-guest-local-preview)
+   `get_library`, `get_audio` (see [Audio streaming](#audio-streaming-guest-local-preview-works-offline-too)
    for why `get_audio` doesn't use the normal response shape).
 
    **desktop → jingleserver** (JSON text): a matching reply
@@ -121,12 +121,13 @@ These are relayed verbatim to the desktop's `remote_get_library()`, so
 search semantics match the desktop app's own library table exactly.
 
 - **Agent connected**: `{ "agent_connected": true, "total": N, "items": [...] }`,
-  each item `{ path, name, folder, categories, duration_seconds, size_bytes }`.
+  each item `{ cache_id, name, categories, duration_seconds, size_bytes }`.
 - **Agent not connected**: falls back to jingleserver's offline cache —
   `{ "agent_connected": false, "offline": true, "generated_at": <epoch>, "items": [...] }`
-  (items here have `{ name, categories, duration_seconds, cached_audio_relpath }`
-  — no live `path`, since there's no agent to resolve one against). If
-  nothing has ever been cached: `{ "agent_connected": false, "offline": true, "items": [], "message": "no jingle machine currently connected" }`.
+  (items here have `{ name, path, categories, duration_seconds }` — the same
+  `path` field as the online shape, so the webclient can request
+  `GET /api/audio?path=...` identically whether an agent is connected or
+  not). If nothing has ever been cached: `{ "agent_connected": false, "offline": true, "items": [], "message": "no jingle machine currently connected" }`.
 
 ### `POST /api/playback/play` / `pause` / `stop` / `mode` / `output`
 
@@ -135,7 +136,7 @@ to the connected agent. `409 { "ok": false, "error": "agent_not_connected" }`
 if no desktop app is connected; `504 { "ok": false, "error": "agent_timeout" }`
 if the agent doesn't answer in time.
 
-- `POST /api/playback/play` — `{ "path": "...", "loop_mode": "off", "live": true }`.
+- `POST /api/playback/play` — `{ "cache_id": "...", "loop_mode": "off", "live": true }`.
   For non-admin users, `live` is always overridden server-side to the host's
   actual current `is_live_mode` (guests can never force real Live/Preview
   routing, even via a crafted request).
@@ -149,19 +150,23 @@ if the agent doesn't answer in time.
   (`403`); anything else is acknowledged as a no-op affecting only the
   caller's own local UI state.
 
-### Audio streaming (guest local preview)
+### Audio streaming (guest local preview, works offline too)
 
-`GET /api/audio?path=<library path>` (agent-connected/live item) or
-`GET /api/audio?cached_relpath=<relpath>` (offline-cache item, from an
-`/api/library` item's `cached_audio_relpath`).
+`GET /api/audio/<cache_id>` — the opaque ID returned by `/api/library`.
+The server resolves the ID to its private library record, so browsers cannot
+request arbitrary desktop paths. This intentionally streams progressively instead of buffering the
+whole file, so large jingles (100MB+) start playing immediately instead of
+after a full download, and works even with **no agent connected** as long
+as the file has been cached at least once:
 
-This intentionally streams progressively instead of buffering the whole
-file, so large jingles (100MB+) start playing immediately instead of after
-a full download:
-
-1. If the file is already cached on jingleserver's disk (`cache/audio/`),
-   it's served directly via `FileResponse`, which supports HTTP Range
-   requests natively (instant seek, minimal latency).
+1. jingleserver first checks for a cached copy at
+   `cache/audio/live_<sha256(path)>.<ext>` — a deterministic name computed
+   from `path` alone, used both by the write-through live-preview cache
+   *and* by the desktop app's manual Offline Cache Backup (see
+   [Offline cache](#offline-cache)), so either path populates the same
+   cache slot. If found, it's served directly via `FileResponse`, which
+   supports HTTP Range requests natively (instant seek, minimal latency,
+   and works with no agent connected at all).
 2. Otherwise, if an agent is connected, jingleserver asks it to stream the
    file: the desktop app sends the bytes over the *same* `/agent/connect`
    WebSocket in 64KB **binary** frames (each prefixed with a 4-byte
@@ -170,23 +175,42 @@ a full download:
    `{ "type": "audio_start", "id", "size", "content_type" }` and
    `{ "type": "audio_end", "id" }` (or `{ "type": "audio_error", "id", "error" }`).
    jingleserver forwards each chunk to the browser as it arrives
-   (`StreamingResponse`) while simultaneously writing it to
-   `cache/audio/live_<sha256(path)>.<ext>` — so only the *first* guest to
-   preview a given file pays the round-trip through the agent; everyone
-   after gets the fast Range-capable path above.
-3. `409` if neither a cache entry nor a connected agent is available.
+   (`StreamingResponse`, with an explicit `Content-Length` header taken from
+   `audio_start`'s `size` — this, rather than chunked transfer-encoding, is
+   what lets browsers such as Safari/iOS treat it as a normal progressive
+   download instead of buffering the whole response before starting
+   playback) while simultaneously writing it to the same `live_<sha256(path)>`
+   cache path above — so only the *first* preview of a given file ever pays
+   the round-trip through the agent.
+3. `404 jingle_not_found` for an unknown ID, `409 agent_not_connected` if a
+  known jingle is neither cached nor connected, and `504 agent_audio_timeout`
+  if the relay cannot begin a transfer in time. Cached responses include
+  `X-Jingle-Cache: hit` and `X-Jingle-Cache-Bytes` diagnostic headers.
 
 The webclient plays this by pointing `<audio src>` straight at the endpoint
 (no `fetch`/`blob()` — letting the browser's own HTTP client handle
 progressive buffering and Range requests is what makes large-file preview
-start quickly).
+start quickly), and always attempts local preview for Play when not
+actively mirroring a connected host's Live output — including with no
+agent connected at all, so cached jingles remain previewable while the
+jingle machine is offline.
+
+For `user` accounts only, cached lossless sources (WAV, FLAC, AIFF, ALAC, or
+PCM) are converted once on jingleserver to a 96 kbps AAC/M4A preview and the
+converted copy is reused for later browser-local previews. This reduces LTE
+startup time and transfer size. `admin` accounts always receive the original
+cached file. The Ubuntu host requires `ffmpeg`; if it is unavailable or a
+conversion fails, the server logs a warning and safely serves the original.
 
 ## Offline mode (no agent connected)
 
 When a user is logged in but no jingle machine is connected:
 
-- The webclient shows an offline banner with a **Refresh** button and
-  disables all playback controls (Play buttons aren't even rendered).
+- The webclient shows an offline banner with a **Refresh** button.
+- Playback control of the real jingle machine (pause/stop/loop/Live-Preview
+  mode) is disabled, since there's no host to control — but **Play still
+  works** for any jingle that's been cached (see [Offline cache](#offline-cache)
+  below), via the same browser-local preview path guests normally use.
 - The library still displays from jingleserver's cache (see
   `GET /api/library` above) if one exists; otherwise a "no jingle machine
   currently connected" message is shown.
@@ -198,21 +222,31 @@ When a user is logged in but no jingle machine is connected:
 
 jingleserver persists a jingle library snapshot + the audio files
 themselves under `JINGLESERVER_CACHE_DIR` (`cache/library_cache.json` +
-`cache/audio/`), so guests can still browse (and preview, once cached) the
-library while no jingle machine is connected.
+`cache/audio/`), so guests can still browse **and preview** the library
+while no jingle machine is connected.
 
 - **Desktop app**: File > "Offline Cache Backup..." (enabled only while
-  connected) uploads every existing jingle file plus a manifest to
-  jingleserver via `POST /agent/cache/file?relpath=...` and
-  `POST /agent/cache/manifest` (both authenticated with the `X-Device-Token`
-  header, not the session cookie — these are agent-to-server calls, not
-  browser calls).
+  connected) uploads jingle files plus a manifest to jingleserver. It's
+  incremental: `GET /agent/cache/status` first returns `{ "files": { "<relpath>": <size_bytes>, ... } }`
+  for everything already cached, and the desktop app skips re-uploading any
+  file whose deterministic cache relpath (`live_<sha256(path)>.<ext>`,
+  matching [Audio streaming](#audio-streaming-guest-local-preview-works-offline-too)'s
+  scheme) already exists there with a matching size — only new or
+  changed files are actually uploaded via `POST /agent/cache/file?relpath=...`.
+  A final `POST /agent/cache/manifest` always re-submits the full current
+  item list (including unchanged/skipped ones) so the offline library
+  listing stays accurate. All three endpoints are authenticated with the
+  `X-Device-Token` header, not the session cookie — these are
+  agent-to-server calls, not browser calls. A popup on the desktop app
+  reports how many files were uploaded vs. already up to date.
 - A reminder dialog (Options > Cache Backup interval, default 7 days) offers
   **Backup Now** / **Remind me in 24 hours** / **Ignore for N days**.
 - The write-through cache described in
-  [Audio streaming](#audio-streaming-guest-local-preview) also populates
-  this same cache incrementally as guests preview jingles live, independent
-  of the manual backup action.
+  [Audio streaming](#audio-streaming-guest-local-preview-works-offline-too)
+  also populates this same cache incrementally as guests preview jingles
+  live, independent of the manual backup action — both paths use the same
+  deterministic `live_<sha256(path)>` naming, so they converge on one
+  cache entry per jingle regardless of how it got there.
 
 ## Status object
 
@@ -233,7 +267,7 @@ library while no jingle machine is connected.
 | `state`             | string  | `stopped`, `playing`, `paused`             |
 | `is_live_mode`      | bool    | `true` = Live output, `false` = Preview    |
 | `current_name`      | string  | Jingle name, `""` when nothing is loaded   |
-| `current_path`      | string  | Full path, `""` when nothing is loaded     |
+| `current_cache_id`  | string  | Opaque ID, omitted when nothing is loaded   |
 | `position_seconds`  | number  | Current playback position                 |
 | `duration_seconds`  | number  | Clip/track duration                        |
 | `loop_mode`         | string  | `off`, `loop`, `continuous`                |

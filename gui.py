@@ -40,6 +40,7 @@ from app_helpers import (
 from dialogs import (
     AboutDialog,
     AudioDiagnosticsDialog,
+    OfflineCacheBackupDialog,
     OptionsDialog,
     SAMPLE_PAD_BLOCKSIZE_OPTIONS,
     format_audio_device_label as _format_audio_device_label,
@@ -269,6 +270,7 @@ class MainWindow(
     _sample_pad_hotkey_requested = pyqtSignal(int)
     _sample_pad_release_requested = pyqtSignal(int)
     _sample_pad_board_switch_requested = pyqtSignal(int)
+    _cache_backup_finished = pyqtSignal(object, object)
 
     def __init__(self, app_name: str = DEFAULT_APP_NAME, app_version: str = DEFAULT_APP_VERSION) -> None:
         super().__init__()
@@ -732,6 +734,7 @@ class MainWindow(
         self._sample_pad_hotkey_requested.connect(self._on_sample_pad_hotkey_requested)
         self._sample_pad_release_requested.connect(self._on_sample_pad_hotkey_released)
         self._sample_pad_board_switch_requested.connect(self._on_sample_pad_board_switch_requested)
+        self._cache_backup_finished.connect(self._on_cache_backup_finished)
         if self._sample_pad_global_hotkeys_enabled:
             self._set_sample_pad_global_hotkeys(True)
 
@@ -1092,8 +1095,11 @@ class MainWindow(
     def _update_offline_cache_backup_action_enabled(self) -> None:
         if hasattr(self, "_offline_cache_backup_action"):
             connected = hasattr(self, "_remote_manager") and self._remote_manager.is_connected()
-            running = getattr(self, "_cache_backup_thread", None) is not None
-            self._offline_cache_backup_action.setEnabled(connected and not running)
+            active = (
+                getattr(self, "_cache_backup_thread", None) is not None
+                or getattr(self, "_cache_backup_dialog", None) is not None
+            )
+            self._offline_cache_backup_action.setEnabled(connected and not active)
 
     def _on_file_offline_cache_backup(self) -> None:
         if not hasattr(self, "_remote_manager") or not self._remote_manager.is_connected():
@@ -1101,36 +1107,96 @@ class MainWindow(
                 self, "Offline Cache Backup", "Connect to a remote-control server first (Server menu)."
             )
             return
-        if getattr(self, "_cache_backup_thread", None) is not None:
-            self._status.showMessage("Offline cache backup is already running.")
+        if getattr(self, "_cache_backup_dialog", None) is not None:
+            self._status.showMessage("Offline cache backup is already open.")
             return
-        self._status.showMessage("Offline cache backup started...")
+        self._cache_backup_cancel_event = threading.Event()
+        self._cache_backup_progress_lock = threading.Lock()
+        self._cache_backup_progress: dict[str, Any] = {
+            "started": False,
+            "running": False,
+            "total": 0,
+            "completed": 0,
+            "uploaded": 0,
+            "skipped": 0,
+            "detail": "Click Start to begin.",
+        }
+        self._cache_backup_dialog = OfflineCacheBackupDialog(
+            self._cache_backup_progress_snapshot,
+            self._start_offline_cache_backup,
+            self._cancel_offline_cache_backup,
+            self,
+        )
+        self._cache_backup_dialog.finished.connect(self._on_cache_backup_dialog_closed)
         self._update_offline_cache_backup_action_enabled()
+        self._cache_backup_dialog.show()
+
+    def _cache_backup_progress_snapshot(self) -> dict[str, Any]:
+        with self._cache_backup_progress_lock:
+            return dict(self._cache_backup_progress)
+
+    def _update_cache_backup_progress(self, **changes: Any) -> None:
+        with self._cache_backup_progress_lock:
+            self._cache_backup_progress.update(changes)
+
+    def _start_offline_cache_backup(self) -> None:
+        if getattr(self, "_cache_backup_thread", None) is not None:
+            return
+        self._update_cache_backup_progress(started=True, running=True, detail="Checking remote cache...")
+        self._status.showMessage("Offline cache backup started...")
 
         def _worker() -> None:
             try:
-                count = self._perform_offline_cache_backup()
+                result = self._perform_offline_cache_backup(
+                    self._update_cache_backup_progress,
+                    self._cache_backup_cancel_event,
+                )
             except Exception as exc:  # noqa: BLE001 - surface any failure to the user
-                QTimer.singleShot(0, lambda exc=exc: self._on_cache_backup_finished(None, exc))
+                self._cache_backup_finished.emit(None, exc)
                 return
-            QTimer.singleShot(0, lambda count=count: self._on_cache_backup_finished(count, None))
+            self._cache_backup_finished.emit(result, None)
 
         self._cache_backup_thread = threading.Thread(target=_worker, name="jatd-cache-backup", daemon=True)
         self._cache_backup_thread.start()
 
-    def _on_cache_backup_finished(self, count: int | None, exc: Exception | None) -> None:
+    def _cancel_offline_cache_backup(self) -> None:
+        self._cache_backup_cancel_event.set()
+        self._update_cache_backup_progress(detail="Cancelling after the current file finishes...")
+
+    def _on_cache_backup_finished(self, result: dict[str, Any] | None, exc: Exception | None) -> None:
         self._cache_backup_thread = None
+        self._update_cache_backup_progress(running=False)
         self._update_offline_cache_backup_action_enabled()
+        dialog = getattr(self, "_cache_backup_dialog", None)
+        if dialog is not None:
+            dialog.finish()
         if exc is not None:
             QMessageBox.warning(self, "Offline Cache Backup Failed", str(exc))
+            return
+        if result is None:
+            return
+        if result.get("cancelled"):
+            self._status.showMessage("Offline cache backup cancelled.")
             return
         now = time.time()
         self._cache_backup_last_epoch = now
         self._settings.setValue("server/lastCacheBackupEpoch", now)
-        self._status.showMessage(f"Offline cache backup complete: {count} jingle(s) uploaded.")
+        summary = (
+            f"{result['uploaded']} uploaded, {result['skipped']} already up to date "
+            f"({result['total']} jingle(s) cached total)."
+        )
+        self._status.showMessage(f"Offline cache backup complete: {summary}")
+        QMessageBox.information(self, "Offline Cache Backup Complete", summary)
 
-    def _perform_offline_cache_backup(self) -> int:
-        import re
+    def _on_cache_backup_dialog_closed(self) -> None:
+        self._cache_backup_dialog = None
+        self._update_offline_cache_backup_action_enabled()
+
+    def _perform_offline_cache_backup(
+        self,
+        report_progress: Callable[..., None],
+        cancel_event: threading.Event,
+    ) -> dict[str, Any]:
         import urllib.error
         import urllib.parse
         import urllib.request
@@ -1144,30 +1210,71 @@ class MainWindow(
 
         base_url = _remote_server.relay_http_base_url(self._server_address)
         headers = {"X-Device-Token": self._server_device_token}
+
+        status_request = urllib.request.Request(f"{base_url}/agent/cache/status", headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(status_request, timeout=30) as response:
+                existing_files: dict[str, int] = json.loads(response.read()).get("files", {})
+        except urllib.error.HTTPError as exc:
+            _raise_with_detail(exc, "Could not read existing cache status")
+
+        records = [record for record in self._records if record.path.exists()]
+        report_progress(total=len(records), completed=0, detail="Comparing local files with the remote cache...")
         manifest_items: list[dict[str, Any]] = []
         uploaded = 0
-        for index, record in enumerate(self._records):
-            if not record.path.exists():
-                continue
-            safe_name = re.sub(r"[^A-Za-z0-9_.\-]", "_", record.path.name)
-            relpath = f"{index:05d}_{safe_name}"
-            data = record.path.read_bytes()
-            url = f"{base_url}/agent/cache/file?relpath={urllib.parse.quote(relpath)}"
-            request = urllib.request.Request(url, data=data, headers=headers, method="POST")
-            try:
-                with urllib.request.urlopen(request, timeout=30):
-                    pass
-            except urllib.error.HTTPError as exc:
-                _raise_with_detail(exc, f"Upload failed for '{record.name}'")
+        skipped = 0
+        completed = 0
+        for record in records:
+            if cancel_event.is_set():
+                return {"uploaded": uploaded, "skipped": skipped, "total": len(records), "cancelled": True}
+            relpath = _remote_server.cache_relpath_for_path(str(record.path))
+            local_size = record.path.stat().st_size
+            if existing_files.get(relpath) == local_size:
+                skipped += 1
+                detail = f"Up to date: {record.name}"
+            else:
+                report_progress(detail=f"Uploading: {record.name}")
+                data = record.path.read_bytes()
+                url = f"{base_url}/agent/cache/file?relpath={urllib.parse.quote(relpath)}"
+                request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+                try:
+                    with urllib.request.urlopen(request, timeout=30) as response:
+                        confirmed_bytes = json.loads(response.read()).get("bytes")
+                except urllib.error.HTTPError as exc:
+                    _raise_with_detail(exc, f"Upload failed for '{record.name}'")
+                if confirmed_bytes != len(data):
+                    raise RuntimeError(
+                        f"Upload for '{record.name}' was incomplete ({confirmed_bytes} of {len(data)} bytes received) - try again."
+                    )
+                uploaded += 1
+                detail = f"Uploaded: {record.name}"
             manifest_items.append(
                 {
                     "name": record.name,
+                    "path": str(record.path),
                     "categories": list(record.categories),
                     "duration_seconds": record.duration_seconds,
-                    "cached_audio_relpath": relpath,
+                    "size_bytes": local_size,
                 }
             )
-            uploaded += 1
+            completed += 1
+            report_progress(completed=completed, uploaded=uploaded, skipped=skipped, detail=detail)
+        if cancel_event.is_set():
+            return {"uploaded": uploaded, "skipped": skipped, "total": len(records), "cancelled": True}
+        report_progress(detail="Verifying remote cache files...")
+        try:
+            with urllib.request.urlopen(status_request, timeout=30) as response:
+                verified_files: dict[str, int] = json.loads(response.read()).get("files", {})
+        except urllib.error.HTTPError as exc:
+            _raise_with_detail(exc, "Could not verify remote cache status")
+        incomplete = [
+            item["name"]
+            for item in manifest_items
+            if verified_files.get(_remote_server.cache_relpath_for_path(item["path"])) != item["size_bytes"]
+        ]
+        if incomplete:
+            raise RuntimeError(f"Remote cache verification failed for {len(incomplete)} jingle(s): {', '.join(incomplete[:3])}")
+        report_progress(detail="Updating cached library index...")
         manifest_request = urllib.request.Request(
             f"{base_url}/agent/cache/manifest",
             data=json.dumps({"items": manifest_items}).encode("utf-8"),
@@ -1179,7 +1286,7 @@ class MainWindow(
                 pass
         except urllib.error.HTTPError as exc:
             _raise_with_detail(exc, "Manifest upload failed")
-        return uploaded
+        return {"uploaded": uploaded, "skipped": skipped, "total": len(records), "cancelled": False}
 
     def remote_get_status(self) -> dict[str, Any]:
         if self._using_main_playback_engine() and self._main_playback_engine is not None:

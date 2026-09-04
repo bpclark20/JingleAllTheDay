@@ -20,6 +20,28 @@ Default result:
 - App bundle output: `%LOCALAPPDATA%\JingleAllTheDay\pyinstaller\dist`
 - Installer output folder: `./installer`
 
+## Versioning
+
+`APP_VERSION` in `./app.py` is the single source of truth.
+
+When bumping the version:
+1. Update `APP_VERSION` in `./app.py`.
+2. Add the new entry to `./rev.log`.
+3. Update the `#define MyAppVersion` fallback in `./installer.iss` (only used
+   when compiling `installer.iss` directly, without `build_installer.ps1`).
+
+Everything else picks the version up automatically:
+- `build_installer.ps1` parses `APP_VERSION` from `app.py` when `-AppVersion`
+  is not provided, and passes it to Inno Setup via `/DMyAppVersion=`.
+- `JingleAllTheDay.spec` parses `APP_VERSION` from `app.py` to embed the
+  Windows version resource (File Explorer > Properties > Details) in the EXE.
+- The app and About dialog read `APP_VERSION` at runtime.
+
+Note: the EXE's *numeric* file-version fields are 16-bit (max 65535), so the
+date-based build component (e.g. 90426) cannot be represented numerically; the
+numeric quad becomes `2.0.0.0` while the exact string (e.g. `2.0.0.090426`) is
+what the Explorer Details tab displays.
+
 ## Remote Control Server Note
 
 The app no longer hosts an inbound LAN server. Instead it dials **out** to a
@@ -101,10 +123,6 @@ Parameters:
   - Type: string
   - Default: `./installer`
   - Directory where installer executable is written.
-- `-IsccPath`
-  - Type: string
-  - Default: empty (auto-discover)
-  - Optional full path to `ISCC.exe` to bypass auto-discovery.
 
 Implicit inputs:
 - Inno Setup compiler `ISCC.exe` (auto-discovered from common install locations, PATH, registry, or WinGet package folder)
@@ -146,12 +164,6 @@ Set custom output folder:
 .\build_installer.ps1 -OutputDir "D:\releases\JATD"
 ```
 
-Provide explicit Inno Setup compiler path:
-
-```powershell
-.\build_installer.ps1 -IsccPath "C:\Program Files\Inno Setup 6\ISCC.exe"
-```
-
 Full custom example:
 
 ```powershell
@@ -181,7 +193,6 @@ winget install --exact --id JRSoftware.InnoSetup
 ```
 
 - Then restart terminal/VS Code so PATH updates are visible.
-- Or run with `-IsccPath` pointing directly to `ISCC.exe`.
 
 If app version cannot be parsed:
 - Pass `-AppVersion` explicitly.

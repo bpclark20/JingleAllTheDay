@@ -31,6 +31,9 @@ SESSION_TTL_HOURS = int(os.environ.get("JINGLESERVER_SESSION_TTL_HOURS", "12"))
 # How long to wait for the connected desktop agent to answer a relayed command.
 AGENT_COMMAND_TIMEOUT_SECONDS = float(os.environ.get("JINGLESERVER_AGENT_TIMEOUT", "6.0"))
 
+# Audio transfers can legitimately pause while traversing a WAN or cellular link.
+AGENT_AUDIO_TIMEOUT_SECONDS = float(os.environ.get("JINGLESERVER_AGENT_AUDIO_TIMEOUT", "20.0"))
+
 
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
