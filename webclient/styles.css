@@ -115,7 +115,6 @@ body {
   height: 100%;
   width: 0%;
   background: var(--accent);
-  transition: width 0.2s linear;
 }
 
 .np-time {

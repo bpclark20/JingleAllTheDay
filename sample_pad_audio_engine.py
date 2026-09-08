@@ -76,6 +76,52 @@ def _get_ffmpeg_path() -> str | None:
     return _FFMPEG_PATH
 
 
+def _get_ffprobe_path() -> str | None:
+    global _FFPROBE_PATH, _FFPROBE_CHECKED
+    if _FFPROBE_CHECKED:
+        return _FFPROBE_PATH
+    _FFPROBE_CHECKED = True
+    _FFPROBE_PATH = shutil.which("ffprobe")
+    return _FFPROBE_PATH
+
+
+def _probe_duration_seconds(path: str | Path) -> float | None:
+    """Fall back to ffprobe for containers libsndfile cannot read (e.g. .m4a/.aac)."""
+    ffprobe = _get_ffprobe_path()
+    if not ffprobe:
+        return None
+    args = [
+        ffprobe,
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        result = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            creationflags=creation_flags,
+            timeout=2.0,
+            check=False,
+        )
+    except Exception:
+        return None
+    value = (result.stdout or b"").decode("utf-8", errors="ignore").strip()
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Fade length used when a retrigger or stop interrupts an active voice.
 # 2 ms at the output sample rate is imperceptible as silence but long enough
@@ -87,6 +133,8 @@ _MIX_HEADROOM = 0.92
 _STREAMING_MIN_SECONDS = 120.0
 _FFMPEG_PATH: str | None = None
 _FFMPEG_CHECKED = False
+_FFPROBE_PATH: str | None = None
+_FFPROBE_CHECKED = False
 
 
 class _Voice:
@@ -220,7 +268,8 @@ class SamplePadAudioEngine:
         self._pad_mix_settings: dict[int, tuple[float, float, bool, bool]] = {}
         self._pad_meter_levels: dict[int, float] = {}
         self._output_meter_levels: tuple[float, float] = (0.0, 0.0)
-        self._pending_pad_triggers: dict[int, tuple[tuple, float, float, float, bool]] = {}
+        # (decode_key, clip_start_seconds, clip_stop_seconds, volume, loop, start_position_seconds)
+        self._pending_pad_triggers: dict[int, tuple[tuple, float, float, float, bool, float | None]] = {}
         self._streaming_min_seconds: float = _STREAMING_MIN_SECONDS
         self._master_gain: float = 1.0
         self._mixer_enabled: bool = False
@@ -447,8 +496,15 @@ class SamplePadAudioEngine:
         clip_stop_seconds: float = 0.0,
         loop: bool = False,
         pad_index: int = -1,
+        start_position_seconds: float | None = None,
     ) -> None:
-        """Start (or retrigger) playback of *path* as an independent voice."""
+        """Start (or retrigger) playback of *path* as an independent voice.
+
+        *clip_start_seconds*/*clip_stop_seconds* define the loop window; when
+        looping, playback wraps back to *clip_start_seconds*. *start_position_seconds*
+        (defaults to *clip_start_seconds*) is the initial playhead only, so seeking
+        forward mid-clip doesn't move where the loop wraps back to.
+        """
         if not _AVAILABLE or self._stream is None:
             return
 
@@ -469,6 +525,7 @@ class SamplePadAudioEngine:
                 loop=loop,
                 volume=volume,
                 pad_index=pad_index,
+                start_position_seconds=start_position_seconds,
             ):
                 return
 
@@ -483,6 +540,7 @@ class SamplePadAudioEngine:
                         float(clip_stop_seconds),
                         float(volume),
                         bool(loop),
+                        start_position_seconds,
                     )
 
             should_start_worker = False
@@ -511,6 +569,7 @@ class SamplePadAudioEngine:
             loop,
             volume,
             pad_index,
+            start_position_seconds=start_position_seconds,
         )
 
     def stop(self, pad_index: int | None = None) -> None:
@@ -560,13 +619,21 @@ class SamplePadAudioEngine:
         with self._lock:
             pending = self._pending_pad_triggers.get(pad_index)
             if pending is not None:
-                pending_key, clip_start_seconds, clip_stop_seconds, pending_volume, _pending_loop = pending
+                (
+                    pending_key,
+                    clip_start_seconds,
+                    clip_stop_seconds,
+                    pending_volume,
+                    _pending_loop,
+                    pending_start_position,
+                ) = pending
                 self._pending_pad_triggers[pad_index] = (
                     pending_key,
                     clip_start_seconds,
                     clip_stop_seconds,
                     pending_volume,
                     loop_value,
+                    pending_start_position,
                 )
 
             voice_id = self._pad_to_voice.get(pad_index)
@@ -715,7 +782,15 @@ class SamplePadAudioEngine:
 
     def _load_pcm(self, path: str | Path, samplerate: int, channels: int) -> np.ndarray:
         """Read *path*, resample to *samplerate*, and mix to *channels*. Returns float32 (N, channels)."""
-        pcm, sr = sf.read(str(path), dtype="float32", always_2d=True)
+        try:
+            pcm, sr = sf.read(str(path), dtype="float32", always_2d=True)
+        except Exception:
+            # libsndfile has no m4a/AAC decoder; decode via ffmpeg directly at the
+            # target rate/channels so no separate resample step is needed.
+            ffmpeg_pcm = self._load_pcm_via_ffmpeg(path, samplerate, channels)
+            if ffmpeg_pcm is None:
+                raise
+            return ffmpeg_pcm
         # Channel match
         file_ch = pcm.shape[1]
         if file_ch < channels:
@@ -727,6 +802,52 @@ class SamplePadAudioEngine:
         if sr != samplerate:
             pcm = _resample(pcm, sr, samplerate)
         return pcm
+
+    @staticmethod
+    def _load_pcm_via_ffmpeg(path: str | Path, samplerate: int, channels: int) -> np.ndarray | None:
+        ffmpeg = _get_ffmpeg_path()
+        if not ffmpeg:
+            return None
+        args = [
+            ffmpeg,
+            "-v",
+            "error",
+            "-nostdin",
+            "-hide_banner",
+            "-i",
+            str(path),
+            "-f",
+            "f32le",
+            "-acodec",
+            "pcm_f32le",
+            "-ac",
+            str(channels),
+            "-ar",
+            str(samplerate),
+            "pipe:1",
+        ]
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            result = subprocess.run(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                creationflags=creation_flags,
+                check=False,
+            )
+        except Exception:
+            return None
+        raw = result.stdout
+        if not raw:
+            return None
+        bytes_per_frame = 4 * channels
+        usable = len(raw) - (len(raw) % bytes_per_frame)
+        if usable <= 0:
+            return None
+        data = np.frombuffer(raw[:usable], dtype=np.float32)
+        frames = data.size // channels
+        return data[: frames * channels].reshape(frames, channels).copy()
 
     def _close_stream(self) -> None:
         if self._stream is not None:
@@ -837,6 +958,7 @@ class SamplePadAudioEngine:
         loop: bool,
         volume: float,
         pad_index: int,
+        start_position_seconds: float | None = None,
     ) -> None:
         n_frames = pcm.shape[0]
         start_frame = max(0, int(clip_start_seconds * stream_sr))
@@ -845,6 +967,11 @@ class SamplePadAudioEngine:
         if stop_frame <= start_frame:
             start_frame = 0
             stop_frame = n_frames
+
+        # Initial playhead defaults to the loop window start; a seek passes a
+        # later position without moving where the loop wraps back to.
+        pos_seconds = start_frame / stream_sr if start_position_seconds is None else start_position_seconds
+        pos_frame = max(start_frame, min(int(pos_seconds * stream_sr), stop_frame))
 
         with self._lock:
             fade_samples = max(1, int(stream_sr * 0.002))
@@ -865,6 +992,7 @@ class SamplePadAudioEngine:
                 loop=loop,
                 volume=volume,
             )
+            new_voice.pos = pos_frame
             self._voices[voice_id] = new_voice
             if pad_index >= 0:
                 self._pad_to_voice[pad_index] = voice_id
@@ -878,6 +1006,7 @@ class SamplePadAudioEngine:
         loop: bool,
         volume: float,
         pad_index: int,
+        start_position_seconds: float | None = None,
     ) -> bool:
         n_frames = int(stream.frames)
         start_frame = max(0, int(clip_start_seconds * stream_sr))
@@ -887,8 +1016,13 @@ class SamplePadAudioEngine:
             start_frame = 0
             stop_frame = n_frames
 
+        # Initial playhead defaults to the loop window start; a seek passes a
+        # later position without moving where the loop wraps back to.
+        pos_seconds = start_frame / stream_sr if start_position_seconds is None else start_position_seconds
+        pos_frame = max(start_frame, min(int(pos_seconds * stream_sr), stop_frame))
+
         try:
-            stream.seek(start_frame)
+            stream.seek(pos_frame)
         except Exception:
             try:
                 stream.close()
@@ -915,6 +1049,7 @@ class SamplePadAudioEngine:
                 loop=loop,
                 volume=volume,
             )
+            new_voice.pos = pos_frame
             new_voice.max_buffer_frames = max(16384, int(stream_sr * 6.0))
             new_voice.start_buffer_frames = max(4096, int(stream_sr * 0.35))
             self._voices[voice_id] = new_voice
@@ -1038,7 +1173,10 @@ class SamplePadAudioEngine:
             info = sf.info(str(path))
             duration = float(info.frames) / float(info.samplerate or 1)
         except Exception:
-            return False
+            probed = _probe_duration_seconds(path)
+            if probed is None:
+                return False
+            duration = probed
 
         if clip_stop_seconds > 0.0 and clip_stop_seconds > clip_start_seconds:
             duration = max(0.0, float(clip_stop_seconds - clip_start_seconds))
@@ -1113,13 +1251,32 @@ class SamplePadAudioEngine:
         loop: bool,
         volume: float,
         pad_index: int,
+        start_position_seconds: float | None = None,
     ) -> bool:
         if not _AVAILABLE:
             return False
         try:
             info = sf.info(str(path))
         except Exception:
-            return False
+            info = None
+
+        if info is None:
+            # libsndfile can't read this container (e.g. m4a/AAC); use ffprobe for
+            # duration and go straight to ffmpeg pipe streaming below.
+            probed = _probe_duration_seconds(path)
+            if probed is None or probed < self._streaming_min_seconds:
+                return False
+            return self._try_start_ffmpeg_streaming_voice(
+                path=path,
+                stream_sr=stream_sr,
+                clip_start_seconds=clip_start_seconds,
+                clip_stop_seconds=clip_stop_seconds,
+                duration_seconds=probed,
+                loop=loop,
+                volume=volume,
+                pad_index=pad_index,
+                start_position_seconds=start_position_seconds,
+            )
 
         duration_seconds = float(info.frames) / float(info.samplerate or 1)
         if duration_seconds < self._streaming_min_seconds:
@@ -1140,6 +1297,7 @@ class SamplePadAudioEngine:
                     loop,
                     volume,
                     pad_index,
+                    start_position_seconds=start_position_seconds,
                 )
             if stream is not None:
                 try:
@@ -1158,6 +1316,7 @@ class SamplePadAudioEngine:
             loop=loop,
             volume=volume,
             pad_index=pad_index,
+            start_position_seconds=start_position_seconds,
         )
 
     def _try_start_ffmpeg_streaming_voice(
@@ -1170,6 +1329,7 @@ class SamplePadAudioEngine:
         loop: bool,
         volume: float,
         pad_index: int,
+        start_position_seconds: float | None = None,
     ) -> bool:
         ffmpeg = _get_ffmpeg_path()
         if not ffmpeg:
@@ -1183,29 +1343,44 @@ class SamplePadAudioEngine:
             clip_duration = float(duration_seconds - clip_start)
         if clip_duration <= 0.0:
             return False
+        clip_stop = clip_start + clip_duration
 
-        ffmpeg_args = [
-            ffmpeg,
-            "-v",
-            "error",
-            "-nostdin",
-            "-hide_banner",
-            "-ss",
-            f"{clip_start:.6f}",
-            "-i",
-            str(path),
-            "-t",
-            f"{clip_duration:.6f}",
-            "-f",
-            "f32le",
-            "-acodec",
-            "pcm_f32le",
-            "-ac",
-            str(self._stream_channels),
-            "-ar",
-            str(stream_sr),
-            "pipe:1",
-        ]
+        # Loop restarts always replay the full [clip_start, clip_stop) window;
+        # only the initial fetch is trimmed to start at the seek position.
+        start_position = clip_start if start_position_seconds is None else max(
+            clip_start, min(float(start_position_seconds), clip_stop)
+        )
+        start_duration = max(0.0, clip_stop - start_position)
+        if start_duration <= 0.0:
+            start_position = clip_start
+            start_duration = clip_duration
+
+        def _build_ffmpeg_args(ss: float, duration: float) -> list[str]:
+            return [
+                ffmpeg,
+                "-v",
+                "error",
+                "-nostdin",
+                "-hide_banner",
+                "-ss",
+                f"{ss:.6f}",
+                "-i",
+                str(path),
+                "-t",
+                f"{duration:.6f}",
+                "-f",
+                "f32le",
+                "-acodec",
+                "pcm_f32le",
+                "-ac",
+                str(self._stream_channels),
+                "-ar",
+                str(stream_sr),
+                "pipe:1",
+            ]
+
+        ffmpeg_args = _build_ffmpeg_args(start_position, start_duration)
+        loop_restart_args = _build_ffmpeg_args(clip_start, clip_duration)
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         try:
             proc = subprocess.Popen(
@@ -1239,7 +1414,7 @@ class SamplePadAudioEngine:
                 volume=volume,
             )
             voice.ffmpeg_process = proc
-            voice.ffmpeg_args = ffmpeg_args
+            voice.ffmpeg_args = loop_restart_args
             voice.max_buffer_frames = max(16384, int(stream_sr * 6.0))
             voice.start_buffer_frames = max(4096, int(stream_sr * 0.35))
             self._voices[voice_id] = voice
@@ -1268,17 +1443,38 @@ class SamplePadAudioEngine:
             self._cache_inflight.discard(decode_key)
 
         # Collect pads still waiting for this exact decode key, each with its own clip window.
-        pending: list[tuple[int, float, float, float, bool]] = []
+        pending: list[tuple[int, float, float, float, bool, float | None]] = []
         with self._lock:
-            for pad_index, (pending_key, clip_start_seconds, clip_stop_seconds, pending_volume, pending_loop) in list(
-                self._pending_pad_triggers.items()
-            ):
+            for pad_index, (
+                pending_key,
+                clip_start_seconds,
+                clip_stop_seconds,
+                pending_volume,
+                pending_loop,
+                pending_start_position,
+            ) in list(self._pending_pad_triggers.items()):
                 if pending_key == decode_key:
-                    pending.append((pad_index, clip_start_seconds, clip_stop_seconds, pending_volume, pending_loop))
+                    pending.append(
+                        (
+                            pad_index,
+                            clip_start_seconds,
+                            clip_stop_seconds,
+                            pending_volume,
+                            pending_loop,
+                            pending_start_position,
+                        )
+                    )
                     self._pending_pad_triggers.pop(pad_index, None)
 
         # Start each pending trigger only if stream format still matches.
-        for pad_index, clip_start_seconds, clip_stop_seconds, pending_volume, pending_loop in pending:
+        for (
+            pad_index,
+            clip_start_seconds,
+            clip_stop_seconds,
+            pending_volume,
+            pending_loop,
+            pending_start_position,
+        ) in pending:
             if self._stream is None:
                 continue
             if self._stream_samplerate != int(samplerate) or self._stream_channels != int(channels):
@@ -1291,6 +1487,7 @@ class SamplePadAudioEngine:
                 pending_loop,
                 pending_volume,
                 pad_index,
+                start_position_seconds=pending_start_position,
             )
 
     @staticmethod

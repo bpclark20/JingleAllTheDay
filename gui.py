@@ -1368,7 +1368,13 @@ class MainWindow(
             return None
         return record.path
 
-    def remote_play(self, path: str, loop_mode: str = "off", is_live_mode: bool = True) -> dict[str, Any]:
+    def remote_play(
+        self,
+        path: str,
+        loop_mode: str = "off",
+        is_live_mode: bool = True,
+        queue: list[str] | None = None,
+    ) -> dict[str, Any]:
         record_index = self._record_index_for_path(path)
         if record_index is None:
             return {"ok": False, "error": "not_found"}
@@ -1383,7 +1389,7 @@ class MainWindow(
         self._select_record_row(record_index)
 
         if self._playback_mode == "continuous":
-            started = self._start_continuous_playback()
+            started = self._start_remote_continuous_playback(record_index, queue)
         else:
             self._reset_continuous_queue()
             started = self._play_record(record_index)
@@ -1392,6 +1398,31 @@ class MainWindow(
         if not started:
             return {"ok": False, "error": "playback_failed"}
         return {"ok": True, **self.remote_get_status()}
+
+    def _start_remote_continuous_playback(
+        self, record_index: int, queue: list[str] | None
+    ) -> bool:
+        """Start continuous playback ordered by the remote caller's own filtered
+        list (*queue*, a list of paths) rather than the desktop table's current
+        filter, so a remote user's continuous playback advances through what
+        they see. Falls back to the desktop's visible order when no queue is
+        supplied (e.g. an older webclient)."""
+        if queue:
+            resolved: list[int] = []
+            target_position = -1
+            for queued_path in queue:
+                queued_index = self._record_index_for_path(queued_path)
+                if queued_index is None:
+                    continue
+                if queued_index == record_index:
+                    target_position = len(resolved)
+                resolved.append(queued_index)
+            if resolved and target_position >= 0:
+                self._continuous_queue = resolved
+                self._continuous_queue_position = target_position - 1
+                return self._play_next_continuous_record()
+
+        return self._start_continuous_playback()
 
     def remote_toggle_pause(self) -> dict[str, Any]:
         self._on_play_clicked()
@@ -4068,13 +4099,16 @@ class MainWindow(
         clip_stop_seconds = 0.0 if clip_stop_ms < 0 else (clip_stop_ms / 1000.0)
         loop_enabled = self._playback_mode == "loop" or self._sample_pad_looping
 
+        # clip_start_seconds is the loop window's start (unaffected by seeking);
+        # start_position_seconds is where playback begins, e.g. a seek target.
         self._main_playback_engine.trigger(
             path=self._current_playing_path,
             volume=1.0,
-            clip_start_seconds=start_position_ms / 1000.0,
+            clip_start_seconds=clip_start_ms / 1000.0,
             clip_stop_seconds=clip_stop_seconds,
             loop=loop_enabled,
             pad_index=self._main_playback_pad_index,
+            start_position_seconds=start_position_ms / 1000.0,
         )
         self._main_playback_state = "playing"
         self._main_playback_paused_position_ms = start_position_ms

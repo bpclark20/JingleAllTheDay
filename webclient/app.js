@@ -57,6 +57,42 @@
   let searchScope = "all";
   let categoryMode = "any";
 
+  // Host playback position is only pushed every ~0.5s over the status socket;
+  // interpolate between updates on every animation frame so the progress bar
+  // moves smoothly instead of visibly stepping at each update.
+  let hostPosition = 0;
+  let hostDuration = 0;
+  let hostPositionAtMs = 0;
+  let hostPlaying = false;
+
+  function renderPlaybackPosition() {
+    let position = 0;
+    let duration = 0;
+    if (localPreviewActive) {
+      position = localAudio.currentTime || 0;
+      duration = localAudio.duration || 0;
+    } else if (agentConnected) {
+      duration = hostDuration;
+      position = hostPosition;
+      if (hostPlaying) {
+        position += (performance.now() - hostPositionAtMs) / 1000;
+      }
+      if (duration > 0) {
+        position = Math.max(0, Math.min(duration, position));
+      }
+    }
+    const pct = duration > 0 ? Math.min(100, (position / duration) * 100) : 0;
+    npFill.style.width = `${pct}%`;
+    npPosition.textContent = formatSeconds(position);
+    npDuration.textContent = formatSeconds(duration);
+  }
+
+  function playbackPositionAnimationLoop() {
+    renderPlaybackPosition();
+    requestAnimationFrame(playbackPositionAnimationLoop);
+  }
+  requestAnimationFrame(playbackPositionAnimationLoop);
+
   // -------------------------------------------------------------------------
   // Session / login
   // -------------------------------------------------------------------------
@@ -261,12 +297,11 @@
     }
     currentCacheId = status.current_cache_id || "";
     npName.textContent = status.current_name || "Nothing playing";
-    const duration = status.duration_seconds || 0;
-    const position = status.position_seconds || 0;
-    const pct = duration > 0 ? Math.min(100, (position / duration) * 100) : 0;
-    npFill.style.width = `${pct}%`;
-    npPosition.textContent = formatSeconds(position);
-    npDuration.textContent = formatSeconds(duration);
+    hostDuration = status.duration_seconds || 0;
+    hostPosition = status.position_seconds || 0;
+    hostPositionAtMs = performance.now();
+    hostPlaying = (status.state || "stopped") === "playing";
+    renderPlaybackPosition();
 
     lastHostLoopMode = status.loop_mode || "off";
     renderLoopButton();
@@ -361,11 +396,19 @@
     // connected; otherwise (offline, or a guest not mirroring the host) always fall back to
     // browser-local preview - which works from the jingleserver cache even with no agent.
     if (agentConnected && isMirroringHost()) {
-      callControl("/api/playback/play", {
+      const loopMode = btnLoop.dataset.mode || "off";
+      const body = {
         cache_id: item.cache_id,
-        loop_mode: btnLoop.dataset.mode || "off",
+        loop_mode: loopMode,
         live: btnLive.dataset.live !== "false",
-      });
+      };
+      if (loopMode === "continuous") {
+        // Continuous playback must advance through *this* browser's current
+        // filtered/sorted view, not whatever the desktop app's table happens
+        // to show - send it explicitly so the host can build the right queue.
+        body.queue = currentLibraryItems.map((entry) => entry.cache_id);
+      }
+      callControl("/api/playback/play", body);
       return;
     }
     startLocalPreview(item);
@@ -414,16 +457,8 @@
     refreshStatusOnce();
   }
 
-  localAudio.addEventListener("timeupdate", () => {
-    if (!localPreviewActive) return;
-    const duration = localAudio.duration || 0;
-    const position = localAudio.currentTime || 0;
-    const pct = duration > 0 ? Math.min(100, (position / duration) * 100) : 0;
-    npFill.style.width = `${pct}%`;
-    npPosition.textContent = formatSeconds(position);
-    npDuration.textContent = formatSeconds(duration);
-  });
-
+  // Position/duration display for local preview is driven continuously by
+  // the playbackPositionAnimationLoop rAF loop; timeupdate isn't needed for that.
   localAudio.addEventListener("ended", () => {
     if (!localPreviewActive) return;
     if (localLoopMode === "continuous" && localPreviewIndex >= 0 && localPreviewIndex + 1 < currentLibraryItems.length) {

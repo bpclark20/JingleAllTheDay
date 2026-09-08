@@ -136,7 +136,12 @@ to the connected agent. `409 { "ok": false, "error": "agent_not_connected" }`
 if no desktop app is connected; `504 { "ok": false, "error": "agent_timeout" }`
 if the agent doesn't answer in time.
 
-- `POST /api/playback/play` — `{ "cache_id": "...", "loop_mode": "off", "live": true }`.
+- `POST /api/playback/play` — `{ "cache_id": "...", "loop_mode": "off", "live": true, "queue": ["cache_id", ...] }`.
+  `queue` is optional and only meaningful with `loop_mode: "continuous"`: it should
+  be the caller's current filtered/sorted list of cache_ids so continuous playback
+  advances through what that client sees, rather than whatever is currently
+  filtered in the desktop app's own library table. Omitting it falls back to the
+  desktop table's visible order.
   For non-admin users, `live` is always overridden server-side to the host's
   actual current `is_live_mode` (guests can never force real Live/Preview
   routing, even via a crafted request).

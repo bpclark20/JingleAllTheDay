@@ -362,6 +362,7 @@ class PlayBody(BaseModel):
     cache_id: str
     loop_mode: str = "off"
     live: bool = True
+    queue: list[str] | None = None
 
 
 class ModeBody(BaseModel):
@@ -383,6 +384,19 @@ async def playback_play(body: PlayBody, user=Depends(get_current_user)):
     kwargs = body.model_dump()
     kwargs["path"] = _manifest_path_for_cache_id(body.cache_id)
     del kwargs["cache_id"]
+    if body.queue:
+        # Resolve the browser's current filtered/sorted view to desktop paths so
+        # continuous playback advances through what the remote user sees, not
+        # whatever the desktop app's own library table happens to be filtered to.
+        resolved_queue: list[str] = []
+        for queued_cache_id in body.queue:
+            try:
+                resolved_queue.append(_manifest_path_for_cache_id(queued_cache_id))
+            except HTTPException:
+                continue
+        kwargs["queue"] = resolved_queue
+    else:
+        kwargs["queue"] = None
     if user["role"] != "admin":
         # Guests can never force the host's real Live/Preview routing - always defer
         # to whatever the host is actually doing right now (mirrors legacy PIN-based behavior).

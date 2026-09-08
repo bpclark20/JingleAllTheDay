@@ -75,6 +75,7 @@ class RemoteServerBridge(QObject):
                     cmd.kwargs.get("path", ""),
                     cmd.kwargs.get("loop_mode", "off"),
                     bool(cmd.kwargs.get("live", cmd.kwargs.get("is_live_mode", True))),
+                    queue=cmd.kwargs.get("queue"),
                 )
             elif cmd.action == "toggle_pause":
                 cmd.result = {"ok": True, **mw.remote_toggle_pause()}
