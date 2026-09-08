@@ -193,6 +193,12 @@ body {
   padding: 0 12px;
 }
 
+.search-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
 .search-row input {
   width: 100%;
   padding: 12px;
@@ -201,6 +207,106 @@ body {
   border: 1px solid var(--border);
   background: var(--panel-2);
   color: var(--text);
+}
+
+.category-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.category-row input {
+  flex: 1;
+  min-width: 0;
+  padding: 10px 12px;
+  font-size: 14px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.chips-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.category-chips {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px 4px 10px;
+  border-radius: 14px;
+  background: var(--accent);
+  color: white;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.chip-remove {
+  border: none;
+  background: rgba(255, 255, 255, 0.2);
+  color: white;
+  width: 18px;
+  height: 18px;
+  line-height: 1;
+  border-radius: 50%;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.segmented-toggle {
+  display: flex;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.segmented-btn {
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  border: none;
+  background: var(--panel-2);
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.segmented-btn.active {
+  background: var(--accent);
+  color: white;
+}
+
+.tag-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.tag-badge {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--accent);
+  color: var(--text);
+  /* Redundant with the flex gap above - keeps badges visibly separated even if the parent's display/gap fails to apply (e.g. stale cached CSS). */
+  margin: 0 4px 4px 0;
+  display: inline-block;
 }
 
 .page-row {

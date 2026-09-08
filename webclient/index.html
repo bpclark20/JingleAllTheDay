@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>JingleAllTheDay Remote</title>
-  <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="styles.css?v=20260907-3" />
 </head>
 <body>
   <div id="login-screen" class="modal">
@@ -53,6 +53,22 @@
     <section class="library">
       <div class="search-row">
         <input id="search-input" type="search" placeholder="Search jingles..." />
+        <div id="scope-toggle" class="segmented-toggle">
+          <button type="button" class="segmented-btn active" data-scope="all">All</button>
+          <button type="button" class="segmented-btn" data-scope="name">Title</button>
+          <button type="button" class="segmented-btn" data-scope="tag">Category</button>
+        </div>
+      </div>
+      <div class="category-row">
+        <input id="category-input" type="text" placeholder="Filter categories (comma-separated)" />
+        <div id="category-mode-toggle" class="segmented-toggle">
+          <button type="button" class="segmented-btn active" data-mode="any">Any</button>
+          <button type="button" class="segmented-btn" data-mode="all">All</button>
+        </div>
+      </div>
+      <div class="chips-row">
+        <div id="category-chips" class="category-chips"></div>
+        <button id="clear-filters-btn" type="button" class="pager-btn" disabled>Clear All</button>
       </div>
       <div class="page-row">
         <label class="page-size-label">
@@ -77,7 +93,7 @@
     </section>
   </div>
 
-  <script src="app.js?v=20260831-2"></script>
+  <script src="app.js?v=20260907-2"></script>
 </body>
 </html>
 

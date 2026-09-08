@@ -26,6 +26,11 @@
   const btnLive = document.getElementById("btn-live");
   const statusLine = document.getElementById("status-line");
   const searchInput = document.getElementById("search-input");
+  const scopeToggle = document.getElementById("scope-toggle");
+  const categoryInput = document.getElementById("category-input");
+  const categoryChips = document.getElementById("category-chips");
+  const categoryModeToggle = document.getElementById("category-mode-toggle");
+  const clearFiltersBtn = document.getElementById("clear-filters-btn");
   const libraryList = document.getElementById("library-list");
   const librarySummary = document.getElementById("library-summary");
   const pageSizeSelect = document.getElementById("page-size-select");
@@ -49,6 +54,8 @@
   let currentLibraryItems = [];
   let localPreviewIndex = -1;
   let statusSocket = null;
+  let searchScope = "all";
+  let categoryMode = "any";
 
   // -------------------------------------------------------------------------
   // Session / login
@@ -481,6 +488,17 @@
       meta.textContent = formatSeconds(item.duration_seconds);
       info.appendChild(name);
       info.appendChild(meta);
+      if (item.categories && item.categories.length) {
+        const badges = document.createElement("div");
+        badges.className = "tag-badges";
+        for (const category of item.categories) {
+          const badge = document.createElement("span");
+          badge.className = "tag-badge";
+          badge.textContent = category;
+          badges.appendChild(badge);
+        }
+        info.appendChild(badges);
+      }
       row.appendChild(info);
 
       if (item.cache_id) {
@@ -518,14 +536,31 @@
 
   let searchDebounce = null;
 
-  function filterOfflineLibrary(items, query, limit, offset) {
+  function filterOfflineLibrary(items, query, scope, categories, mode, limit, offset) {
     const search = query.trim().toLocaleLowerCase();
-    const matches = !search
-      ? items
-      : items.filter((item) => {
-          const haystack = [item.name || "", ...(item.categories || [])].join(" ").toLocaleLowerCase();
-          return haystack.includes(search);
-        });
+    const wantedCategories = categories.map((entry) => entry.toLocaleLowerCase()).filter(Boolean);
+    const matches = items.filter((item) => {
+      const itemCategories = (item.categories || []).map((entry) => String(entry).toLocaleLowerCase());
+      if (wantedCategories.length) {
+        const matchesAll = wantedCategories.every((category) => itemCategories.includes(category));
+        const matchesAny = wantedCategories.some((category) => itemCategories.includes(category));
+        if (mode === "all" ? !matchesAll : !matchesAny) {
+          return false;
+        }
+      }
+      if (search) {
+        const haystack =
+          scope === "name"
+            ? item.name || ""
+            : scope === "tag"
+            ? (item.categories || []).join(" ")
+            : [item.name || "", ...(item.categories || [])].join(" ");
+        if (!haystack.toLocaleLowerCase().includes(search)) {
+          return false;
+        }
+      }
+      return true;
+    });
     return {
       items: limit > 0 ? matches.slice(offset, offset + limit) : matches.slice(offset),
       total: matches.length,
@@ -534,10 +569,14 @@
 
   async function fetchLibrary() {
     const searchText = searchInput.value.trim();
+    const categories = parseCategoryInput();
     const search = encodeURIComponent(searchText);
+    const category = encodeURIComponent(categories.join(","));
     const limit = currentPageSize();
     try {
-      const response = await fetch(`/api/library?search=${search}&limit=${limit}&offset=${pageOffset}`);
+      const response = await fetch(
+        `/api/library?search=${search}&scope=${searchScope}&category=${category}&category_mode=${categoryMode}&limit=${limit}&offset=${pageOffset}`
+      );
       if (response.status === 401) {
         showLoginScreen();
         return;
@@ -546,8 +585,8 @@
       setAgentConnected(Boolean(data.agent_connected));
       let items = data.items || [];
       pageTotal = data.total || items.length;
-      if (!data.agent_connected && searchText && !data.offline_filter_applied) {
-        const fallback = filterOfflineLibrary(items, searchText, limit, pageOffset);
+      if (!data.agent_connected && (searchText || categories.length) && !data.offline_filter_applied) {
+        const fallback = filterOfflineLibrary(items, searchText, searchScope, categories, categoryMode, limit, pageOffset);
         items = fallback.items;
         pageTotal = fallback.total;
       }
@@ -567,11 +606,89 @@
   }
 
   searchInput.addEventListener("input", () => {
+    updateClearButtonState();
     window.clearTimeout(searchDebounce);
     searchDebounce = window.setTimeout(() => {
       pageOffset = 0;
       fetchLibrary();
     }, 250);
+  });
+
+  scopeToggle.addEventListener("click", (event) => {
+    const btn = event.target.closest(".segmented-btn");
+    if (!btn) return;
+    searchScope = btn.dataset.scope;
+    scopeToggle.querySelectorAll(".segmented-btn").forEach((entry) => entry.classList.toggle("active", entry === btn));
+    pageOffset = 0;
+    fetchLibrary();
+  });
+
+  categoryModeToggle.addEventListener("click", (event) => {
+    const btn = event.target.closest(".segmented-btn");
+    if (!btn) return;
+    categoryMode = btn.dataset.mode;
+    categoryModeToggle.querySelectorAll(".segmented-btn").forEach((entry) => entry.classList.toggle("active", entry === btn));
+    pageOffset = 0;
+    fetchLibrary();
+  });
+
+  // The category textbox is the single source of truth (comma-separated, like the desktop app) - chips are just a live preview of it.
+  function parseCategoryInput() {
+    return categoryInput.value
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+  }
+
+  function updateClearButtonState() {
+    clearFiltersBtn.disabled = !searchInput.value.trim() && !categoryInput.value.trim();
+  }
+
+  function renderCategoryChips() {
+    const categories = parseCategoryInput();
+    categoryChips.innerHTML = "";
+    for (const category of categories) {
+      const chip = document.createElement("span");
+      chip.className = "chip";
+      const label = document.createElement("span");
+      label.textContent = category;
+      const removeBtn = document.createElement("button");
+      removeBtn.type = "button";
+      removeBtn.className = "chip-remove";
+      removeBtn.textContent = "\u00d7";
+      removeBtn.setAttribute("aria-label", `Remove ${category} filter`);
+      removeBtn.addEventListener("click", () => {
+        const remaining = parseCategoryInput().filter((entry) => entry.toLocaleLowerCase() !== category.toLocaleLowerCase());
+        categoryInput.value = remaining.join(", ");
+        renderCategoryChips();
+        updateClearButtonState();
+        pageOffset = 0;
+        fetchLibrary();
+      });
+      chip.appendChild(label);
+      chip.appendChild(removeBtn);
+      categoryChips.appendChild(chip);
+    }
+  }
+
+  let categoryDebounce = null;
+  categoryInput.addEventListener("input", () => {
+    renderCategoryChips();
+    updateClearButtonState();
+    window.clearTimeout(categoryDebounce);
+    categoryDebounce = window.setTimeout(() => {
+      pageOffset = 0;
+      fetchLibrary();
+    }, 250);
+  });
+
+  clearFiltersBtn.addEventListener("click", () => {
+    searchInput.value = "";
+    categoryInput.value = "";
+    renderCategoryChips();
+    updateClearButtonState();
+    pageOffset = 0;
+    fetchLibrary();
   });
 
   pageSizeSelect.addEventListener("change", () => {
