@@ -1,3 +1,8 @@
+## 2.0.2.090826
+- Several remote control bugs squashed.
+- Continuous mode playback started from a remote control user now plays jingles in the order that they see instead of the desktop application's current view.
+- Added support for m4a file playback.
+
 ## 2.0.0.090426
 - New remote control feature added.
 - New Control API (REMOTE_API.md) to allow a remote server to behave as a middle man for controlling the application remotely.
