@@ -9,6 +9,13 @@ from app_helpers import coerce_volume_percent as _coerce_volume_percent
 from app_helpers import coerce_recent_window_days as _coerce_recent_window_days
 from app_helpers import format_duration_hms as _format_duration_hms
 from app_helpers import format_size_label as _format_size_label
+from app_helpers import (
+    SAMPLE_PAD_BLOCKSIZE_OPTIONS,
+    QMediaDevices,
+    _coerce_sample_pad_blocksize,
+    _coerce_sample_pad_streaming_min_seconds,
+    _has_qt_multimedia,
+)
 import sample_pad_audio_engine as _sp_engine_mod
 import remote_server as _remote_server
 from PyQt6.QtCore import Qt
@@ -40,17 +47,6 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import QTimer
 from recording_engine import RecordingConfig, get_recording_engine
-
-_has_qt_multimedia = False
-try:
-    from PyQt6.QtMultimedia import QMediaDevices
-
-    _has_qt_multimedia = True
-except ModuleNotFoundError:
-    pass
-
-
-SAMPLE_PAD_BLOCKSIZE_OPTIONS = (1024, 512, 384, 256, 224, 192, 128, 64)
 
 _VIRTUAL_AUDIO_KEYWORDS = (
     "broadcast",
@@ -103,24 +99,6 @@ def format_audio_device_label(name: str) -> str:
     if is_virtual_audio_device_name(name):
         return f"[Virtual] {name}"
     return name
-
-
-def _coerce_sample_pad_blocksize(value: int | str | None) -> int:
-    try:
-        parsed = int(value) if value is not None else 128
-    except (TypeError, ValueError):
-        parsed = 128
-    if parsed in SAMPLE_PAD_BLOCKSIZE_OPTIONS:
-        return parsed
-    return 128
-
-
-def _coerce_sample_pad_streaming_min_seconds(value: int | str | None) -> int:
-    try:
-        parsed = int(value) if value is not None else 120
-    except (TypeError, ValueError):
-        parsed = 120
-    return max(0, min(3600, parsed))
 
 
 class OptionsDialog(QDialog):

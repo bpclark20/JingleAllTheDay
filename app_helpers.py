@@ -15,9 +15,37 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QPalette
 from PyQt6.QtWidgets import QApplication
 
+_has_qt_multimedia = False
+QAudioOutput: Any = None
+QMediaDevices: Any = None
+QMediaPlayer: Any = None
+try:
+    from PyQt6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
+
+    _has_qt_multimedia = True
+except ModuleNotFoundError:
+    pass
+
+_has_pynput = False
+_pynput_keyboard: Any | None = None
+try:
+    from pynput import keyboard as _pynput_keyboard  # type: ignore[import-not-found]
+
+    _has_pynput = True
+except Exception:
+    _pynput_keyboard = None
+
+_has_windows_native_hotkeys = sys.platform == "win32"
+_WM_HOTKEY = 0x0312
+_MOD_NOREPEAT = 0x4000
+_MOD_ALT = 0x0001
+_MOD_CONTROL = 0x0002
+_MOD_SHIFT = 0x0004
+
 _HERE = Path(sys._MEIPASS) if hasattr(sys, "_MEIPASS") else Path(__file__).resolve().parent  # type: ignore[attr-defined]
 _FFPROBE_PATH: str | None = None
 _FFPROBE_CHECKED = False
+SAMPLE_PAD_BLOCKSIZE_OPTIONS = (1024, 512, 384, 256, 224, 192, 128, 64)
 RESERVED_INTERNAL_TAG_RECENT = "Recent"
 RESERVED_INTERNAL_TAG_RECORDING = "JADR"
 _RESERVED_INTERNAL_TAGS = {
@@ -467,6 +495,37 @@ def probe_duration_seconds(path: Path) -> float:
         return max(0.0, float(value))
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return 0.0
+
+
+def _coerce_sample_pad_blocksize(value: Any) -> int:
+    try:
+        parsed = int(value) if value is not None else 128
+    except (TypeError, ValueError):
+        parsed = 128
+    if parsed in SAMPLE_PAD_BLOCKSIZE_OPTIONS:
+        return parsed
+    return 128
+
+
+def _coerce_sample_pad_streaming_min_seconds(value: Any) -> int:
+    try:
+        parsed = int(value) if value is not None else 120
+    except (TypeError, ValueError):
+        parsed = 120
+    return max(0, min(3600, parsed))
+
+
+def _normalize_recording_wav_subtype(value: Any) -> str:
+    candidate = str(value or "").strip().upper().replace("-", "_")
+    if candidate == "PCM24":
+        candidate = "PCM_24"
+    elif candidate == "PCM16":
+        candidate = "PCM_16"
+    elif candidate in {"FLOAT32", "PCM_FLOAT"}:
+        candidate = "FLOAT"
+    if candidate not in {"PCM_16", "PCM_24", "FLOAT"}:
+        return "PCM_16"
+    return candidate
 
 
 if __name__ == "__main__":

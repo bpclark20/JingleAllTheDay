@@ -18,6 +18,22 @@ from app_helpers import (
     APPEARANCE_MODE_DARK,
     APPEARANCE_MODE_LIGHT,
     APPEARANCE_MODE_SYSTEM,
+    SAMPLE_PAD_BLOCKSIZE_OPTIONS,
+    QAudioOutput,
+    QMediaDevices,
+    QMediaPlayer,
+    _coerce_sample_pad_blocksize,
+    _coerce_sample_pad_streaming_min_seconds,
+    _has_pynput,
+    _has_qt_multimedia,
+    _has_windows_native_hotkeys,
+    _MOD_ALT,
+    _MOD_CONTROL,
+    _MOD_NOREPEAT,
+    _MOD_SHIFT,
+    _normalize_recording_wav_subtype,
+    _pynput_keyboard,
+    _WM_HOTKEY,
     apply_app_appearance_mode as _apply_app_appearance_mode,
     apply_windows_titlebar_theme as _apply_windows_titlebar_theme,
     RESERVED_INTERNAL_TAG_RECENT,
@@ -42,7 +58,6 @@ from dialogs import (
     AudioDiagnosticsDialog,
     OfflineCacheBackupDialog,
     OptionsDialog,
-    SAMPLE_PAD_BLOCKSIZE_OPTIONS,
     format_audio_device_label as _format_audio_device_label,
     is_virtual_audio_device_name as _is_virtual_audio_device_name,
 )
@@ -63,37 +78,6 @@ from sample_pads import SamplePadsWindow
 from playlists_window import PLAYLIST_DRAG_MIME_TYPE, PlaylistsWindow
 from sample_pad_audio_engine import SamplePadAudioEngine as _SamplePadAudioEngine
 import sample_pad_audio_engine as _sp_engine_mod
-
-
-def _coerce_sample_pad_blocksize(value: Any) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        parsed = 128
-    if parsed in SAMPLE_PAD_BLOCKSIZE_OPTIONS:
-        return parsed
-    return 128
-
-
-def _coerce_sample_pad_streaming_min_seconds(value: Any) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        parsed = 120
-    return max(0, min(3600, parsed))
-
-
-def _normalize_recording_wav_subtype(value: Any) -> str:
-    candidate = str(value or "").strip().upper().replace("-", "_")
-    if candidate == "PCM24":
-        candidate = "PCM_24"
-    elif candidate == "PCM16":
-        candidate = "PCM_16"
-    elif candidate in {"FLOAT32", "PCM_FLOAT"}:
-        candidate = "FLOAT"
-    if candidate not in {"PCM_16", "PCM_24", "FLOAT"}:
-        return "PCM_16"
-    return candidate
 
 
 _ensure_qt_logging_rules()
@@ -140,31 +124,6 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-
-_has_qt_multimedia = False
-try:
-    from PyQt6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
-
-    _has_qt_multimedia = True
-except ModuleNotFoundError:
-    pass
-
-_has_pynput = False
-_pynput_keyboard: Any | None = None
-try:
-    from pynput import keyboard as _pynput_keyboard  # type: ignore[import-not-found]
-
-    _has_pynput = True
-except Exception:
-    _pynput_keyboard = None
-
-_has_windows_native_hotkeys = sys.platform == "win32"
-_WM_HOTKEY = 0x0312
-_MOD_NOREPEAT = 0x4000
-_MOD_ALT = 0x0001
-_MOD_CONTROL = 0x0002
-_MOD_SHIFT = 0x0004
-
 
 def _is_wayland_session() -> bool:
     session_type = os.environ.get("XDG_SESSION_TYPE", "").strip().lower()
