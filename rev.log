@@ -1,3 +1,7 @@
+## 2.0.3.091426
+- More remote control bugs squashed.
+- Added new queueing feature for remote control playback, and a way for the desktop app to add jingles to the currently running remote queue.
+
 ## 2.0.2.090826
 - Several remote control bugs squashed.
 - Continuous mode playback started from a remote control user now plays jingles in the order that they see instead of the desktop application's current view.

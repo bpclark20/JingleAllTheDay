@@ -76,6 +76,18 @@ class RemoteServerBridge(QObject):
                     cmd.kwargs.get("loop_mode", "off"),
                     bool(cmd.kwargs.get("live", cmd.kwargs.get("is_live_mode", True))),
                     queue=cmd.kwargs.get("queue"),
+                    owner_label=cmd.kwargs.get("owner_label", ""),
+                )
+            elif cmd.action == "cancel_queued":
+                cancelled = mw.remote_cancel_queued(
+                    cmd.kwargs.get("queue_id", ""),
+                    owner_label=cmd.kwargs.get("owner_label", ""),
+                    is_admin=bool(cmd.kwargs.get("is_admin", False)),
+                )
+                cmd.result = {"ok": cancelled, **mw.remote_get_status()}
+            elif cmd.action == "resume_queue":
+                cmd.result = mw.remote_resume_interrupted_queue(
+                    owner_label=cmd.kwargs.get("owner_label", ""),
                 )
             elif cmd.action == "toggle_pause":
                 cmd.result = {"ok": True, **mw.remote_toggle_pause()}

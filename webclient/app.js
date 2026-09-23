@@ -38,6 +38,15 @@
   const pageNextBtn = document.getElementById("page-next");
   const pageIndicator = document.getElementById("page-indicator");
   const localAudio = document.getElementById("local-audio");
+  const upNextPanel = document.getElementById("up-next-panel");
+  const upNextList = document.getElementById("up-next-list");
+  const liveQueuePanel = document.getElementById("live-queue-panel");
+  const liveQueueList = document.getElementById("live-queue-list");
+  const resumeQueueBtn = document.getElementById("resume-queue-btn");
+  const myQueueSendBtn = document.getElementById("my-queue-send-btn");
+  const myQueueClearBtn = document.getElementById("my-queue-clear-btn");
+  const myQueueList = document.getElementById("my-queue-list");
+  const myQueueEmpty = document.getElementById("my-queue-empty");
 
   let currentRole = null;
   let currentCacheId = "";
@@ -53,6 +62,10 @@
   let lastHostPlayState = "stopped";
   let currentLibraryItems = [];
   let localPreviewIndex = -1;
+  // "library" = continuous local preview walks currentLibraryItems (existing behavior);
+  // "queue" = it walks myQueue instead (session-only, resets on reload - Feature: remote queue).
+  let localPreviewSource = "library";
+  let myQueue = [];
   let statusSocket = null;
   let searchScope = "all";
   let categoryMode = "any";
@@ -274,11 +287,184 @@
     return data;
   }
 
+  function renderQueuedJingles(queuedJingles) {
+    const entries = Array.isArray(queuedJingles) ? queuedJingles : [];
+    if (entries.length === 0) {
+      upNextPanel.classList.add("hidden");
+      upNextList.innerHTML = "";
+      return;
+    }
+    upNextPanel.classList.remove("hidden");
+    upNextList.innerHTML = "";
+    entries.forEach((entry) => {
+      const item = document.createElement("li");
+      item.className = "up-next-item";
+      const name = document.createElement("span");
+      name.className = "up-next-name";
+      name.textContent = `${entry.position + 1}. ${entry.name}`;
+      const cancelBtn = document.createElement("button");
+      cancelBtn.className = "pager-btn up-next-cancel";
+      cancelBtn.textContent = "Cancel";
+      cancelBtn.addEventListener("click", () => cancelQueuedJingle(entry.queue_id));
+      item.appendChild(name);
+      item.appendChild(cancelBtn);
+      upNextList.appendChild(item);
+    });
+  }
+
+  async function cancelQueuedJingle(queueId) {
+    const data = await callControl("/api/playback/cancel_queued", { queue_id: queueId });
+    if (data.ok) {
+      renderQueuedJingles(data.queued_jingles);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // My Queue (session-only, per-browser reorderable queue) - Feature request
+  // -------------------------------------------------------------------------
+
+  function renderMyQueue() {
+    const hasItems = myQueue.length > 0;
+    myQueueSendBtn.disabled = !hasItems;
+    myQueueClearBtn.disabled = !hasItems;
+    myQueueEmpty.classList.toggle("hidden", hasItems);
+    myQueueList.innerHTML = "";
+    myQueue.forEach((item, index) => {
+      const row = document.createElement("li");
+      row.className = "up-next-item";
+      const name = document.createElement("span");
+      name.className = "up-next-name";
+      name.textContent = `${index + 1}. ${item.name}`;
+      const controls = document.createElement("div");
+      controls.className = "my-queue-item-controls";
+
+      const upBtn = document.createElement("button");
+      upBtn.className = "pager-btn";
+      upBtn.textContent = "\u2191";
+      upBtn.disabled = index === 0;
+      upBtn.addEventListener("click", () => moveMyQueueItem(index, -1));
+
+      const downBtn = document.createElement("button");
+      downBtn.className = "pager-btn";
+      downBtn.textContent = "\u2193";
+      downBtn.disabled = index === myQueue.length - 1;
+      downBtn.addEventListener("click", () => moveMyQueueItem(index, 1));
+
+      const removeBtn = document.createElement("button");
+      removeBtn.className = "pager-btn";
+      removeBtn.textContent = "Remove";
+      removeBtn.addEventListener("click", () => removeFromMyQueue(index));
+
+      controls.appendChild(upBtn);
+      controls.appendChild(downBtn);
+      controls.appendChild(removeBtn);
+      row.appendChild(name);
+      row.appendChild(controls);
+      myQueueList.appendChild(row);
+    });
+  }
+
+  function addToMyQueue(item) {
+    myQueue.push({ cache_id: item.cache_id, name: item.name });
+    renderMyQueue();
+    showStatus(`Added "${item.name}" to your queue.`);
+  }
+
+  function removeFromMyQueue(index) {
+    if (index < 0 || index >= myQueue.length) return;
+    myQueue.splice(index, 1);
+    renderMyQueue();
+  }
+
+  function moveMyQueueItem(index, direction) {
+    const targetIndex = index + direction;
+    if (targetIndex < 0 || targetIndex >= myQueue.length) return;
+    const [entry] = myQueue.splice(index, 1);
+    myQueue.splice(targetIndex, 0, entry);
+    renderMyQueue();
+  }
+
+  function clearMyQueue() {
+    myQueue = [];
+    renderMyQueue();
+  }
+
+  async function sendQueueToJingleMachine() {
+    if (myQueue.length === 0) return;
+    if (agentConnected && isMirroringHost()) {
+      const body = {
+        cache_id: myQueue[0].cache_id,
+        loop_mode: "continuous",
+        live: btnLive.dataset.live !== "false",
+        queue: myQueue.map((entry) => entry.cache_id),
+      };
+      const data = await callControl("/api/playback/play", body);
+      if (data.ok && data.queued) {
+        showStatus("Your queue is queued - it'll start once the current jingle finishes.");
+      }
+      return;
+    }
+    // Offline (or not mirroring host): play the custom queue locally, same as an
+    // individual jingle preview works today, advancing through myQueue in order.
+    localLoopMode = "continuous";
+    renderLoopButton();
+    startLocalPreview(myQueue[0], "queue");
+  }
+
+  myQueueSendBtn.addEventListener("click", sendQueueToJingleMachine);
+  myQueueClearBtn.addEventListener("click", clearMyQueue);
+  renderMyQueue();
+
+  // -------------------------------------------------------------------------
+  // Live Queue (the desktop-visible remote queue currently playing/interrupted)
+  // -------------------------------------------------------------------------
+
+  let lastLiveQueueLength = -1;
+
+  function renderLiveQueue(activeRemoteQueue) {
+    const entries = Array.isArray(activeRemoteQueue) ? activeRemoteQueue : [];
+    if (entries.length === 0) {
+      liveQueuePanel.classList.add("hidden");
+      liveQueueList.innerHTML = "";
+      lastLiveQueueLength = -1;
+      return;
+    }
+    if (lastLiveQueueLength >= 0 && entries.length > lastLiveQueueLength) {
+      showStatus("The desktop added a jingle to the live queue.");
+    }
+    lastLiveQueueLength = entries.length;
+    liveQueuePanel.classList.remove("hidden");
+    liveQueueList.innerHTML = "";
+    entries.forEach((entry) => {
+      const item = document.createElement("li");
+      item.className = "up-next-item";
+      const name = document.createElement("span");
+      name.className = "up-next-name";
+      name.textContent = entry.current ? `\u25b6 ${entry.name}` : entry.name;
+      item.appendChild(name);
+      liveQueueList.appendChild(item);
+    });
+  }
+
+  function renderResumeButton(hasInterruptedQueue) {
+    resumeQueueBtn.classList.toggle("hidden", !hasInterruptedQueue);
+  }
+
+  resumeQueueBtn.addEventListener("click", async () => {
+    const data = await callControl("/api/playback/resume_queue", {});
+    if (data.ok && data.queued) {
+      showStatus("Resume queued - it'll start once the current jingle finishes.");
+    }
+  });
+
   function applyStatus(status) {
     setAgentConnected(Boolean(status.agent_connected), status.message);
     if (!agentConnected) {
       return;
     }
+    renderQueuedJingles(status.queued_jingles);
+    renderLiveQueue(status.active_remote_queue);
+    renderResumeButton(Boolean(status.has_interrupted_queue));
     const isLive = status.is_live_mode !== false;
     if (currentRole !== "admin" && guestLiveIntent && !isLive) {
       // Host dropped out of Live while this guest was mirroring it - fall back to local preview
@@ -408,13 +594,21 @@
         // to show - send it explicitly so the host can build the right queue.
         body.queue = currentLibraryItems.map((entry) => entry.cache_id);
       }
-      callControl("/api/playback/play", body);
+      callControl("/api/playback/play", body).then((data) => {
+        if (data.ok && data.queued) {
+          showStatus(`${item.name} is queued - it'll play once the current jingle finishes.`);
+        }
+      });
       return;
     }
-    startLocalPreview(item);
+    startLocalPreview(item, "library");
   }
 
-  function startLocalPreview(item) {
+  function currentPreviewSourceItems() {
+    return localPreviewSource === "queue" ? myQueue : currentLibraryItems;
+  }
+
+  function startLocalPreview(item, source) {
     // The <audio> element fetches directly from /api/audio so the browser can progressively
     // buffer/stream large jingles instead of waiting for a full blob download before playback.
     // This works whether the jingle machine is connected (live relay) or not (served from
@@ -424,7 +618,8 @@
     localAudio.src = audioUrl;
     localAudio.loop = localLoopMode === "loop";
     localPreviewActive = true;
-    localPreviewIndex = currentLibraryItems.findIndex((entry) => entry.cache_id === item.cache_id);
+    localPreviewSource = source || "library";
+    localPreviewIndex = currentPreviewSourceItems().findIndex((entry) => entry.cache_id === item.cache_id);
     currentCacheId = item.cache_id;
     npName.textContent = `${item.name} (buffering\u2026)`;
     npName.classList.add("buffering");
@@ -452,6 +647,7 @@
     localPreviewActive = false;
     localPreviewBuffering = false;
     localPreviewIndex = -1;
+    localPreviewSource = "library";
     npName.classList.remove("buffering");
     updateControlsEnabled();
     refreshStatusOnce();
@@ -461,8 +657,9 @@
   // the playbackPositionAnimationLoop rAF loop; timeupdate isn't needed for that.
   localAudio.addEventListener("ended", () => {
     if (!localPreviewActive) return;
-    if (localLoopMode === "continuous" && localPreviewIndex >= 0 && localPreviewIndex + 1 < currentLibraryItems.length) {
-      startLocalPreview(currentLibraryItems[localPreviewIndex + 1]);
+    const sourceItems = currentPreviewSourceItems();
+    if (localLoopMode === "continuous" && localPreviewIndex >= 0 && localPreviewIndex + 1 < sourceItems.length) {
+      startLocalPreview(sourceItems[localPreviewIndex + 1], localPreviewSource);
       return;
     }
     stopLocalPreview();
@@ -485,7 +682,7 @@
     if (!localPreviewActive) return;
     localPreviewBuffering = false;
     npName.classList.remove("buffering");
-    const item = currentLibraryItems.find((entry) => entry.cache_id === currentCacheId);
+    const item = currentPreviewSourceItems().find((entry) => entry.cache_id === currentCacheId);
     npName.textContent = item ? `${item.name} (local preview)` : "Local preview";
     renderPlayButton();
   });
@@ -541,6 +738,11 @@
         playBtn.textContent = "Play";
         playBtn.addEventListener("click", () => triggerPlay(item));
         row.appendChild(playBtn);
+
+        const queueBtn = document.createElement("button");
+        queueBtn.textContent = "+ Queue";
+        queueBtn.addEventListener("click", () => addToMyQueue(item));
+        row.appendChild(queueBtn);
 
         // Desktop convenience: double-click anywhere in the row plays it (mobile keeps the explicit Play tap target).
         row.addEventListener("dblclick", (event) => {

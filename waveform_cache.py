@@ -213,8 +213,11 @@ def _load_ffmpeg_waveform_peaks(path: Path, bucket_count: int) -> list[float]:
         "s16le",
         "-",
     ]
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
-        result = subprocess.run(cmd, capture_output=True, timeout=8.0, check=False)
+        result = subprocess.run(
+            cmd, capture_output=True, timeout=8.0, check=False, creationflags=creation_flags
+        )
     except (OSError, subprocess.TimeoutExpired):
         return []
 

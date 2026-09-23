@@ -46,8 +46,31 @@
         <button id="btn-loop" class="toggle-btn" data-mode="off">Loop: Off</button>
         <button id="btn-live" class="toggle-btn" data-live="true">Mode: Live</button>
       </div>
+      <button id="resume-queue-btn" class="pager-btn hidden">Resume Interrupted Queue</button>
       <div id="status-line" class="status-line"></div>
       <audio id="local-audio" preload="none"></audio>
+    </section>
+
+    <section id="up-next-panel" class="up-next-panel hidden">
+      <div class="up-next-title">Up Next</div>
+      <ul id="up-next-list" class="up-next-list"></ul>
+    </section>
+
+    <section id="live-queue-panel" class="up-next-panel hidden">
+      <div class="up-next-title">Live Queue</div>
+      <ul id="live-queue-list" class="up-next-list"></ul>
+    </section>
+
+    <section id="my-queue-panel" class="my-queue-panel">
+      <div class="my-queue-header">
+        <div class="up-next-title">My Queue</div>
+        <div class="my-queue-actions">
+          <button id="my-queue-send-btn" class="pager-btn" disabled>Send to Jingle Machine</button>
+          <button id="my-queue-clear-btn" class="pager-btn" disabled>Clear</button>
+        </div>
+      </div>
+      <ul id="my-queue-list" class="up-next-list"></ul>
+      <div id="my-queue-empty" class="my-queue-empty">Add jingles from the library below to build a queue.</div>
     </section>
 
     <section class="library">

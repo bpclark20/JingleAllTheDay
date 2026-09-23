@@ -365,6 +365,10 @@ class PlayBody(BaseModel):
     queue: list[str] | None = None
 
 
+class CancelQueuedBody(BaseModel):
+    queue_id: str
+
+
 class ModeBody(BaseModel):
     loop_mode: str
 
@@ -402,8 +406,28 @@ async def playback_play(body: PlayBody, user=Depends(get_current_user)):
         # to whatever the host is actually doing right now (mirrors legacy PIN-based behavior).
         last_status = agent_manager.last_status() or {}
         kwargs["live"] = bool(last_status.get("is_live_mode", True))
+    kwargs["owner_label"] = user["username"]
     try:
         return await agent_manager.send_command("play", kwargs)
+    except (AgentNotConnected, AgentCommandTimeout) as exc:
+        return _agent_error_response(exc)
+
+
+@app.post("/api/playback/cancel_queued")
+async def playback_cancel_queued(body: CancelQueuedBody, user=Depends(get_current_user)):
+    try:
+        return await agent_manager.send_command(
+            "cancel_queued",
+            {"queue_id": body.queue_id, "owner_label": user["username"], "is_admin": user["role"] == "admin"},
+        )
+    except (AgentNotConnected, AgentCommandTimeout) as exc:
+        return _agent_error_response(exc)
+
+
+@app.post("/api/playback/resume_queue")
+async def playback_resume_queue(user=Depends(get_current_user)):
+    try:
+        return await agent_manager.send_command("resume_queue", {"owner_label": user["username"]})
     except (AgentNotConnected, AgentCommandTimeout) as exc:
         return _agent_error_response(exc)
 

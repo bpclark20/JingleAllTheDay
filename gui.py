@@ -415,8 +415,8 @@ class MainWindow(
         self._main_playback_meter_loading_path: str = ""
         self._main_playback_meter_loading: bool = False
         # Low-latency engine used for live-mode sample pad playback
-        self._sp_engine: _SamplePadAudioEngine = _SamplePadAudioEngine()
-        self._sp_monitor_engine: _SamplePadAudioEngine = _SamplePadAudioEngine()
+        self._sp_engine: _SamplePadAudioEngine = _SamplePadAudioEngine(name="broadcast")
+        self._sp_monitor_engine: _SamplePadAudioEngine = _SamplePadAudioEngine(name="monitor")
         self._sp_engine.set_streaming_min_seconds(self._sample_pad_streaming_min_seconds)
         self._sp_engine.set_mixer_enabled(self._mixer_enabled)
         self._sp_engine.set_input_gain(self._microphone_gain_percent / 100.0)
@@ -461,6 +461,12 @@ class MainWindow(
         self._playback_mode = "off"
         self._continuous_queue: list[int] = []
         self._continuous_queue_position = -1
+        # True while `_continuous_queue` holds a remote user's ordered "My Queue" send
+        # (as opposed to the desktop's own filtered-list continuous playback).
+        self._continuous_queue_is_remote = False
+        # Snapshot of a remote queue a local operator interrupted, so the webapp can
+        # offer to resume it: {"queue_indices": list[int], "position": int}.
+        self._interrupted_remote_queue: dict[str, Any] | None = None
         self._current_playing_name = ""
         self._current_playing_path = ""
         self._playlist_active = False
@@ -473,12 +479,16 @@ class MainWindow(
         self._clip_seek_ramp_token = 0
         self._clip_boundary_handling = False
         self._main_playback_engine: _SamplePadAudioEngine | None = (
-            _SamplePadAudioEngine() if _sp_engine_mod.is_available() else None
+            _SamplePadAudioEngine(name="main") if _sp_engine_mod.is_available() else None
         )
         self._main_playback_pad_index = 10001
         self._main_playback_state = "stopped"
         self._main_playback_duration_ms = 0
         self._main_playback_paused_position_ms = 0
+        # FIFO of remote play requests deferred while a main jingle is already playing;
+        # drained only on natural end-of-clip, never on a manual local Stop/override.
+        self._pending_remote_play_queue: list[dict[str, Any]] = []
+        self._remote_queue_id_counter = 0
         self._main_playback_timer = QTimer(self)
         self._main_playback_timer.setInterval(30)
         self._main_playback_timer.timeout.connect(self._on_main_playback_timer)
@@ -1321,7 +1331,36 @@ class MainWindow(
             "position_seconds": max(0.0, position_ms / 1000.0),
             "duration_seconds": max(0.0, duration_ms / 1000.0),
             "loop_mode": self._playback_mode,
+            "queued_jingles": self._queued_remote_jingles_summary(),
+            "active_remote_queue": self._active_remote_queue_summary(),
+            "has_interrupted_queue": self._interrupted_remote_queue is not None,
         }
+
+    def _queued_remote_jingles_summary(self) -> list[dict[str, Any]]:
+        summary: list[dict[str, Any]] = []
+        for position, entry in enumerate(self._pending_remote_play_queue):
+            if entry.get("kind") == "resume_queue":
+                name = "Resume interrupted queue"
+            else:
+                record_index = self._record_index_for_path(entry["path"])
+                name = self._records[record_index].name if record_index is not None else Path(entry["path"]).stem
+            summary.append({"queue_id": entry["queue_id"], "name": name, "position": position})
+        return summary
+
+    def _active_remote_queue_summary(self) -> list[dict[str, Any]]:
+        """Upcoming items in the currently-live (playing or interrupted) remote queue, for the webapp's 'Live Queue' panel."""
+        if self._continuous_queue_is_remote:
+            indices = self._continuous_queue[self._continuous_queue_position :]
+        elif self._interrupted_remote_queue is not None:
+            snapshot = self._interrupted_remote_queue
+            indices = snapshot["queue_indices"][snapshot["position"] :]
+        else:
+            return []
+        summary: list[dict[str, Any]] = []
+        for offset, record_index in enumerate(indices):
+            name = self._records[record_index].name if 0 <= record_index < len(self._records) else "Unknown"
+            summary.append({"position": offset, "name": name, "current": offset == 0})
+        return summary
 
     def remote_get_library(
         self,
@@ -1374,6 +1413,7 @@ class MainWindow(
         loop_mode: str = "off",
         is_live_mode: bool = True,
         queue: list[str] | None = None,
+        owner_label: str = "",
     ) -> dict[str, Any]:
         record_index = self._record_index_for_path(path)
         if record_index is None:
@@ -1382,6 +1422,117 @@ class MainWindow(
         if not record.path.exists():
             return {"ok": False, "error": "missing_file"}
 
+        if self._is_main_playback_active():
+            queue_id = self._enqueue_remote_play(path, loop_mode, is_live_mode, queue, owner_label)
+            return {
+                "ok": True,
+                "queued": True,
+                "queue_id": queue_id,
+                **self.remote_get_status(),
+            }
+
+        started = self._dispatch_remote_play(record_index, path, loop_mode, is_live_mode, queue)
+        if not started:
+            return {"ok": False, "error": "playback_failed"}
+        return {"ok": True, **self.remote_get_status()}
+
+    def _is_main_playback_active(self) -> bool:
+        """True when a main-list jingle is currently playing or paused (sample pads don't count)."""
+        if self._using_main_playback_engine():
+            return self._main_playback_state in ("playing", "paused")
+        if self._player is not None:
+            return self._player.playbackState() in (
+                QMediaPlayer.PlaybackState.PlayingState,
+                QMediaPlayer.PlaybackState.PausedState,
+            )
+        return False
+
+    def _enqueue_remote_play(
+        self,
+        path: str,
+        loop_mode: str,
+        is_live_mode: bool,
+        queue: list[str] | None,
+        owner_label: str,
+    ) -> str:
+        self._remote_queue_id_counter += 1
+        queue_id = f"q{self._remote_queue_id_counter}"
+        self._pending_remote_play_queue.append(
+            {
+                "queue_id": queue_id,
+                "kind": "play",
+                "path": path,
+                "loop_mode": loop_mode,
+                "is_live_mode": is_live_mode,
+                "queue": queue,
+                "owner_label": owner_label,
+            }
+        )
+        self._publish_remote_state()
+        return queue_id
+
+    def _enqueue_resume_queue(self, snapshot: dict[str, Any], owner_label: str) -> str:
+        self._remote_queue_id_counter += 1
+        queue_id = f"q{self._remote_queue_id_counter}"
+        self._pending_remote_play_queue.append(
+            {"queue_id": queue_id, "kind": "resume_queue", "snapshot": snapshot, "owner_label": owner_label}
+        )
+        self._publish_remote_state()
+        return queue_id
+
+    def remote_resume_interrupted_queue(self, owner_label: str = "") -> dict[str, Any]:
+        if self._interrupted_remote_queue is None:
+            return {"ok": False, "error": "no_interrupted_queue"}
+        snapshot = self._interrupted_remote_queue
+        self._interrupted_remote_queue = None
+        if self._is_main_playback_active():
+            queue_id = self._enqueue_resume_queue(snapshot, owner_label)
+            return {"ok": True, "queued": True, "queue_id": queue_id, **self.remote_get_status()}
+        started = self._dispatch_resume_interrupted_queue(snapshot)
+        if not started:
+            return {"ok": False, "error": "playback_failed"}
+        return {"ok": True, **self.remote_get_status()}
+
+    def _dispatch_resume_interrupted_queue(self, snapshot: dict[str, Any]) -> bool:
+        resolved = [index for index in snapshot.get("queue_indices", []) if 0 <= index < len(self._records)]
+        if not resolved:
+            return False
+        position = max(0, min(int(snapshot.get("position", 0)), len(resolved) - 1))
+        self._on_stop_clicked()
+        self._clear_playlist_state()
+        self._playback_mode = "continuous"
+        self._refresh_playback_mode_button()
+        self._apply_player_loop_mode()
+        self._continuous_queue = resolved
+        self._continuous_queue_position = position - 1
+        self._continuous_queue_is_remote = True
+        started = self._play_next_continuous_record()
+        self._publish_remote_state()
+        return started
+
+    def remote_cancel_queued(self, queue_id: str, owner_label: str = "", is_admin: bool = False) -> bool:
+        for index, entry in enumerate(self._pending_remote_play_queue):
+            if entry.get("queue_id") != queue_id:
+                continue
+            if not is_admin and entry.get("owner_label", "") != owner_label:
+                return False
+            cancelled = self._pending_remote_play_queue.pop(index)
+            if cancelled.get("kind") == "resume_queue" and self._interrupted_remote_queue is None:
+                # Restore the pending-resume state so the webapp's Resume button reappears
+                # instead of silently losing the ability to resume this queue.
+                self._interrupted_remote_queue = cancelled.get("snapshot")
+            self._publish_remote_state()
+            return True
+        return False
+
+    def _dispatch_remote_play(
+        self,
+        record_index: int,
+        path: str,
+        loop_mode: str,
+        is_live_mode: bool,
+        queue: list[str] | None,
+    ) -> bool:
         self._on_stop_clicked()
         self._clear_playlist_state()
         self.remote_set_live_mode(is_live_mode)
@@ -1395,9 +1546,28 @@ class MainWindow(
             started = self._play_record(record_index)
 
         self._publish_remote_state()
-        if not started:
-            return {"ok": False, "error": "playback_failed"}
-        return {"ok": True, **self.remote_get_status()}
+        return started
+
+    def _dispatch_next_pending_remote_play(self) -> None:
+        """Called after a main jingle naturally finishes; starts the oldest queued remote request, if any."""
+        while self._pending_remote_play_queue:
+            entry = self._pending_remote_play_queue.pop(0)
+            if entry.get("kind") == "resume_queue":
+                if self._dispatch_resume_interrupted_queue(entry["snapshot"]):
+                    return
+                continue
+            record_index = self._record_index_for_path(entry["path"])
+            if record_index is None or not self._records[record_index].path.exists():
+                continue
+            if self._dispatch_remote_play(
+                record_index,
+                entry["path"],
+                entry["loop_mode"],
+                entry["is_live_mode"],
+                entry.get("queue"),
+            ):
+                return
+        self._publish_remote_state()
 
     def _start_remote_continuous_playback(
         self, record_index: int, queue: list[str] | None
@@ -1420,6 +1590,8 @@ class MainWindow(
             if resolved and target_position >= 0:
                 self._continuous_queue = resolved
                 self._continuous_queue_position = target_position - 1
+                self._continuous_queue_is_remote = True
+                self._interrupted_remote_queue = None
                 return self._play_next_continuous_record()
 
         return self._start_continuous_playback()
@@ -3820,7 +3992,30 @@ class MainWindow(
         add_to_playlist_action.setEnabled(selected_count > 0)
         add_to_playlist_action.triggered.connect(self._on_add_selected_to_playlist)
 
+        add_to_remote_queue_action = menu.addAction("Add to Remote Queue")
+        add_to_remote_queue_action.setEnabled(selected_count == 1 and self._remote_queue_is_addable())
+        add_to_remote_queue_action.triggered.connect(self._on_add_selected_to_remote_queue)
+
         menu.exec(self._table.viewport().mapToGlobal(pos))
+
+    def _remote_queue_is_addable(self) -> bool:
+        """True while there's a live remote queue (playing or interrupted-awaiting-resume) to append to."""
+        return self._continuous_queue_is_remote or self._interrupted_remote_queue is not None
+
+    def _on_add_selected_to_remote_queue(self) -> None:
+        selected_indices = self._selected_record_indices()
+        if not selected_indices:
+            return
+        record_index = selected_indices[0]
+        if self._continuous_queue_is_remote:
+            self._continuous_queue.append(record_index)
+        elif self._interrupted_remote_queue is not None:
+            self._interrupted_remote_queue["queue_indices"].append(record_index)
+        else:
+            self._status.showMessage("No remote queue is currently active.")
+            return
+        self._publish_remote_state()
+        self._status.showMessage(f"Added \"{self._records[record_index].name}\" to the remote queue.")
 
     def _on_add_selected_to_playlist(self) -> None:
         payload = self.selected_playlist_candidates()
@@ -3890,6 +4085,7 @@ class MainWindow(
             and self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
         ):
             self._player.stop()
+            self._interrupt_active_remote_queue_for_local_play()
             self._reset_continuous_queue()
             self._current_playing_name = ""
             self._current_playing_path = ""
@@ -3921,6 +4117,23 @@ class MainWindow(
     def _reset_continuous_queue(self) -> None:
         self._continuous_queue = []
         self._continuous_queue_position = -1
+        self._continuous_queue_is_remote = False
+
+    def _interrupt_active_remote_queue_for_local_play(self) -> None:
+        """If a remote 'My Queue' send is currently playing, snapshot it for later resume
+        and drop to Loop Off so a local operator's next Play/double-click plays alone."""
+        if not self._continuous_queue_is_remote:
+            return
+        if self._continuous_queue and 0 <= self._continuous_queue_position < len(self._continuous_queue):
+            self._interrupted_remote_queue = {
+                "queue_indices": list(self._continuous_queue),
+                "position": self._continuous_queue_position,
+            }
+        self._continuous_queue_is_remote = False
+        self._playback_mode = "off"
+        self._refresh_playback_mode_button()
+        self._apply_player_loop_mode()
+        self._publish_remote_state()
 
     def _clear_playlist_state(self) -> None:
         was_active = self._playlist_active
@@ -4140,6 +4353,8 @@ class MainWindow(
             self._status.showMessage(f"Playback finished: {ended_name}")
         else:
             self._status.showMessage("Playback finished.")
+        if self._pending_remote_play_queue:
+            self._dispatch_next_pending_remote_play()
 
     def _on_main_playback_timer(self) -> None:
         if self._main_playback_engine is None:
@@ -4371,11 +4586,15 @@ class MainWindow(
                 return
 
             if self._playback_mode == "continuous":
-                if not self._start_continuous_playback():
+                if self._continuous_queue_is_remote:
+                    self._interrupt_active_remote_queue_for_local_play()
+                elif not self._start_continuous_playback():
                     self._current_playing_name = ""
                     self._current_playing_path = ""
                     self._status.showMessage("No playable jingles were found from the selected row onward.")
-                return
+                    return
+                else:
+                    return
 
             if self._playback_mode == "off" and self._start_selected_queue_playback():
                 return
@@ -4413,11 +4632,15 @@ class MainWindow(
             return
 
         if self._playback_mode == "continuous":
-            if not self._start_continuous_playback():
+            if self._continuous_queue_is_remote:
+                self._interrupt_active_remote_queue_for_local_play()
+            elif not self._start_continuous_playback():
                 self._current_playing_name = ""
                 self._current_playing_path = ""
                 self._status.showMessage("No playable jingles were found from the selected row onward.")
-            return
+                return
+            else:
+                return
 
         if self._playback_mode == "off" and self._start_selected_queue_playback():
             return
@@ -4448,6 +4671,7 @@ class MainWindow(
                 self._update_time_label(0, self._main_playback_duration_ms)
                 self._set_play_button_state("stopped")
                 self._set_stop_button_breathing(False)
+                self._interrupt_active_remote_queue_for_local_play()
                 self._reset_continuous_queue()
                 self._reset_clip_playback_window()
                 self._sample_pad_looping = False
@@ -4473,6 +4697,7 @@ class MainWindow(
             if self._broadcast_player is not None:
                 self._broadcast_player.stop()
                 self._broadcast_player.setPosition(self._current_clip_start_ms)
+            self._interrupt_active_remote_queue_for_local_play()
             self._reset_continuous_queue()
             self._reset_clip_playback_window()
             self._sample_pad_looping = False
@@ -4547,6 +4772,8 @@ class MainWindow(
                     self._status.showMessage(f"Playback finished: {ended_name}")
                 else:
                     self._status.showMessage("Playback finished.")
+                if self._pending_remote_play_queue:
+                    self._dispatch_next_pending_remote_play()
                 return
 
         if not self._slider_pressed:
@@ -4610,6 +4837,8 @@ class MainWindow(
                 self._status.showMessage(f"Playback finished: {ended_name}")
             else:
                 self._status.showMessage("Playback finished.")
+            if self._pending_remote_play_queue:
+                self._dispatch_next_pending_remote_play()
 
     def _record_index_for_path(self, path_text: str) -> int | None:
         target = Path(path_text)

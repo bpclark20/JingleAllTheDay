@@ -18,6 +18,8 @@ callback reads is protected by a threading.Lock.
 from __future__ import annotations
 
 import contextlib
+import logging
+import tempfile
 import threading
 import time
 from collections import deque
@@ -40,6 +42,28 @@ except (ImportError, OSError):
 
 def is_available() -> bool:
     return _AVAILABLE
+
+
+# --- Temporary polyphony-interference investigation logging -----------------
+# Logs which engine instance opens a stream on which device, and voice
+# start/fade events, to a plain-text file so multi-pad/main-list overlap
+# scenarios can be traced without a debugger attached. Remove once the
+# polyphony regression is root-caused and fixed.
+_POLY_LOG_PATH = Path(tempfile.gettempdir()) / "jingleallhteday_polyphony_debug.log"
+_poly_logger = logging.getLogger("jatd.polyphony_debug")
+if not _poly_logger.handlers:
+    _poly_logger.setLevel(logging.DEBUG)
+    _poly_handler = logging.FileHandler(_POLY_LOG_PATH, encoding="utf-8")
+    _poly_handler.setFormatter(logging.Formatter("%(asctime)s.%(msecs)03d %(message)s", datefmt="%H:%M:%S"))
+    _poly_logger.addHandler(_poly_handler)
+    _poly_logger.propagate = False
+
+
+def _poly_log(message: str) -> None:
+    try:
+        _poly_logger.debug(message)
+    except Exception:
+        pass
 
 
 def list_audio_devices(*, channel_key: str | None = None) -> list[dict[str, object]]:
@@ -232,7 +256,10 @@ class _StreamingVoice:
 class SamplePadAudioEngine:
     """Click-free polyphonic sample pad audio engine backed by PortAudio."""
 
-    def __init__(self) -> None:
+    def __init__(self, name: str = "") -> None:
+        # Label used only by the temporary polyphony-debug log to tell engine
+        # instances apart (e.g. "monitor"/"broadcast"/"main"); harmless if unset.
+        self._name = name or f"engine{id(self) & 0xFFFF:04x}"
         self._lock = threading.Lock()
         self._stream: Optional["sd.OutputStream"] = None
         self._stream_device: str = ""
@@ -358,6 +385,10 @@ class SamplePadAudioEngine:
                     callback=self._callback,
                 )
             self._stream.start()
+            _poly_log(
+                f"[{self._name}] stream OPEN device={device_name!r} index={device_index} "
+                f"sr={samplerate} ch={channels} blocksize={blocksize}"
+            )
         except Exception as exc:
             self._stream = None
             raise RuntimeError(f"SamplePadAudioEngine: could not open device '{device_name}': {exc}") from exc
@@ -580,6 +611,7 @@ class SamplePadAudioEngine:
             fade_samples = max(1, int((self._stream_samplerate or 44100) * 0.002))
             if pad_index is None:
                 self._pending_pad_triggers.clear()
+                _poly_log(f"[{self._name}] stop(all) fading {len(self._voices)} voice(s)")
                 for voice in self._voices.values():
                     self._begin_voice_fade(voice, fade_samples)
                 return
@@ -593,6 +625,7 @@ class SamplePadAudioEngine:
             if voice is None:
                 self._pad_to_voice.pop(pad_index, None)
                 return
+            _poly_log(f"[{self._name}] stop(pad={pad_index}) fading voice={voice_id} active_voices={len(self._voices)}")
             self._begin_voice_fade(voice, fade_samples)
 
     def set_pad_mix(
@@ -979,6 +1012,7 @@ class SamplePadAudioEngine:
                 old_voice_id = self._pad_to_voice.get(pad_index)
                 old_voice = self._voices.get(old_voice_id) if old_voice_id is not None else None
                 if old_voice is not None:
+                    _poly_log(f"[{self._name}] retrigger pad={pad_index} fading old voice={old_voice_id}")
                     self._begin_voice_fade(old_voice, fade_samples)
 
             voice_id = self._next_voice_id
@@ -996,6 +1030,10 @@ class SamplePadAudioEngine:
             self._voices[voice_id] = new_voice
             if pad_index >= 0:
                 self._pad_to_voice[pad_index] = voice_id
+            _poly_log(
+                f"[{self._name}] voice START (pcm) id={voice_id} pad={pad_index} "
+                f"active_voices={len(self._voices)} device={self._stream_device!r}"
+            )
 
     def _start_streaming_voice(
         self,
@@ -1036,6 +1074,7 @@ class SamplePadAudioEngine:
                 old_voice_id = self._pad_to_voice.get(pad_index)
                 old_voice = self._voices.get(old_voice_id) if old_voice_id is not None else None
                 if old_voice is not None:
+                    _poly_log(f"[{self._name}] retrigger pad={pad_index} fading old voice={old_voice_id}")
                     self._begin_voice_fade(old_voice, fade_samples)
 
             voice_id = self._next_voice_id
@@ -1055,6 +1094,10 @@ class SamplePadAudioEngine:
             self._voices[voice_id] = new_voice
             if pad_index >= 0:
                 self._pad_to_voice[pad_index] = voice_id
+            _poly_log(
+                f"[{self._name}] voice START (streaming/sf) id={voice_id} pad={pad_index} "
+                f"active_voices={len(self._voices)} device={self._stream_device!r}"
+            )
 
         worker = threading.Thread(
             target=self._streaming_worker,
@@ -1400,6 +1443,7 @@ class SamplePadAudioEngine:
                 old_voice_id = self._pad_to_voice.get(pad_index)
                 old_voice = self._voices.get(old_voice_id) if old_voice_id is not None else None
                 if old_voice is not None:
+                    _poly_log(f"[{self._name}] retrigger pad={pad_index} fading old voice={old_voice_id}")
                     self._begin_voice_fade(old_voice, fade_samples)
 
             voice_id = self._next_voice_id
@@ -1420,6 +1464,10 @@ class SamplePadAudioEngine:
             self._voices[voice_id] = voice
             if pad_index >= 0:
                 self._pad_to_voice[pad_index] = voice_id
+            _poly_log(
+                f"[{self._name}] voice START (streaming/ffmpeg) id={voice_id} pad={pad_index} "
+                f"active_voices={len(self._voices)} device={self._stream_device!r}"
+            )
 
         worker = threading.Thread(
             target=self._streaming_worker,

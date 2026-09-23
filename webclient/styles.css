@@ -73,6 +73,83 @@ body {
   max-width: 720px;
 }
 
+.up-next-panel {
+  background: var(--panel);
+  margin: 0 auto 12px;
+  padding: 12px 16px;
+  border-radius: 12px;
+  max-width: 720px;
+}
+
+.up-next-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 8px;
+}
+
+.up-next-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.up-next-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  background: var(--panel-2);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 14px;
+}
+
+.up-next-item .up-next-name {
+  word-break: break-word;
+}
+
+.up-next-item .up-next-cancel {
+  flex-shrink: 0;
+}
+
+.my-queue-panel {
+  background: var(--panel);
+  margin: 0 auto 12px;
+  padding: 12px 16px;
+  border-radius: 12px;
+  max-width: 720px;
+}
+
+.my-queue-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.my-queue-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.my-queue-empty {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.my-queue-item-controls {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
 .np-name {
   font-size: 17px;
   font-weight: 600;
