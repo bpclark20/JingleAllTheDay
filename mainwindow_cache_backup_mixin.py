@@ -5,9 +5,9 @@ import threading
 import time
 from typing import Any, Callable
 
-from PyQt6.QtWidgets import QMessageBox
+from PyQt6.QtWidgets import QMessageBox, QStyle
 
-from dialogs import OfflineCacheBackupDialog
+from dialogs import OfflineCacheBackupDialog, show_silent_message
 import remote_server as _remote_server
 
 
@@ -122,7 +122,12 @@ class MainWindowCacheBackupMixin:
         if dialog is not None:
             dialog.finish()
         if exc is not None:
-            QMessageBox.warning(self, "Offline Cache Backup Failed", str(exc))
+            show_silent_message(
+                self,
+                "Offline Cache Backup Failed",
+                str(exc),
+                QStyle.StandardPixmap.SP_MessageBoxWarning,
+            )
             return
         if result is None:
             return
@@ -137,7 +142,7 @@ class MainWindowCacheBackupMixin:
             f"({result['total']} jingle(s) cached total)."
         )
         self._status.showMessage(f"Offline cache backup complete: {summary}")
-        QMessageBox.information(self, "Offline Cache Backup Complete", summary)
+        show_silent_message(self, "Offline Cache Backup Complete", summary)
 
     def _on_cache_backup_dialog_closed(self) -> None:
         self._cache_backup_dialog = None

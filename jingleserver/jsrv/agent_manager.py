@@ -55,9 +55,24 @@ class AgentManager:
         self._send_lock = asyncio.Lock()
         self._audio_queues: dict[int, asyncio.Queue[bytes | BaseException | None]] = {}
         self._audio_meta: dict[int, asyncio.Future[dict[str, Any]]] = {}
+        # Reason the connected agent announced via `going_offline`, if any.
+        self._going_offline_reason: str | None = None
+        # Why/when the last agent went away; empty until one has connected and left.
+        self._offline_info: dict[str, Any] = {}
 
     def is_connected(self) -> bool:
         return self._socket is not None
+
+    def offline_info(self) -> dict[str, Any]:
+        """`offline_reason` ("shutdown", "disconnect", "restart", "connection_test" or
+        "connection_lost"), `offline_since` (epoch seconds) and `agent_label` for the
+        most recent agent to go offline; empty if none has disconnected yet."""
+        return dict(self._offline_info)
+
+    def mark_going_offline(self, websocket: WebSocket, reason: str) -> None:
+        """Record that the agent on `websocket` announced an intentional disconnect."""
+        if self._socket is websocket:
+            self._going_offline_reason = reason or "disconnect"
 
     def connection_info(self) -> dict[str, Any]:
         if not self.is_connected():
@@ -74,6 +89,7 @@ class AgentManager:
             self._socket = websocket
             self._label = label
             self._connected_at = time.time()
+            self._going_offline_reason = None
         if previous is not None and previous is not websocket:
             try:
                 await previous.close(code=4000, reason="replaced by new agent connection")
@@ -83,6 +99,12 @@ class AgentManager:
     async def detach(self, websocket: WebSocket) -> None:
         async with self._lock:
             if self._socket is websocket:
+                self._offline_info = {
+                    "offline_reason": self._going_offline_reason or "connection_lost",
+                    "offline_since": time.time(),
+                    "agent_label": self._label,
+                }
+                self._going_offline_reason = None
                 self._socket = None
                 self._label = ""
                 self._last_status = None

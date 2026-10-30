@@ -3,8 +3,6 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import os
-import shutil
-import subprocess
 import sys
 import time
 import wave
@@ -14,6 +12,8 @@ from typing import Any
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QPalette
 from PyQt6.QtWidgets import QApplication
+
+from media_tools import probe_duration_seconds as _ffprobe_duration_seconds
 
 _has_qt_multimedia = False
 QAudioOutput: Any = None
@@ -43,8 +43,6 @@ _MOD_CONTROL = 0x0002
 _MOD_SHIFT = 0x0004
 
 _HERE = Path(sys._MEIPASS) if hasattr(sys, "_MEIPASS") else Path(__file__).resolve().parent  # type: ignore[attr-defined]
-_FFPROBE_PATH: str | None = None
-_FFPROBE_CHECKED = False
 SAMPLE_PAD_BLOCKSIZE_OPTIONS = (1024, 512, 384, 256, 224, 192, 128, 64)
 RESERVED_INTERNAL_TAG_RECENT = "Recent"
 RESERVED_INTERNAL_TAG_RECORDING = "JADR"
@@ -442,15 +440,6 @@ def format_duration_hms(total_seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
-def get_ffprobe_path() -> str | None:
-    global _FFPROBE_PATH, _FFPROBE_CHECKED
-    if _FFPROBE_CHECKED:
-        return _FFPROBE_PATH
-    _FFPROBE_CHECKED = True
-    _FFPROBE_PATH = shutil.which("ffprobe")
-    return _FFPROBE_PATH
-
-
 def probe_duration_seconds(path: Path) -> float:
     suffix = path.suffix.lower()
     if suffix in {".wav", ".wave"}:
@@ -462,39 +451,7 @@ def probe_duration_seconds(path: Path) -> float:
                     return float(frames) / float(rate)
         except (wave.Error, OSError):
             pass
-
-    ffprobe = get_ffprobe_path()
-    if not ffprobe:
-        return 0.0
-
-    cmd = [
-        ffprobe,
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        str(path),
-    ]
-    try:
-        run_kwargs: dict[str, Any] = {
-            "capture_output": True,
-            "text": True,
-            "timeout": 2.0,
-            "check": False,
-        }
-        if hasattr(subprocess, "CREATE_NO_WINDOW"):
-            run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-        result = subprocess.run(cmd, **run_kwargs)
-        if result.returncode != 0:
-            return 0.0
-        value = (result.stdout or "").strip()
-        if not value:
-            return 0.0
-        return max(0.0, float(value))
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        return 0.0
+    return _ffprobe_duration_seconds(path) or 0.0
 
 
 def _coerce_sample_pad_blocksize(value: Any) -> int:

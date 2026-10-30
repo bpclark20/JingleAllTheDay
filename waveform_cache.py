@@ -7,6 +7,8 @@ import wave
 from pathlib import Path
 from typing import Callable
 
+from media_tools import NO_WINDOW_FLAGS, ffmpeg_path
+
 _WAVEFORM_CACHE: dict[tuple[str, int, int, int], list[float]] = {}
 
 
@@ -195,7 +197,7 @@ def _load_wav_waveform_peaks(path: Path, bucket_count: int) -> list[float]:
 
 
 def _load_ffmpeg_waveform_peaks(path: Path, bucket_count: int) -> list[float]:
-    ffmpeg = shutil_which("ffmpeg")
+    ffmpeg = ffmpeg_path()
     if not ffmpeg:
         return []
 
@@ -213,7 +215,7 @@ def _load_ffmpeg_waveform_peaks(path: Path, bucket_count: int) -> list[float]:
         "s16le",
         "-",
     ]
-    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    creation_flags = NO_WINDOW_FLAGS
     try:
         result = subprocess.run(
             cmd, capture_output=True, timeout=8.0, check=False, creationflags=creation_flags
@@ -266,9 +268,3 @@ def _reduce_to_peaks(amplitudes: list[float], bucket_count: int) -> list[float]:
         window = amplitudes[start:end]
         peaks.append(max(window) if window else 0.0)
     return peaks
-
-
-def shutil_which(name: str) -> str | None:
-    from shutil import which
-
-    return which(name)

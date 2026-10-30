@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sys
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -16,7 +15,12 @@ from app_helpers import (
     _coerce_sample_pad_streaming_min_seconds,
     _has_qt_multimedia,
 )
-import sample_pad_audio_engine as _sp_engine_mod
+from app_settings import OptionsSettings
+from broadcast_routing import (
+    broadcast_route_warnings,
+    format_audio_device_label,
+    virtual_device_guide,
+)
 import remote_server as _remote_server
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QKeySequence, QPixmap
@@ -40,6 +44,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QSlider,
+    QStyle,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -48,79 +53,11 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import QTimer
 from recording_engine import RecordingConfig, get_recording_engine
 
-_VIRTUAL_AUDIO_KEYWORDS = (
-    "broadcast",
-    "blackhole",
-    "cable",
-    "dante",
-    "jack",
-    "loopback",
-    "monitor",
-    "null",
-    "sink",
-    "soundflower",
-    "vb-audio",
-    "virtual",
-    "voicemeeter",
-)
-
-
-def is_virtual_audio_device_name(name: str) -> bool:
-    normalized = name.strip().casefold()
-    if not normalized:
-        return False
-    if any(keyword in normalized for keyword in _VIRTUAL_AUDIO_KEYWORDS):
-        return True
-
-    # On Linux, Qt friendly labels for null sinks can be shortened or cleaned up
-    # compared with the PortAudio device names. If a matching PortAudio output has
-    # a corresponding .monitor input, treat it as a virtual sink.
-    if sys.platform.startswith("linux") and _sp_engine_mod.is_available():
-        try:
-            devices = _sp_engine_mod.list_audio_devices()
-        except Exception:
-            devices = []
-        candidate_names = {
-            str(dev.get("name", "")).strip().casefold()
-            for dev in devices
-            if str(dev.get("name", "")).strip()
-        }
-        for candidate in candidate_names:
-            if normalized not in candidate and candidate not in normalized:
-                continue
-            if f"{candidate}.monitor" in candidate_names:
-                return True
-            if candidate.endswith("broadcast") or candidate.endswith("sink"):
-                return True
-    return False
-
-
-def format_audio_device_label(name: str) -> str:
-    if is_virtual_audio_device_name(name):
-        return f"[Virtual] {name}"
-    return name
-
-
 class OptionsDialog(QDialog):
     def __init__(
         self,
-        live_output_device: str,
-        preview_output_device: str,
-        broadcast_output_device: str,
-        mixer_enabled: bool,
-        microphone_input_device: str,
-        recording_input_device: int | str | None,
-        microphone_gain_percent: int,
-        live_volume_percent: int,
-        preview_volume_percent: int,
-        recent_window_days: int,
-        sample_pad_blocksize: int,
-        sample_pad_streaming_min_seconds: int,
+        options: OptionsSettings,
         samples_dir: Path | None = None,
-        server_enabled: bool = True,
-        server_address: str = "",
-        server_device_token: str = "",
-        cache_backup_reminder_days: int = 7,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -186,7 +123,7 @@ class OptionsDialog(QDialog):
         mixer_enabled_row.addWidget(mixer_enabled_label)
 
         self._mixer_enabled_checkbox = QCheckBox("Enable in-app microphone + jingle mixer")
-        self._mixer_enabled_checkbox.setChecked(bool(mixer_enabled))
+        self._mixer_enabled_checkbox.setChecked(bool(options.mixer_enabled))
         self._mixer_enabled_checkbox.setToolTip(
             "Foundation setting for future internal microphone+jingle mixing. "
             "Current builds persist this setting but do not yet switch playback behavior."
@@ -232,7 +169,7 @@ class OptionsDialog(QDialog):
         self._microphone_gain_slider = QSlider(Qt.Orientation.Horizontal)
         self._microphone_gain_slider.setRange(0, 200)
         self._microphone_gain_slider.setPageStep(5)
-        self._microphone_gain_slider.setValue(max(0, min(200, int(microphone_gain_percent))))
+        self._microphone_gain_slider.setValue(max(0, min(200, int(options.microphone_gain_percent))))
         self._microphone_gain_slider.setToolTip(
             "Input gain for future internal microphone mixing. 100% is unity gain."
         )
@@ -252,7 +189,7 @@ class OptionsDialog(QDialog):
         self._live_volume_slider = QSlider(Qt.Orientation.Horizontal)
         self._live_volume_slider.setRange(0, 100)
         self._live_volume_slider.setPageStep(5)
-        self._live_volume_slider.setValue(_coerce_volume_percent(live_volume_percent))
+        self._live_volume_slider.setValue(_coerce_volume_percent(options.live_volume_percent))
         self._live_volume_slider.setToolTip("Playback volume used in Live mode.")
         live_volume_row.addWidget(self._live_volume_slider)
 
@@ -270,7 +207,7 @@ class OptionsDialog(QDialog):
         self._preview_volume_slider = QSlider(Qt.Orientation.Horizontal)
         self._preview_volume_slider.setRange(0, 100)
         self._preview_volume_slider.setPageStep(5)
-        self._preview_volume_slider.setValue(_coerce_volume_percent(preview_volume_percent))
+        self._preview_volume_slider.setValue(_coerce_volume_percent(options.preview_volume_percent))
         self._preview_volume_slider.setToolTip("Playback volume used in Preview mode.")
         preview_volume_row.addWidget(self._preview_volume_slider)
 
@@ -289,7 +226,7 @@ class OptionsDialog(QDialog):
         self._recent_window_days_spin.setRange(1, 3650)
         self._recent_window_days_spin.setSingleStep(1)
         self._recent_window_days_spin.setSuffix(" days")
-        self._recent_window_days_spin.setValue(_coerce_recent_window_days(recent_window_days))
+        self._recent_window_days_spin.setValue(_coerce_recent_window_days(options.recent_window_days))
         self._recent_window_days_spin.setToolTip(
             "How many days back should count as an internal Recent jingle tag."
         )
@@ -309,7 +246,7 @@ class OptionsDialog(QDialog):
         self._sample_pad_blocksize_combo.setToolTip(
             "Audio buffer size for live sample-pad playback. Lower values reduce trigger latency; higher values increase stability."
         )
-        selected_blocksize = _coerce_sample_pad_blocksize(sample_pad_blocksize)
+        selected_blocksize = _coerce_sample_pad_blocksize(options.sample_pad_blocksize)
         for option in SAMPLE_PAD_BLOCKSIZE_OPTIONS:
             self._sample_pad_blocksize_combo.addItem(str(option), option)
             if option == selected_blocksize:
@@ -331,7 +268,7 @@ class OptionsDialog(QDialog):
         self._sample_pad_streaming_min_seconds_spin.setSingleStep(15)
         self._sample_pad_streaming_min_seconds_spin.setSuffix(" s")
         self._sample_pad_streaming_min_seconds_spin.setValue(
-            _coerce_sample_pad_streaming_min_seconds(sample_pad_streaming_min_seconds)
+            _coerce_sample_pad_streaming_min_seconds(options.sample_pad_streaming_min_seconds)
         )
         self._sample_pad_streaming_min_seconds_spin.setToolTip(
             "Duration threshold for first-trigger streaming on cache miss. "
@@ -348,7 +285,7 @@ class OptionsDialog(QDialog):
         server_enabled_label.setFixedWidth(100)
         server_enabled_row.addWidget(server_enabled_label)
         self._server_enabled_checkbox = QCheckBox("Auto-connect on launch")
-        self._server_enabled_checkbox.setChecked(bool(server_enabled))
+        self._server_enabled_checkbox.setChecked(bool(options.server_enabled))
         self._server_enabled_checkbox.setToolTip(
             "When enabled, the desktop app automatically connects to the remote-control server "
             "when it opens. It can always be connected/disconnected manually from the Server menu."
@@ -361,7 +298,7 @@ class OptionsDialog(QDialog):
         server_address_label = QLabel("Server Address")
         server_address_label.setFixedWidth(100)
         server_address_row.addWidget(server_address_label)
-        self._server_address_edit = QLineEdit(str(server_address or ""))
+        self._server_address_edit = QLineEdit(str(options.server_address or ""))
         self._server_address_edit.setPlaceholderText("e.g. jingles.brianpclark.com or 192.168.1.50:47030")
         self._server_address_edit.setMinimumWidth(220)
         server_address_row.addWidget(self._server_address_edit)
@@ -372,7 +309,7 @@ class OptionsDialog(QDialog):
         server_token_label = QLabel("Device Token")
         server_token_label.setFixedWidth(100)
         server_token_row.addWidget(server_token_label)
-        self._server_device_token_edit = QLineEdit(str(server_device_token or ""))
+        self._server_device_token_edit = QLineEdit(str(options.server_device_token or ""))
         self._server_device_token_edit.setPlaceholderText("From 'jingleserver adddevice <label>' on the server")
         self._server_device_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self._server_device_token_edit.setMinimumWidth(220)
@@ -398,7 +335,7 @@ class OptionsDialog(QDialog):
         cache_reminder_row.addWidget(cache_reminder_label)
         self._cache_backup_reminder_spin = QSpinBox()
         self._cache_backup_reminder_spin.setRange(1, 90)
-        self._cache_backup_reminder_spin.setValue(max(1, min(90, int(cache_backup_reminder_days))))
+        self._cache_backup_reminder_spin.setValue(max(1, min(90, int(options.cache_backup_reminder_days))))
         self._cache_backup_reminder_spin.setSuffix(" day(s) between reminders")
         self._cache_backup_reminder_spin.setMinimumWidth(220)
         cache_reminder_row.addWidget(self._cache_backup_reminder_spin)
@@ -432,11 +369,11 @@ class OptionsDialog(QDialog):
         root.addWidget(buttons)
 
         self._populate_devices(
-            live_output_device,
-            preview_output_device,
-            broadcast_output_device,
-            microphone_input_device,
-            recording_input_device,
+            options.output_device,
+            options.preview_output_device,
+            options.broadcast_output_device,
+            options.microphone_input_device,
+            options.recording_input_device,
         )
         self._live_volume_slider.valueChanged.connect(self._sync_volume_labels)
         self._preview_volume_slider.valueChanged.connect(self._sync_volume_labels)
@@ -617,49 +554,44 @@ class OptionsDialog(QDialog):
 
         combo.blockSignals(False)
 
-    def selected_devices(self) -> tuple[str, str, str]:
-        live = self._live_device_combo.currentData()
-        preview = self._preview_device_combo.currentData()
-        broadcast = self._broadcast_device_combo.currentData()
-        live_value = str(live).strip() if live is not None else ""
-        preview_value = str(preview).strip() if preview is not None else ""
-        broadcast_value = str(broadcast).strip() if broadcast is not None else ""
-        return live_value, preview_value, broadcast_value
+    def selected_options(self) -> OptionsSettings:
+        recording_device = self.selected_recording_device()
+        return OptionsSettings(
+            output_device=self._combo_text(self._live_device_combo),
+            preview_output_device=self._combo_text(self._preview_device_combo),
+            broadcast_output_device=self._combo_text(self._broadcast_device_combo),
+            mixer_enabled=bool(self._mixer_enabled_checkbox.isChecked()),
+            microphone_input_device=self._combo_text(self._microphone_device_combo),
+            recording_input_device=-1 if recording_device is None else recording_device,
+            microphone_gain_percent=max(0, min(200, int(self._microphone_gain_slider.value()))),
+            live_volume_percent=_coerce_volume_percent(self._live_volume_slider.value()),
+            preview_volume_percent=_coerce_volume_percent(self._preview_volume_slider.value()),
+            recent_window_days=_coerce_recent_window_days(self._recent_window_days_spin.value()),
+            sample_pad_blocksize=_coerce_sample_pad_blocksize(
+                self._sample_pad_blocksize_combo.currentData()
+            ),
+            sample_pad_streaming_min_seconds=_coerce_sample_pad_streaming_min_seconds(
+                self._sample_pad_streaming_min_seconds_spin.value()
+            ),
+            server_enabled=bool(self._server_enabled_checkbox.isChecked()),
+            server_address=self.selected_server_address(),
+            server_device_token=self.selected_server_device_token(),
+            cache_backup_reminder_days=max(1, min(90, int(self._cache_backup_reminder_spin.value()))),
+        )
+
+    @staticmethod
+    def _combo_text(combo: QComboBox) -> str:
+        value = combo.currentData()
+        return str(value).strip() if value is not None else ""
 
     def _refresh_broadcast_warning(self) -> None:
         live = str(self._live_device_combo.currentData() or "").strip()
         broadcast = str(self._broadcast_device_combo.currentData() or "").strip()
         mixer_enabled = bool(self._mixer_enabled_checkbox.isChecked())
-
-        messages: list[str] = []
-        if not mixer_enabled:
-            messages.append("Mixer Mode is off, so microphone audio will not be sent to any broadcast route.")
-        if not broadcast:
-            if live and not is_virtual_audio_device_name(live):
-                messages.append(
-                    "No Broadcast Device is selected. Discord/OBS routing usually works best with a virtual or loopback broadcast device instead of a physical Live Device."
-                )
-        else:
-            if not is_virtual_audio_device_name(broadcast):
-                messages.append(
-                    "The selected Broadcast Device does not look like a virtual or loopback device. Physical outputs usually will not behave like an isolated broadcast feed."
-                )
-            if live.strip().casefold() == broadcast.strip().casefold():
-                messages.append(
-                    "Broadcast Device matches Live Device, so broadcast and local monitoring are not isolated from each other."
-                )
-        messages.append(
-            "Main library jingles are mirrored to the Broadcast Device. Sample-pad jingles still follow the current Live/Preview monitor route, and live-mode sample pads are also duplicated to the Broadcast Device when it differs from the monitor route."
-        )
+        messages = broadcast_route_warnings(live, broadcast, mixer_enabled)
         self._broadcast_warning_label.setText("\n".join(messages))
 
-    def selected_mixer_config(self) -> tuple[bool, str, int]:
-        microphone = self._microphone_device_combo.currentData()
-        microphone_value = str(microphone).strip() if microphone is not None else ""
-        microphone_gain = max(0, min(200, int(self._microphone_gain_slider.value())))
-        return bool(self._mixer_enabled_checkbox.isChecked()), microphone_value, microphone_gain
-
-    def selected_recording_device(self) -> int | str | None:
+    def selected_recording_device(self) -> int | None:
         recording = self._recording_device_combo.currentData()
         if recording is None:
             return None
@@ -671,30 +603,11 @@ class OptionsDialog(QDialog):
             return None
         return parsed if parsed >= 0 else None
 
-    def selected_volumes(self) -> tuple[int, int]:
-        return (
-            _coerce_volume_percent(self._live_volume_slider.value()),
-            _coerce_volume_percent(self._preview_volume_slider.value()),
-        )
-
-    def selected_sample_pad_blocksize(self) -> int:
-        value = self._sample_pad_blocksize_combo.currentData()
-        return _coerce_sample_pad_blocksize(value)
-
-    def selected_recent_window_days(self) -> int:
-        return _coerce_recent_window_days(self._recent_window_days_spin.value())
-
-    def selected_server_enabled(self) -> bool:
-        return bool(self._server_enabled_checkbox.isChecked())
-
     def selected_server_address(self) -> str:
         return self._server_address_edit.text().strip()
 
     def selected_server_device_token(self) -> str:
         return self._server_device_token_edit.text().strip()
-
-    def selected_cache_backup_reminder_days(self) -> int:
-        return max(1, min(90, int(self._cache_backup_reminder_spin.value())))
 
     def _on_test_connection_clicked(self) -> None:
         address = self.selected_server_address()
@@ -707,12 +620,6 @@ class OptionsDialog(QDialog):
         ok, message = _remote_server.test_connection(address, token)
         prefix = "✓" if ok else "✗"
         self._server_test_result_label.setText(f"{prefix} {message}")
-
-
-    def selected_sample_pad_streaming_min_seconds(self) -> int:
-        return _coerce_sample_pad_streaming_min_seconds(
-            self._sample_pad_streaming_min_seconds_spin.value()
-        )
 
     def selected_folder(self) -> Path | None:
         text = self._folder_edit.text().strip()
@@ -771,30 +678,18 @@ class AudioDiagnosticsDialog(QDialog):
         copy_btn.clicked.connect(self._copy_report)
         button_row.addWidget(copy_btn)
 
-        if sys.platform.startswith("linux"):
-            copy_create_btn = QPushButton("Copy Create Broadcast Devices")
-            copy_create_btn.clicked.connect(
-                lambda: self._copy_text(
-                    "pactl load-module module-null-sink sink_name=JingleBroadcast sink_properties=device.description=\"Jingle Broadcast\"\n"
-                    "pactl load-module module-remap-source master=JingleBroadcast.monitor source_name=JingleMic source_properties=device.description=\"Jingle Mic\""
-                )
-            )
-            button_row.addWidget(copy_create_btn)
-
-            copy_delete_btn = QPushButton("Copy Delete Broadcast Devices")
-            copy_delete_btn.clicked.connect(
-                lambda: self._copy_text(
-                    "for id in $(pactl list short modules | awk '/module-remap-source/ && /source_name=JingleMic/ {print $1}'); do pactl unload-module \"$id\"; done\n"
-                    "for id in $(pactl list short modules | awk '/module-null-sink/ && /sink_name=JingleBroadcast/ {print $1}'); do pactl unload-module \"$id\"; done"
-                )
-            )
-            button_row.addWidget(copy_delete_btn)
-
-            copy_list_btn = QPushButton("Copy List Audio Devices")
-            copy_list_btn.clicked.connect(
-                lambda: self._copy_text("pactl list short sinks\npactl list short sources")
-            )
-            button_row.addWidget(copy_list_btn)
+        guide = virtual_device_guide()
+        if guide is not None:
+            for label, commands in (
+                ("Copy Create Broadcast Devices", guide.create_commands),
+                ("Copy Delete Broadcast Devices", guide.delete_commands),
+                ("Copy List Audio Devices", guide.list_commands),
+            ):
+                if not commands:
+                    continue
+                guide_btn = QPushButton(label)
+                guide_btn.clicked.connect(lambda _checked=False, text=commands: self._copy_text(text))
+                button_row.addWidget(guide_btn)
 
         button_row.addStretch()
 
@@ -860,13 +755,12 @@ class AudioDiagnosticsDialog(QDialog):
             "PortAudio Input Devices",
             fmt_list(list(snapshot.get('portaudio_input_devices', []))),
             "",
-            "Linux Virtual Sink Assistant",
-            fmt_list(list(snapshot.get('linux_assistant', []))),
+            fmt_value(snapshot.get('virtual_device_assistant_title'), empty='Virtual Device Assistant'),
+            fmt_list(list(snapshot.get('virtual_device_assistant', []))),
             "",
             "Broadcast Workflow",
             "- Pick a [Virtual] Broadcast Device in Options when sending mixer audio to Discord, OBS, or a loopback sink.",
-            "- On Linux, create both the sink and the Jingle Mic remapped source, then select Jingle Mic in Discord or other chat apps.",
-            "- Audacity can usually record from either Jingle Mic or the raw JingleBroadcast.monitor source.",
+            *(f"- {note}" for note in snapshot.get('virtual_device_workflow_notes', [])),
             "- Use Refresh after changing audio devices or mixer settings.",
         ]
         return "\n".join(sections)
@@ -1155,6 +1049,42 @@ class RevisionHistoryDialog(QDialog):
         buttons.rejected.connect(self.reject)
         buttons.accepted.connect(self.accept)
         root.addWidget(buttons)
+
+
+def show_silent_message(
+    parent: QWidget | None,
+    title: str,
+    text: str,
+    icon: QStyle.StandardPixmap = QStyle.StandardPixmap.SP_MessageBoxInformation,
+) -> None:
+    """Modal message box that does not play a Windows notification sound.
+
+    QMessageBox raises an accessibility alert when shown, which Windows answers
+    with a system sound. That sound reaches the Live output (and so Discord
+    listeners) when Live is the default device, so use this for messages that
+    can appear on their own while the app is broadcasting.
+    """
+    dialog = QDialog(parent)
+    dialog.setWindowTitle(title)
+    root = QVBoxLayout(dialog)
+
+    row = QHBoxLayout()
+    icon_label = QLabel()
+    icon_size = dialog.style().pixelMetric(QStyle.PixelMetric.PM_MessageBoxIconSize)
+    icon_label.setPixmap(dialog.style().standardIcon(icon).pixmap(icon_size, icon_size))
+    icon_label.setAlignment(Qt.AlignmentFlag.AlignTop)
+    row.addWidget(icon_label)
+    text_label = QLabel(text)
+    text_label.setWordWrap(True)
+    text_label.setMinimumWidth(320)
+    text_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+    row.addWidget(text_label, 1)
+    root.addLayout(row)
+
+    buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+    buttons.accepted.connect(dialog.accept)
+    root.addWidget(buttons)
+    dialog.exec()
 
 
 class OfflineCacheBackupDialog(QDialog):

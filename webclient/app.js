@@ -53,6 +53,8 @@
   let pageOffset = 0;
   let pageTotal = 0;
   let agentConnected = false;
+  // Last offline explanation from a status payload; library responses don't carry one.
+  let lastOfflineText = "";
   let localPreviewActive = false;
   let localPreviewBuffering = false;
   let lastHostIsLive = true;
@@ -206,14 +208,39 @@
   // Offline / agent-connection state
   // -------------------------------------------------------------------------
 
+  // Explains why the jingle machine is offline, from the reason it gave the server
+  // (or "connection_lost" when it dropped without saying goodbye).
+  function offlineTextForStatus(status) {
+    const since = status.offline_since
+      ? ` at ${new Date(status.offline_since * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`
+      : "";
+    switch (status.offline_reason) {
+      case "shutdown":
+        return `The jingle machine was shut down${since}.`;
+      case "disconnect":
+        return `The jingle machine disconnected from the server${since}.`;
+      case "restart":
+      case "connection_test":
+        return "The jingle machine is reconnecting...";
+      case "connection_lost":
+        return `Lost connection to the jingle machine${since}. It will reconnect automatically if it is still running.`;
+      default:
+        return "";
+    }
+  }
+
+  // offlineText: explanation to show while offline; omit to keep the last one.
   function setAgentConnected(connected, offlineText) {
     const changed = connected !== agentConnected;
     agentConnected = connected;
+    if (offlineText !== undefined) {
+      lastOfflineText = offlineText;
+    }
     if (connected) {
       offlineBanner.classList.add("hidden");
     } else {
       lastHostIsLive = false;
-      offlineMessage.textContent = offlineText || "No jingle machine currently connected for control.";
+      offlineMessage.textContent = lastOfflineText || "No jingle machine currently connected for control.";
       offlineBanner.classList.remove("hidden");
       if (changed && localPreviewActive) {
         stopLocalPreview();
@@ -458,7 +485,7 @@
   });
 
   function applyStatus(status) {
-    setAgentConnected(Boolean(status.agent_connected), status.message);
+    setAgentConnected(Boolean(status.agent_connected), offlineTextForStatus(status) || status.message || "");
     if (!agentConnected) {
       return;
     }

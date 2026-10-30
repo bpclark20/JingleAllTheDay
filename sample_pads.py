@@ -7,6 +7,8 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 
 from app_helpers import chip_palette_for_tag_seed as _chip_palette_for_tag_seed
 from app_helpers import coerce_volume_percent as _coerce_volume_percent
+from mixer_strip_builder import CHANNEL_STYLESHEET, create_channel_strip
+from mixer_widgets import DbScaleWidget, PeakMeterWidget
 
 _PAD_MODES = ("one_shot", "loop", "release_os", "release_l")
 _PAD_MODE_LABELS = {
@@ -17,9 +19,6 @@ _PAD_MODE_LABELS = {
 }
 _RELEASE_PAD_MODES = {"release_os", "release_l"}
 _PAD_MODE_ALIASES = {"release": "release_l"}
-_METER_DB_FLOOR = -60.0
-_METER_DB_TOP_SPLIT = -20.0
-_METER_TOP_PORTION = 0.62
 
 
 def _normalize_pad_mode(value: Any) -> str:
@@ -37,18 +36,6 @@ def _coerce_pan_percent(value: Any) -> int:
     except (TypeError, ValueError):
         parsed = 0
     return max(-100, min(100, parsed))
-
-
-def _meter_ratio_for_db(db_value: float) -> float:
-    """Map dB to a vertical ratio with expanded upper-range resolution."""
-    db = max(_METER_DB_FLOOR, min(0.0, float(db_value)))
-    if db >= _METER_DB_TOP_SPLIT:
-        # Allocate most vertical space to the critical -20..0 dB region.
-        return ((0.0 - db) / (0.0 - _METER_DB_TOP_SPLIT)) * _METER_TOP_PORTION
-    return _METER_TOP_PORTION + (
-        ((_METER_DB_TOP_SPLIT - db) / (_METER_DB_TOP_SPLIT - _METER_DB_FLOOR))
-        * (1.0 - _METER_TOP_PORTION)
-    )
 
 
 class SamplePad(QtWidgets.QWidget):
@@ -359,161 +346,6 @@ class SamplePad(QtWidgets.QWidget):
         self._emit_pad_state_changed()
 
 
-class _DbScaleWidget(QtWidgets.QWidget):
-    def __init__(self, strip_height: int, parent: QtWidgets.QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setFixedWidth(28)
-        self.setFixedHeight(strip_height)
-
-    def set_strip_height(self, strip_height: int) -> None:
-        self.setFixedHeight(max(80, int(strip_height)))
-
-    @staticmethod
-    def _y_for_db(db_value: float, height: int) -> int:
-        top_pad = 6
-        bottom_pad = 6
-        usable = max(1, height - top_pad - bottom_pad)
-        ratio = _meter_ratio_for_db(db_value)
-        return int(round(top_pad + ratio * usable))
-
-    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
-        del event
-        painter = QtGui.QPainter(self)
-        painter.setRenderHint(QtGui.QPainter.RenderHint.TextAntialiasing, True)
-        width = self.width()
-        height = self.height()
-        if width <= 0 or height <= 0:
-            return
-
-        major_candidates = [0, -3, -6, -9, -12, -15, -18, -20, -24, -30, -36, -42, -48, -54, -60]
-        min_major_gap = max(12, int(height / 13))
-        major_ticks: list[int] = []
-        last_major_y: int | None = None
-        for idx, tick in enumerate(major_candidates):
-            y = self._y_for_db(float(tick), height)
-            force_keep = idx == 0 or idx == len(major_candidates) - 1
-            if force_keep or last_major_y is None or (y - last_major_y) >= min_major_gap:
-                major_ticks.append(tick)
-                last_major_y = y
-
-        minor_ticks: list[float] = []
-        for idx in range(len(major_ticks) - 1):
-            top_db = float(major_ticks[idx])
-            bottom_db = float(major_ticks[idx + 1])
-            y_top = self._y_for_db(top_db, height)
-            y_bottom = self._y_for_db(bottom_db, height)
-            gap_px = abs(y_bottom - y_top)
-            if gap_px >= 14:
-                minor_ticks.append((top_db + bottom_db) * 0.5)
-            if gap_px >= 28:
-                minor_ticks.append(top_db + (bottom_db - top_db) * 0.25)
-                minor_ticks.append(top_db + (bottom_db - top_db) * 0.75)
-
-        major_pen = QtGui.QPen(QtGui.QColor("#90a4ae"))
-        minor_pen = QtGui.QPen(QtGui.QColor("#607d8b"))
-        text_pen = QtGui.QPen(QtGui.QColor("#90a4ae"))
-
-        painter.setPen(minor_pen)
-        for tick in minor_ticks:
-            y = self._y_for_db(float(tick), height)
-            painter.drawLine(0, y, 7, y)
-
-        painter.setPen(major_pen)
-        for tick in major_ticks:
-            y = self._y_for_db(float(tick), height)
-            painter.drawLine(0, y, 10, y)
-
-        painter.setPen(text_pen)
-        font = painter.font()
-        font.setPointSize(8)
-        painter.setFont(font)
-        for tick in major_ticks:
-            y = self._y_for_db(float(tick), height)
-            label = "-inf" if tick <= -60 else str(tick)
-            text_rect = QtCore.QRect(12, y - 6, max(1, width - 12), 12)
-            painter.drawText(text_rect, QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter, label)
-
-
-class _PeakMeterWidget(QtWidgets.QWidget):
-    def __init__(self, strip_height: int, color: str = "#26a69a", parent: QtWidgets.QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._level = 0.0
-        self._peak_hold = 0.0
-        self._bar_color = QtGui.QColor(color)
-        self._hold_color = QtGui.QColor("#fff59d")
-        self.setFixedWidth(12)
-        self.setFixedHeight(strip_height)
-        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        self.setToolTip("Click to reset peak hold")
-
-    def set_strip_height(self, strip_height: int) -> None:
-        self.setFixedHeight(max(80, int(strip_height)))
-
-    def set_bar_color(self, color: str) -> None:
-        self._bar_color = QtGui.QColor(color)
-        self.update()
-
-    def set_level(self, level: float) -> None:
-        lvl = max(0.0, min(1.0, float(level)))
-        if lvl >= self._peak_hold:
-            self._peak_hold = lvl
-        else:
-            self._peak_hold = max(lvl, self._peak_hold * 0.985 - 0.001)
-        self._level = lvl
-        self.update()
-
-    @staticmethod
-    def _db_from_level(level: float) -> float:
-        lvl = max(0.000001, min(1.0, float(level)))
-        return max(_METER_DB_FLOOR, min(0.0, 20.0 * math.log10(lvl)))
-
-    @staticmethod
-    def _y_for_db(db_value: float, height: int) -> int:
-        top_pad = 2
-        bottom_pad = 2
-        usable = max(1, height - top_pad - bottom_pad)
-        ratio = _meter_ratio_for_db(db_value)
-        return int(round(top_pad + ratio * usable))
-
-    def reset_peak_hold(self) -> None:
-        self._peak_hold = self._level
-        self.update()
-
-    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
-        if event.button() == QtCore.Qt.MouseButton.LeftButton:
-            self.reset_peak_hold()
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
-        del event
-        painter = QtGui.QPainter(self)
-        w = self.width()
-        h = self.height()
-        if w <= 0 or h <= 0:
-            return
-
-        rect = self.rect()
-        painter.setPen(QtGui.QPen(QtGui.QColor("#2f3a40")))
-        painter.setBrush(QtGui.QBrush(QtGui.QColor("#11161a")))
-        painter.drawRoundedRect(rect.adjusted(0, 0, -1, -1), 2, 2)
-
-        level_db = self._db_from_level(self._level)
-        level_y = self._y_for_db(level_db, h)
-        bottom_y = h - 2
-        level_h = max(0, bottom_y - level_y + 1)
-        if level_h > 0:
-            bar_rect = QtCore.QRect(1, level_y, max(1, w - 2), level_h)
-            painter.fillRect(bar_rect, self._bar_color)
-
-        hold_db = self._db_from_level(self._peak_hold)
-        hold_y = self._y_for_db(hold_db, h)
-        hold_y = max(1, min(h - 2, hold_y))
-        painter.setPen(QtGui.QPen(self._hold_color, 1))
-        painter.drawLine(1, hold_y, w - 2, hold_y)
-
-
 class SamplePadMixerDialog(QtWidgets.QDialog):
     def __init__(self, pads_window: "SamplePadsWindow") -> None:
         super().__init__(None)
@@ -533,8 +365,8 @@ class SamplePadMixerDialog(QtWidgets.QDialog):
         self._pan_sliders: list[QtWidgets.QSlider] = []
         self._mute_buttons: list[QtWidgets.QPushButton] = []
         self._solo_buttons: list[QtWidgets.QPushButton] = []
-        self._meter_bars: list[_PeakMeterWidget] = []
-        self._db_scale_widgets: list[_DbScaleWidget] = []
+        self._meter_bars: list[PeakMeterWidget] = []
+        self._db_scale_widgets: list[DbScaleWidget] = []
         self._strip_lane_widgets: list[QtWidgets.QWidget] = []
         self._channel_boxes: list[QtWidgets.QWidget] = []
         self._strip_height: int = 220
@@ -554,9 +386,9 @@ class SamplePadMixerDialog(QtWidgets.QDialog):
 
         self._output_channel_box: QtWidgets.QWidget | None = None
         self._output_strip_lane: QtWidgets.QWidget | None = None
-        self._output_meter_left_bar: _PeakMeterWidget | None = None
-        self._output_meter_right_bar: _PeakMeterWidget | None = None
-        self._output_db_scale: _DbScaleWidget | None = None
+        self._output_meter_left_bar: PeakMeterWidget | None = None
+        self._output_meter_right_bar: PeakMeterWidget | None = None
+        self._output_db_scale: DbScaleWidget | None = None
         self._output_volume_slider: QtWidgets.QSlider | None = None
         self._output_mode_btn: QtWidgets.QPushButton | None = None
         self._output_mode_label: QtWidgets.QLabel | None = None
@@ -583,130 +415,42 @@ class SamplePadMixerDialog(QtWidgets.QDialog):
         channels_row.setSpacing(self._strip_spacing)
 
         for slot_index in range(self._pads_window._num_pads):
-            channel = QtWidgets.QFrame()
-            channel.setObjectName("mixerChannel")
-            channel.setStyleSheet(
-                "#mixerChannel {"
-                " border: 1px solid #3a464d;"
-                " border-radius: 4px;"
-                " background: #161c21;"
-                "}"
+            meter_bar = PeakMeterWidget(self._strip_height, "#26a69a")
+            db_scale_widget = DbScaleWidget(self._strip_height)
+            strip = create_channel_strip(
+                parent_layout=channels_row,
+                index_text=f"Pad {slot_index + 1}",
+                name_text=f"Pad {slot_index + 1}",
+                channel_width=self._strip_width,
+                strip_height=self._strip_height,
+                top_to_strip_gap=self._top_to_strip_gap,
+                strip_to_bottom_gap=self._strip_to_bottom_gap,
+                pan_slider_width=self._strip_width - 30,
+                meter_widget=meter_bar,
+                db_scale_widget=db_scale_widget,
+                volume_value=100,
+                pan_value=0,
+                muted=False,
+                solo=False,
+                on_volume_changed=lambda value, idx=slot_index: self._on_volume_changed(idx, value),
+                on_volume_dragged=lambda value, idx=slot_index: self._on_volume_dragged(idx, value),
+                on_pan_changed=lambda value, idx=slot_index: self._on_pan_changed(idx, value),
+                on_pan_dragged=lambda value, idx=slot_index: self._on_pan_dragged(idx, value),
+                on_mute_toggled=lambda checked, idx=slot_index: self._on_mute_toggled(idx, checked),
+                on_solo_toggled=lambda checked, idx=slot_index: self._on_solo_toggled(idx, checked),
+                channel_stylesheet=CHANNEL_STYLESHEET,
             )
-            channel.setFixedWidth(self._strip_width)
-            channel.setSizePolicy(
-                QtWidgets.QSizePolicy.Policy.Fixed,
-                QtWidgets.QSizePolicy.Policy.Expanding,
-            )
-            channel_layout = QtWidgets.QVBoxLayout(channel)
-            channel_layout.setContentsMargins(4, 4, 4, 4)
-            channel_layout.setSpacing(0)
+            strip.pan_slider.setToolTip("Center")
 
-            pad_label = QtWidgets.QLabel(f"Pad {slot_index + 1}")
-            pad_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            pad_label.setStyleSheet("color: #b0bec5;")
-            pad_label.setMinimumHeight(14)
-            pad_label.setMaximumHeight(14)
-            channel_layout.addWidget(pad_label)
-
-            name_label = QtWidgets.QLabel(f"Pad {slot_index + 1}")
-            name_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            name_label.setWordWrap(False)
-            name_label.setMinimumHeight(16)
-            name_label.setMaximumHeight(16)
-            channel_layout.addWidget(name_label)
-            channel_layout.addSpacing(self._top_to_strip_gap)
-
-            strip_lane_widget = QtWidgets.QWidget()
-            strip_lane_widget.setFixedHeight(self._strip_height)
-            strip_row = QtWidgets.QHBoxLayout(strip_lane_widget)
-            strip_row.setContentsMargins(0, 0, 0, 0)
-            strip_row.setSpacing(4)
-
-            meter_bar = _PeakMeterWidget(self._strip_height, "#26a69a")
-            strip_row.addWidget(meter_bar, 0, QtCore.Qt.AlignmentFlag.AlignTop)
-
-            db_scale_widget = _DbScaleWidget(self._strip_height)
-            strip_row.addWidget(db_scale_widget, 0, QtCore.Qt.AlignmentFlag.AlignTop)
-
-            volume_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Vertical)
-            volume_slider.setRange(0, 100)
-            volume_slider.setValue(100)
-            volume_slider.setPageStep(5)
-            volume_slider.setFixedHeight(self._strip_height)
-            volume_slider.setSizePolicy(
-                QtWidgets.QSizePolicy.Policy.Fixed,
-                QtWidgets.QSizePolicy.Policy.Expanding,
-            )
-            volume_slider.valueChanged.connect(
-                lambda value, idx=slot_index: self._on_volume_changed(idx, value)
-            )
-            volume_slider.sliderMoved.connect(
-                lambda value, idx=slot_index: self._on_volume_dragged(idx, value)
-            )
-            strip_row.addWidget(volume_slider, 0, QtCore.Qt.AlignmentFlag.AlignTop)
-            channel_layout.addWidget(strip_lane_widget, 0, QtCore.Qt.AlignmentFlag.AlignTop)
-            channel_layout.addSpacing(self._strip_to_bottom_gap)
-
-            pan_row = QtWidgets.QHBoxLayout()
-            pan_row.setSpacing(4)
-
-            pan_left_label = QtWidgets.QLabel("L")
-            pan_left_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            pan_left_label.setStyleSheet("color: #90a4ae;")
-            pan_left_label.setFixedWidth(10)
-            pan_row.addWidget(pan_left_label)
-
-            pan_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-            pan_slider.setRange(-100, 100)
-            pan_slider.setValue(0)
-            pan_slider.setPageStep(10)
-            pan_slider.setFixedWidth(max(34, self._strip_width - 30))
-            pan_slider.setToolTip("Center")
-            pan_slider.valueChanged.connect(
-                lambda value, idx=slot_index: self._on_pan_changed(idx, value)
-            )
-            pan_slider.sliderMoved.connect(
-                lambda value, idx=slot_index: self._on_pan_dragged(idx, value)
-            )
-            pan_row.addWidget(pan_slider)
-
-            pan_right_label = QtWidgets.QLabel("R")
-            pan_right_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            pan_right_label.setStyleSheet("color: #90a4ae;")
-            pan_right_label.setFixedWidth(10)
-            pan_row.addWidget(pan_right_label)
-
-            channel_layout.addLayout(pan_row)
-            channel_layout.addSpacing(4)
-
-            buttons_row = QtWidgets.QHBoxLayout()
-            buttons_row.setSpacing(4)
-
-            mute_btn = QtWidgets.QPushButton("M")
-            mute_btn.setCheckable(True)
-            mute_btn.toggled.connect(lambda checked, idx=slot_index: self._on_mute_toggled(idx, checked))
-            mute_btn.setFixedWidth(34)
-            buttons_row.addWidget(mute_btn)
-
-            solo_btn = QtWidgets.QPushButton("S")
-            solo_btn.setCheckable(True)
-            solo_btn.toggled.connect(lambda checked, idx=slot_index: self._on_solo_toggled(idx, checked))
-            solo_btn.setFixedWidth(34)
-            buttons_row.addWidget(solo_btn)
-
-            channel_layout.addLayout(buttons_row)
-
-            self._name_labels.append(name_label)
-            self._volume_sliders.append(volume_slider)
-            self._pan_sliders.append(pan_slider)
-            self._mute_buttons.append(mute_btn)
-            self._solo_buttons.append(solo_btn)
+            self._name_labels.append(strip.name_label)
+            self._volume_sliders.append(strip.volume_slider)
+            self._pan_sliders.append(strip.pan_slider)
+            self._mute_buttons.append(strip.mute_button)
+            self._solo_buttons.append(strip.solo_button)
             self._meter_bars.append(meter_bar)
             self._db_scale_widgets.append(db_scale_widget)
-            self._strip_lane_widgets.append(strip_lane_widget)
-            self._channel_boxes.append(channel)
-
-            channels_row.addWidget(channel)
+            self._strip_lane_widgets.append(strip.strip_lane)
+            self._channel_boxes.append(strip.channel_box)
 
         separator = QtWidgets.QFrame()
         separator.setFrameShape(QtWidgets.QFrame.Shape.VLine)
@@ -752,15 +496,15 @@ class SamplePadMixerDialog(QtWidgets.QDialog):
         output_strip_row.setContentsMargins(0, 0, 0, 0)
         output_strip_row.setSpacing(4)
 
-        output_meter_left = _PeakMeterWidget(self._strip_height, "#42a5f5")
+        output_meter_left = PeakMeterWidget(self._strip_height, "#42a5f5")
         output_meter_left.setToolTip("Output Left")
         output_strip_row.addWidget(output_meter_left, 0, QtCore.Qt.AlignmentFlag.AlignTop)
 
-        output_meter_right = _PeakMeterWidget(self._strip_height, "#90caf9")
+        output_meter_right = PeakMeterWidget(self._strip_height, "#90caf9")
         output_meter_right.setToolTip("Output Right")
         output_strip_row.addWidget(output_meter_right, 0, QtCore.Qt.AlignmentFlag.AlignTop)
 
-        output_db_scale = _DbScaleWidget(self._strip_height)
+        output_db_scale = DbScaleWidget(self._strip_height)
         output_strip_row.addWidget(output_db_scale, 0, QtCore.Qt.AlignmentFlag.AlignTop)
 
         output_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Vertical)

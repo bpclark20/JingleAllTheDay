@@ -1,3 +1,18 @@
+## 2.0.5.102926
+- Closing the application while connected to the remote server is now nearly instant (previously up to a 5 second delay).
+- The desktop app now tells the remote server when it is going offline on purpose (closing, disconnecting, reconnecting or testing the connection). The remote web app's offline banner now distinguishes an intentional shutdown from a lost connection.
+- The Offline Cache Backup complete/failed popups no longer play a Windows notification sound, which could be broadcast through the Live device (e.g. into a Discord call).
+- Fixed a crash risk when the Sample Pad Mixer was open (a regression from the main window code reorganization).
+- Fixed the Options dialog not saving the recording input device if it was the first device in the list.
+- Fixed startup failing if a saved sample pad board setting was corrupted.
+- Remote server: fixed an error being logged every time the desktop app disconnected cleanly.
+- Code cleanup and reorganization: options/settings handling, mixer UI, audio engine voice handling, ffmpeg/ffprobe helpers, and virtual broadcast device (Discord/OBS) setup guidance, laying groundwork for a future Windows version of the virtual device mixer feature.
+- The polyphony debug log is now disabled by default (enable with the JATD_POLYPHONY_DEBUG=1 environment variable).
+
+## 2.0.4.092226
+- Major code reorganization of the main application window: gui.py was split into separate feature modules (appearance, library, table, playback, sample pads, mixer/output routing, hotkeys, remote control, offline cache backup, audio diagnostics), reducing it from about 5,700 lines to 950. No intended change in behavior.
+- Fixed mixer mode not capturing the microphone when the Microphone setting was left on "System Default"; it now falls back to the system default input device.
+
 ## 2.0.3.091426
 - More remote control bugs squashed.
 - Added new queueing feature for remote control playback, and a way for the desktop app to add jingles to the currently running remote queue.

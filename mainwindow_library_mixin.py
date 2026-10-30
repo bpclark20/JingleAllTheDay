@@ -17,6 +17,7 @@ from app_helpers import (
     probe_duration_seconds as _probe_duration_seconds,
     tags_to_text as _tags_to_text,
 )
+from app_settings import read_bool, write_bool
 from mainwindow_contracts import MainWindowLibraryHost
 from models_store import JingleRecord
 from waveform_cache import build_waveform_previews
@@ -438,29 +439,22 @@ class MainWindowLibraryMixin:
             self._settings.setValue("library/samplesDir", str(self._samples_dir))
 
     def _load_auto_folder_tags(self) -> bool:
-        return str(self._settings.value("library/autoFolderTags", "")).strip().lower() == "true"
+        return read_bool(self._settings, "library/autoFolderTags", False)
 
     def _save_auto_folder_tags(self) -> None:
-        self._settings.setValue("library/autoFolderTags", "true" if self._auto_folder_tags else "false")
+        write_bool(self._settings, "library/autoFolderTags", self._auto_folder_tags)
 
     def _load_auto_generate_waveforms(self) -> bool:
-        return str(self._settings.value("library/autoGenerateWaveforms", "")).strip().lower() == "true"
+        return read_bool(self._settings, "library/autoGenerateWaveforms", False)
 
     def _save_auto_generate_waveforms(self) -> None:
-        self._settings.setValue(
-            "library/autoGenerateWaveforms",
-            "true" if self._auto_generate_waveforms else "false",
-        )
+        write_bool(self._settings, "library/autoGenerateWaveforms", self._auto_generate_waveforms)
 
     def _load_watch_library_changes(self) -> bool:
-        raw = str(self._settings.value("library/watchLibraryChanges", "true")).strip().lower()
-        return raw != "false"
+        return read_bool(self._settings, "library/watchLibraryChanges", True)
 
     def _save_watch_library_changes(self) -> None:
-        self._settings.setValue(
-            "library/watchLibraryChanges",
-            "true" if self._watch_library_changes else "false",
-        )
+        write_bool(self._settings, "library/watchLibraryChanges", self._watch_library_changes)
 
     def _maybe_run_first_time_setup(self) -> None:
         self._maybe_bootstrap_added_at_from_mtime()

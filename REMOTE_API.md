@@ -69,6 +69,21 @@ WebSocket endpoint: `wss://<jingleserver>/agent/connect`.
    ```json
    { "type": "status", "data": { "state": "playing", "is_live_mode": true, "current_name": "...", "current_path": "...", "position_seconds": 3.4, "duration_seconds": 9.2, "loop_mode": "off" } }
    ```
+4. **Going offline on purpose.** Before disconnecting deliberately, the
+   desktop announces why:
+   ```json
+   { "type": "going_offline", "reason": "shutdown" }
+   ```
+   `reason` is `shutdown` (app closing), `disconnect` (Server > Disconnect,
+   or remote control turned off in Options), `restart` (reconnecting, e.g.
+   after changing the server address/token) or `connection_test` (the
+   Options dialog's Test Connection). jingleserver replies
+   `{ "type": "going_offline_ack" }` and the desktop then performs the normal
+   WebSocket close handshake. The desktop waits at most 2 s for the ack (older
+   jingleserver builds never send one) and 2 s for the close handshake. A
+   connection that drops without this notice is recorded as
+   `connection_lost`; the result is exposed to browsers via
+   [`GET /api/status`](#get-apistatus).
 
 Desktop-side implementation: `remote_server.py`'s `RemoteRelayClient` (background
 asyncio thread, reconnects with backoff 1s→30s on any failure). Incoming
@@ -102,7 +117,12 @@ authenticated).
 
 ### `GET /api/status`
 
-If no desktop agent is connected: `{ "agent_connected": false }`.
+If no desktop agent is connected: `{ "agent_connected": false }`, plus — once
+an agent has connected and left since jingleserver started —
+`offline_reason` (`shutdown`, `disconnect`, `restart`, `connection_test` or
+`connection_lost`; see [going offline](#desktop--jingleserver-agent-protocol)),
+`offline_since` (epoch seconds) and `agent_label`. `WS /ws/status` pushes the
+same shape.
 Otherwise: `{ "agent_connected": true, ...status }` (see
 [Status object](#status-object)) — served from jingleserver's cached copy of
 the agent's last status push, so this never blocks on the agent.

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from PyQt6 import QtCore, QtWidgets
 
-from mixer_strip_builder import create_channel_strip
+from mixer_strip_builder import CHANNEL_STYLESHEET, create_channel_strip
 from mixer_model import MixerState
-from sample_pads import _DbScaleWidget, _PeakMeterWidget
+from mixer_widgets import DbScaleWidget, PeakMeterWidget
 
 
 class SequencerMixerDialog(QtWidgets.QDialog):
@@ -38,8 +38,8 @@ class SequencerMixerDialog(QtWidgets.QDialog):
         self._pan_sliders: list[QtWidgets.QSlider] = []
         self._mute_buttons: list[QtWidgets.QPushButton] = []
         self._solo_buttons: list[QtWidgets.QPushButton] = []
-        self._meter_bars: list[_PeakMeterWidget] = []
-        self._db_scale_widgets: list[_DbScaleWidget] = []
+        self._meter_bars: list[PeakMeterWidget] = []
+        self._db_scale_widgets: list[DbScaleWidget] = []
         self._strip_lane_widgets: list[QtWidgets.QWidget] = []
         self._channel_boxes: list[QtWidgets.QWidget] = []
         self._strip_height: int = 220
@@ -130,8 +130,8 @@ class SequencerMixerDialog(QtWidgets.QDialog):
         self._channel_boxes.clear()
 
         for idx, channel in enumerate(self._mixer_state.channels):
-            meter = _PeakMeterWidget(self._strip_height, "#26a69a")
-            db_scale_widget = _DbScaleWidget(self._strip_height)
+            meter = PeakMeterWidget(self._strip_height, "#26a69a")
+            db_scale_widget = DbScaleWidget(self._strip_height)
 
             strip = create_channel_strip(
                 parent_layout=self._channels_row,
@@ -154,16 +154,8 @@ class SequencerMixerDialog(QtWidgets.QDialog):
                 on_pan_dragged=None,
                 on_mute_toggled=lambda checked, channel_index=idx: self._on_mute_toggled(channel_index, checked),
                 on_solo_toggled=lambda checked, channel_index=idx: self._on_solo_toggled(channel_index, checked),
+                channel_stylesheet=CHANNEL_STYLESHEET,
             )
-            strip.channel_box.setObjectName("mixerChannel")
-            strip.channel_box.setStyleSheet(
-                "#mixerChannel {"
-                " border: 1px solid #3a464d;"
-                " border-radius: 4px;"
-                " background: #161c21;"
-                "}"
-            )
-            strip.name_label.setWordWrap(False)
 
             self._name_labels.append(strip.name_label)
             self._volume_sliders.append(strip.volume_slider)

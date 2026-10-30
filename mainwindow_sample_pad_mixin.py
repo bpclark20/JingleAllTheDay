@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 import threading
 from pathlib import Path
@@ -9,7 +10,8 @@ from typing import Any
 from PyQt6.QtCore import QUrl, Qt
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
-from app_helpers import QMediaPlayer, _has_pynput, _has_windows_native_hotkeys
+from app_helpers import QMediaPlayer, _has_pynput, _has_qt_multimedia, _has_windows_native_hotkeys
+from app_settings import write_bool
 from models_store import JingleRecord
 from recording_engine import RecordingConfig, get_recording_engine
 from sample_pad_audio_engine import SamplePadAudioEngine as _SamplePadAudioEngine
@@ -783,9 +785,8 @@ class MainWindowSamplePadMixin:
 
     def _on_sample_pads_recording_mode_toggled(self, enabled: bool) -> None:
         self._sample_pad_recording_mode_enabled = bool(enabled)
-        self._settings.setValue(
-            "samplePads/recordingModeEnabled",
-            "true" if self._sample_pad_recording_mode_enabled else "false",
+        write_bool(
+            self._settings, "samplePads/recordingModeEnabled", self._sample_pad_recording_mode_enabled
         )
         if not self._sample_pad_recording_mode_enabled and self._sample_pad_recording_active:
             self._stop_sample_pad_recording(save_to_pad=True)

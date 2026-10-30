@@ -29,6 +29,8 @@ _SAFE_RELPATH = re.compile(r"^[A-Za-z0-9_.\-\/]+$")
 _live_library_paths: dict[str, str] = {}
 _preview_transcode_lock = asyncio.Lock()
 _LOSSLESS_SUFFIXES = {".aif", ".aiff", ".alac", ".flac", ".pcm", ".wav"}
+# Reasons an agent may give in its `going_offline` message.
+_AGENT_OFFLINE_REASONS = {"shutdown", "disconnect", "restart", "connection_test"}
 
 
 def _public_library_item(item: dict[str, Any]) -> dict[str, Any]:
@@ -217,7 +219,7 @@ def session_info(jsid: str | None = Cookie(default=None)) -> dict[str, Any]:
 @app.get("/api/status")
 async def get_status(user=Depends(get_current_user)) -> dict[str, Any]:
     if not agent_manager.is_connected():
-        return {"agent_connected": False}
+        return {"agent_connected": False, **agent_manager.offline_info()}
     status = agent_manager.last_status() or {}
     return {"agent_connected": True, **_public_status(status)}
 
@@ -496,7 +498,7 @@ async def ws_status(websocket: WebSocket) -> None:
             if agent_manager.is_connected():
                 payload = {"agent_connected": True, **_public_status(agent_manager.last_status() or {})}
             else:
-                payload = {"agent_connected": False}
+                payload = {"agent_connected": False, **agent_manager.offline_info()}
             await websocket.send_json(payload)
             await asyncio.sleep(0.5)
     except WebSocketDisconnect:
@@ -529,10 +531,24 @@ async def agent_connect(websocket: WebSocket) -> None:
             # Audio chunks arrive as binary frames; everything else (status pushes,
             # command replies, audio_start/end/error control messages) is JSON text.
             raw = await websocket.receive()
+            if raw.get("type") == "websocket.disconnect":
+                # A clean close arrives as a message, not WebSocketDisconnect;
+                # receiving again after it raises RuntimeError.
+                break
             if raw.get("bytes") is not None:
                 agent_manager.handle_incoming_bytes(raw["bytes"])
             elif raw.get("text") is not None:
-                agent_manager.handle_incoming(json.loads(raw["text"]))
+                message = json.loads(raw["text"])
+                if message.get("type") == "going_offline":
+                    # Intentional disconnect: remember why, then acknowledge so the
+                    # agent knows it can close (it performs the close handshake next).
+                    reason = str(message.get("reason", ""))
+                    agent_manager.mark_going_offline(
+                        websocket, reason if reason in _AGENT_OFFLINE_REASONS else "disconnect"
+                    )
+                    await websocket.send_json({"type": "going_offline_ack"})
+                    continue
+                agent_manager.handle_incoming(message)
     except WebSocketDisconnect:
         pass
     finally:

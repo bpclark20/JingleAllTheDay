@@ -12,11 +12,8 @@ from app_helpers import (
     APPEARANCE_MODE_DARK,
     APPEARANCE_MODE_LIGHT,
     APPEARANCE_MODE_SYSTEM,
-    SAMPLE_PAD_BLOCKSIZE_OPTIONS,
     QAudioOutput,
     QMediaPlayer,
-    _coerce_sample_pad_blocksize,
-    _coerce_sample_pad_streaming_min_seconds,
     _has_qt_multimedia,
     _normalize_recording_wav_subtype,
     apply_app_appearance_mode as _apply_app_appearance_mode,
@@ -24,13 +21,12 @@ from app_helpers import (
     apply_windows_taskbar_icon as _apply_windows_taskbar_icon,
     chip_palette_for_tag_seed as _chip_palette_for_tag_seed,
     coerce_appearance_mode as _coerce_appearance_mode,
-    coerce_recent_window_days as _coerce_recent_window_days,
-    coerce_volume_percent as _coerce_volume_percent,
     ensure_qt_logging_rules as _ensure_qt_logging_rules,
     format_duration_hms as _format_duration_hms,
     format_size_label as _format_size_label,
     probe_duration_seconds as _probe_duration_seconds,
 )
+from app_settings import OptionsSettings, read_bool, read_float, read_int, read_str
 from dialogs import (
     AudioDiagnosticsDialog,
     OptionsDialog,
@@ -166,97 +162,30 @@ class MainWindow(
             (self._app_data_dir / "playlists_autosave.json").resolve()
         )
         self._settings.setValue("playlists/autosavePath", self._playlists_autosave_path)
-        self._output_device = str(self._settings.value("options/outputDevice", "")).strip()
-        self._preview_output_device = str(self._settings.value("options/previewOutputDevice", "")).strip()
-        self._broadcast_output_device = str(
-            self._settings.value("options/broadcastOutputDevice", "")
-        ).strip()
-        self._mixer_enabled = (
-            str(self._settings.value("options/mixerEnabled", "false")).strip().lower() == "true"
-        )
-        self._microphone_input_device = str(
-            self._settings.value("options/microphoneInputDevice", "")
-        ).strip()
-        try:
-            self._recording_input_device = int(self._settings.value("options/recordingInputDevice", -1))
-        except (TypeError, ValueError):
-            self._recording_input_device = -1
-        if self._recording_input_device < 0:
-            self._recording_input_device = -1
+        self._set_options_attributes(OptionsSettings.load(self._settings))
         self._recording_wav_subtype = _normalize_recording_wav_subtype(
             self._settings.value("options/recordingWavSubtype", "PCM_16")
         )
-        try:
-            self._microphone_gain_percent = int(
-                self._settings.value("options/microphoneGainPercent", 100)
-            )
-        except (TypeError, ValueError):
-            self._microphone_gain_percent = 100
-        self._microphone_gain_percent = max(0, min(200, self._microphone_gain_percent))
-        self._live_volume_percent = _coerce_volume_percent(
-            self._settings.value("options/liveVolumePercent", 100)
+        self._cache_backup_last_epoch = read_float(self._settings, "server/lastCacheBackupEpoch", 0.0)
+        self._cache_backup_snooze_until_epoch = read_float(
+            self._settings, "server/cacheBackupSnoozeUntilEpoch", 0.0
         )
-        self._preview_volume_percent = _coerce_volume_percent(
-            self._settings.value("options/previewVolumePercent", 100)
-        )
-        self._sample_pad_blocksize = _coerce_sample_pad_blocksize(
-            self._settings.value("options/samplePadBlocksize", 128)
-        )
-        self._sample_pad_streaming_min_seconds = _coerce_sample_pad_streaming_min_seconds(
-            self._settings.value("options/samplePadStreamingMinSeconds", 120)
-        )
-        self._recent_window_days = _coerce_recent_window_days(
-            self._settings.value("options/recentWindowDays", 14)
-        )
-        self._server_enabled = (
-            str(self._settings.value("server/enabled", "true")).strip().lower() == "true"
-        )
-        self._server_address = str(self._settings.value("server/address", "")).strip()
-        self._server_device_token = str(self._settings.value("server/deviceToken", "")).strip()
-        try:
-            self._cache_backup_reminder_days = int(
-                self._settings.value("server/cacheBackupReminderDays", 7)
-            )
-        except (TypeError, ValueError):
-            self._cache_backup_reminder_days = 7
-        if self._cache_backup_reminder_days < 1:
-            self._cache_backup_reminder_days = 7
-        try:
-            self._cache_backup_last_epoch = float(
-                self._settings.value("server/lastCacheBackupEpoch", 0.0)
-            )
-        except (TypeError, ValueError):
-            self._cache_backup_last_epoch = 0.0
-        try:
-            self._cache_backup_snooze_until_epoch = float(
-                self._settings.value("server/cacheBackupSnoozeUntilEpoch", 0.0)
-            )
-        except (TypeError, ValueError):
-            self._cache_backup_snooze_until_epoch = 0.0
-        self._sample_pads_last_layout_path = str(
-            self._settings.value("samplePads/lastLayoutPath", "")
-        ).strip()
+        self._sample_pads_last_layout_path = read_str(self._settings, "samplePads/lastLayoutPath")
         self._audio_diagnostics_dialog: AudioDiagnosticsDialog | None = None
-        self._sample_pad_global_hotkeys_enabled = (
-            str(self._settings.value("samplePads/globalHotkeysEnabled", "false")).strip().lower()
-            == "true"
+        self._sample_pad_global_hotkeys_enabled = read_bool(
+            self._settings, "samplePads/globalHotkeysEnabled", False
         )
-        self._sample_pad_alt_modifier = (
-            str(self._settings.value("samplePads/globalHotkeysAltModifier", "false")).strip().lower()
-            == "true"
+        self._sample_pad_alt_modifier = read_bool(
+            self._settings, "samplePads/globalHotkeysAltModifier", False
         )
-        self._sample_pad_board_switch_requires_ctrl = (
-            str(self._settings.value("samplePads/boardSwitchRequiresCtrl", "false")).strip().lower()
-            == "true"
+        self._sample_pad_board_switch_requires_ctrl = read_bool(
+            self._settings, "samplePads/boardSwitchRequiresCtrl", False
         )
-        self._sample_pad_active_board_index = int(
-            self._settings.value("samplePads/activeBoardIndex", 0)
+        self._sample_pad_active_board_index = read_int(
+            self._settings, "samplePads/activeBoardIndex", 0, minimum=0, maximum=4
         )
-        if self._sample_pad_active_board_index < 0 or self._sample_pad_active_board_index > 4:
-            self._sample_pad_active_board_index = 0
-        self._sample_pad_recording_mode_enabled = (
-            str(self._settings.value("samplePads/recordingModeEnabled", "false")).strip().lower()
-            == "true"
+        self._sample_pad_recording_mode_enabled = read_bool(
+            self._settings, "samplePads/recordingModeEnabled", False
         )
         self._sample_pad_listener: Any | None = None
         self._sample_pad_hotkey_backend = "none"
@@ -808,7 +737,7 @@ class MainWindow(
                 pass
         self._stop_sample_pad_global_hotkeys()
         if hasattr(self, "_remote_manager"):
-            self._remote_manager.stop()
+            self._remote_manager.stop(reason="shutdown")
         self._sp_engine.close()
         self._sp_monitor_engine.close()
         if self._main_playback_engine is not None:
@@ -821,82 +750,58 @@ class MainWindow(
         settings.setFallbacksEnabled(False)
         return settings
 
-    def _on_open_options(self) -> None:
-        dialog = OptionsDialog(
-            self._output_device,
-            self._preview_output_device,
-            self._broadcast_output_device,
-            self._mixer_enabled,
-            self._microphone_input_device,
-            self._recording_input_device,
-            self._microphone_gain_percent,
-            self._live_volume_percent,
-            self._preview_volume_percent,
-            self._recent_window_days,
-            self._sample_pad_blocksize,
-            self._sample_pad_streaming_min_seconds,
-            self._samples_dir,
-            self._server_enabled,
-            self._server_address,
-            self._server_device_token,
-            self._cache_backup_reminder_days,
-            self,
+    def _options_snapshot(self) -> OptionsSettings:
+        return OptionsSettings(
+            output_device=self._output_device,
+            preview_output_device=self._preview_output_device,
+            broadcast_output_device=self._broadcast_output_device,
+            mixer_enabled=self._mixer_enabled,
+            microphone_input_device=self._microphone_input_device,
+            recording_input_device=self._recording_input_device,
+            microphone_gain_percent=self._microphone_gain_percent,
+            live_volume_percent=self._live_volume_percent,
+            preview_volume_percent=self._preview_volume_percent,
+            recent_window_days=self._recent_window_days,
+            sample_pad_blocksize=self._sample_pad_blocksize,
+            sample_pad_streaming_min_seconds=self._sample_pad_streaming_min_seconds,
+            server_enabled=self._server_enabled,
+            server_address=self._server_address,
+            server_device_token=self._server_device_token,
+            cache_backup_reminder_days=self._cache_backup_reminder_days,
         )
+
+    def _set_options_attributes(self, options: OptionsSettings) -> None:
+        self._output_device = options.output_device
+        self._preview_output_device = options.preview_output_device
+        self._broadcast_output_device = options.broadcast_output_device
+        self._mixer_enabled = options.mixer_enabled
+        self._microphone_input_device = options.microphone_input_device
+        self._recording_input_device = options.recording_input_device
+        self._microphone_gain_percent = options.microphone_gain_percent
+        self._live_volume_percent = options.live_volume_percent
+        self._preview_volume_percent = options.preview_volume_percent
+        self._recent_window_days = options.recent_window_days
+        self._sample_pad_blocksize = options.sample_pad_blocksize
+        self._sample_pad_streaming_min_seconds = options.sample_pad_streaming_min_seconds
+        self._server_enabled = options.server_enabled
+        self._server_address = options.server_address
+        self._server_device_token = options.server_device_token
+        self._cache_backup_reminder_days = options.cache_backup_reminder_days
+
+    def _on_open_options(self) -> None:
+        previous = self._options_snapshot()
+        dialog = OptionsDialog(previous, self._samples_dir, self)
         if dialog.exec() != int(QDialog.DialogCode.Accepted):
             return
 
-        (
-            self._output_device,
-            self._preview_output_device,
-            self._broadcast_output_device,
-        ) = dialog.selected_devices()
-        (
-            self._mixer_enabled,
-            self._microphone_input_device,
-            self._microphone_gain_percent,
-        ) = dialog.selected_mixer_config()
-        self._recording_input_device = dialog.selected_recording_device() or -1
-        self._live_volume_percent, self._preview_volume_percent = dialog.selected_volumes()
-        selected_recent_window_days = dialog.selected_recent_window_days()
-        self._sample_pad_blocksize = dialog.selected_sample_pad_blocksize()
-        self._sample_pad_streaming_min_seconds = (
-            dialog.selected_sample_pad_streaming_min_seconds()
-        )
-        self._settings.setValue("options/outputDevice", self._output_device)
-        self._settings.setValue("options/previewOutputDevice", self._preview_output_device)
-        self._settings.setValue("options/broadcastOutputDevice", self._broadcast_output_device)
-        self._settings.setValue(
-            "options/mixerEnabled", "true" if self._mixer_enabled else "false"
-        )
-        self._settings.setValue(
-            "options/microphoneInputDevice", self._microphone_input_device
-        )
-        self._settings.setValue("options/recordingInputDevice", self._recording_input_device)
-        self._settings.setValue(
-            "options/microphoneGainPercent", self._microphone_gain_percent
-        )
-        self._settings.setValue("options/recentWindowDays", selected_recent_window_days)
-        self._settings.setValue("options/samplePadBlocksize", self._sample_pad_blocksize)
-        self._settings.setValue(
-            "options/samplePadStreamingMinSeconds",
-            self._sample_pad_streaming_min_seconds,
-        )
+        options = dialog.selected_options()
+        self._set_options_attributes(options)
+        options.save(self._settings)
 
-        new_server_enabled = dialog.selected_server_enabled()
-        new_server_address = dialog.selected_server_address()
-        new_server_device_token = dialog.selected_server_device_token()
-        new_cache_backup_reminder_days = dialog.selected_cache_backup_reminder_days()
         connection_settings_changed = (
-            new_server_address != self._server_address or new_server_device_token != self._server_device_token
+            options.server_address != previous.server_address
+            or options.server_device_token != previous.server_device_token
         )
-        self._server_enabled = new_server_enabled
-        self._server_address = new_server_address
-        self._server_device_token = new_server_device_token
-        self._cache_backup_reminder_days = new_cache_backup_reminder_days
-        self._settings.setValue("server/enabled", "true" if self._server_enabled else "false")
-        self._settings.setValue("server/address", self._server_address)
-        self._settings.setValue("server/deviceToken", self._server_device_token)
-        self._settings.setValue("server/cacheBackupReminderDays", self._cache_backup_reminder_days)
         if hasattr(self, "_remote_manager"):
             if self._remote_manager.is_running() and connection_settings_changed:
                 self._remote_manager.restart()
@@ -905,14 +810,12 @@ class MainWindow(
             elif not self._server_enabled and self._remote_manager.is_running():
                 self._remote_manager.stop()
 
-        if selected_recent_window_days != self._recent_window_days:
-            self._recent_window_days = selected_recent_window_days
+        if options.recent_window_days != previous.recent_window_days:
             self._refresh_recent_runtime_from_store()
         self._sp_engine.set_streaming_min_seconds(self._sample_pad_streaming_min_seconds)
         self._sp_engine.set_mixer_enabled(self._mixer_enabled)
         self._sp_engine.set_input_gain(self._microphone_gain_percent / 100.0)
         self._apply_mixer_input_device(notify_errors=True)
-        self._save_volume_settings()
         self._refresh_mode_toggle_state(notify_if_disabled=True)
         self._refresh_volume_controls()
         self._apply_output_device()

@@ -17,8 +17,12 @@ callback reads is protected by a threading.Lock.
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import logging
+import logging.handlers
+import os
+import queue
 import tempfile
 import threading
 import time
@@ -26,11 +30,12 @@ from collections import deque
 import math
 import re
 from pathlib import Path
-import shutil
 import subprocess
 from typing import Optional
 
 import numpy as np
+
+from media_tools import NO_WINDOW_FLAGS, ffmpeg_path, probe_duration_seconds
 
 try:
     import sounddevice as sd
@@ -44,22 +49,35 @@ def is_available() -> bool:
     return _AVAILABLE
 
 
-# --- Temporary polyphony-interference investigation logging -----------------
+# --- Polyphony-interference investigation logging ---------------------------
 # Logs which engine instance opens a stream on which device, and voice
 # start/fade events, to a plain-text file so multi-pad/main-list overlap
-# scenarios can be traced without a debugger attached. Remove once the
-# polyphony regression is root-caused and fixed.
+# scenarios can be traced without a debugger attached. Disabled unless
+# JATD_POLYPHONY_DEBUG=1 is set. Records are handed to a background thread
+# because most call sites hold the lock the PortAudio callback also takes;
+# file I/O there would risk audio dropouts.
+_POLY_LOG_ENABLED = os.environ.get("JATD_POLYPHONY_DEBUG", "").strip() in {"1", "true", "yes"}
 _POLY_LOG_PATH = Path(tempfile.gettempdir()) / "jingleallhteday_polyphony_debug.log"
 _poly_logger = logging.getLogger("jatd.polyphony_debug")
-if not _poly_logger.handlers:
+if _POLY_LOG_ENABLED and not _poly_logger.handlers:
     _poly_logger.setLevel(logging.DEBUG)
-    _poly_handler = logging.FileHandler(_POLY_LOG_PATH, encoding="utf-8")
-    _poly_handler.setFormatter(logging.Formatter("%(asctime)s.%(msecs)03d %(message)s", datefmt="%H:%M:%S"))
-    _poly_logger.addHandler(_poly_handler)
+    _poly_file_handler = logging.handlers.RotatingFileHandler(
+        _POLY_LOG_PATH, maxBytes=2 * 1024 * 1024, backupCount=1, encoding="utf-8"
+    )
+    _poly_file_handler.setFormatter(
+        logging.Formatter("%(asctime)s.%(msecs)03d %(message)s", datefmt="%H:%M:%S")
+    )
+    _poly_queue: queue.SimpleQueue[logging.LogRecord] = queue.SimpleQueue()
+    _poly_logger.addHandler(logging.handlers.QueueHandler(_poly_queue))
     _poly_logger.propagate = False
+    _poly_listener = logging.handlers.QueueListener(_poly_queue, _poly_file_handler)
+    _poly_listener.start()
+    atexit.register(_poly_listener.stop)
 
 
 def _poly_log(message: str) -> None:
+    if not _POLY_LOG_ENABLED:
+        return
     try:
         _poly_logger.debug(message)
     except Exception:
@@ -91,61 +109,6 @@ def list_audio_devices(*, channel_key: str | None = None) -> list[dict[str, obje
     return results
 
 
-def _get_ffmpeg_path() -> str | None:
-    global _FFMPEG_PATH, _FFMPEG_CHECKED
-    if _FFMPEG_CHECKED:
-        return _FFMPEG_PATH
-    _FFMPEG_CHECKED = True
-    _FFMPEG_PATH = shutil.which("ffmpeg")
-    return _FFMPEG_PATH
-
-
-def _get_ffprobe_path() -> str | None:
-    global _FFPROBE_PATH, _FFPROBE_CHECKED
-    if _FFPROBE_CHECKED:
-        return _FFPROBE_PATH
-    _FFPROBE_CHECKED = True
-    _FFPROBE_PATH = shutil.which("ffprobe")
-    return _FFPROBE_PATH
-
-
-def _probe_duration_seconds(path: str | Path) -> float | None:
-    """Fall back to ffprobe for containers libsndfile cannot read (e.g. .m4a/.aac)."""
-    ffprobe = _get_ffprobe_path()
-    if not ffprobe:
-        return None
-    args = [
-        ffprobe,
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        str(path),
-    ]
-    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    try:
-        result = subprocess.run(
-            args,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-            creationflags=creation_flags,
-            timeout=2.0,
-            check=False,
-        )
-    except Exception:
-        return None
-    value = (result.stdout or b"").decode("utf-8", errors="ignore").strip()
-    if not value:
-        return None
-    try:
-        return max(0.0, float(value))
-    except ValueError:
-        return None
-
-
 # ---------------------------------------------------------------------------
 # Fade length used when a retrigger or stop interrupts an active voice.
 # 2 ms at the output sample rate is imperceptible as silence but long enough
@@ -155,10 +118,6 @@ _LOW_LATENCY_BLOCKSIZE = 128
 _FALLBACK_BLOCKSIZE = 256
 _MIX_HEADROOM = 0.92
 _STREAMING_MIN_SECONDS = 120.0
-_FFMPEG_PATH: str | None = None
-_FFMPEG_CHECKED = False
-_FFPROBE_PATH: str | None = None
-_FFPROBE_CHECKED = False
 
 
 class _Voice:
@@ -838,7 +797,7 @@ class SamplePadAudioEngine:
 
     @staticmethod
     def _load_pcm_via_ffmpeg(path: str | Path, samplerate: int, channels: int) -> np.ndarray | None:
-        ffmpeg = _get_ffmpeg_path()
+        ffmpeg = ffmpeg_path()
         if not ffmpeg:
             return None
         args = [
@@ -859,7 +818,7 @@ class SamplePadAudioEngine:
             str(samplerate),
             "pipe:1",
         ]
-        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        creation_flags = NO_WINDOW_FLAGS
         try:
             result = subprocess.run(
                 args,
@@ -982,18 +941,15 @@ class SamplePadAudioEngine:
             return chunk[:, :channels]
         return chunk
 
-    def _start_voice(
-        self,
-        pcm: np.ndarray,
+    @staticmethod
+    def _clip_frame_window(
+        n_frames: int,
         stream_sr: int,
         clip_start_seconds: float,
         clip_stop_seconds: float,
-        loop: bool,
-        volume: float,
-        pad_index: int,
-        start_position_seconds: float | None = None,
-    ) -> None:
-        n_frames = pcm.shape[0]
+        start_position_seconds: float | None,
+    ) -> tuple[int, int, int]:
+        """Return (start_frame, stop_frame, initial_playhead_frame) for a clip."""
         start_frame = max(0, int(clip_start_seconds * stream_sr))
         stop_frame = int(clip_stop_seconds * stream_sr) if clip_stop_seconds > 0 else n_frames
         stop_frame = min(stop_frame, n_frames)
@@ -1005,7 +961,15 @@ class SamplePadAudioEngine:
         # later position without moving where the loop wraps back to.
         pos_seconds = start_frame / stream_sr if start_position_seconds is None else start_position_seconds
         pos_frame = max(start_frame, min(int(pos_seconds * stream_sr), stop_frame))
+        return start_frame, stop_frame, pos_frame
 
+    def _register_voice(self, voice: _Voice | _StreamingVoice, stream_sr: int, kind: str) -> None:
+        """Assign an id to a fully built voice and make it audible.
+
+        Retriggering a pad fades out that pad's previous voice; voices with a
+        negative pad index never replace one another.
+        """
+        pad_index = voice.pad_index
         with self._lock:
             fade_samples = max(1, int(stream_sr * 0.002))
             if pad_index >= 0:
@@ -1017,23 +981,40 @@ class SamplePadAudioEngine:
 
             voice_id = self._next_voice_id
             self._next_voice_id += 1
-            new_voice = _Voice(
-                voice_id=voice_id,
-                pad_index=pad_index,
-                pcm=pcm,
-                clip_start=start_frame,
-                clip_end=stop_frame,
-                loop=loop,
-                volume=volume,
-            )
-            new_voice.pos = pos_frame
-            self._voices[voice_id] = new_voice
+            voice.voice_id = voice_id
+            self._voices[voice_id] = voice
             if pad_index >= 0:
                 self._pad_to_voice[pad_index] = voice_id
             _poly_log(
-                f"[{self._name}] voice START (pcm) id={voice_id} pad={pad_index} "
+                f"[{self._name}] voice START ({kind}) id={voice_id} pad={pad_index} "
                 f"active_voices={len(self._voices)} device={self._stream_device!r}"
             )
+
+    def _start_voice(
+        self,
+        pcm: np.ndarray,
+        stream_sr: int,
+        clip_start_seconds: float,
+        clip_stop_seconds: float,
+        loop: bool,
+        volume: float,
+        pad_index: int,
+        start_position_seconds: float | None = None,
+    ) -> None:
+        start_frame, stop_frame, pos_frame = self._clip_frame_window(
+            int(pcm.shape[0]), stream_sr, clip_start_seconds, clip_stop_seconds, start_position_seconds
+        )
+        new_voice = _Voice(
+            voice_id=-1,
+            pad_index=pad_index,
+            pcm=pcm,
+            clip_start=start_frame,
+            clip_end=stop_frame,
+            loop=loop,
+            volume=volume,
+        )
+        new_voice.pos = pos_frame
+        self._register_voice(new_voice, stream_sr, "pcm")
 
     def _start_streaming_voice(
         self,
@@ -1046,18 +1027,9 @@ class SamplePadAudioEngine:
         pad_index: int,
         start_position_seconds: float | None = None,
     ) -> bool:
-        n_frames = int(stream.frames)
-        start_frame = max(0, int(clip_start_seconds * stream_sr))
-        stop_frame = int(clip_stop_seconds * stream_sr) if clip_stop_seconds > 0 else n_frames
-        stop_frame = min(stop_frame, n_frames)
-        if stop_frame <= start_frame:
-            start_frame = 0
-            stop_frame = n_frames
-
-        # Initial playhead defaults to the loop window start; a seek passes a
-        # later position without moving where the loop wraps back to.
-        pos_seconds = start_frame / stream_sr if start_position_seconds is None else start_position_seconds
-        pos_frame = max(start_frame, min(int(pos_seconds * stream_sr), stop_frame))
+        start_frame, stop_frame, pos_frame = self._clip_frame_window(
+            int(stream.frames), stream_sr, clip_start_seconds, clip_stop_seconds, start_position_seconds
+        )
 
         try:
             stream.seek(pos_frame)
@@ -1068,36 +1040,19 @@ class SamplePadAudioEngine:
                 pass
             return False
 
-        with self._lock:
-            fade_samples = max(1, int(stream_sr * 0.002))
-            if pad_index >= 0:
-                old_voice_id = self._pad_to_voice.get(pad_index)
-                old_voice = self._voices.get(old_voice_id) if old_voice_id is not None else None
-                if old_voice is not None:
-                    _poly_log(f"[{self._name}] retrigger pad={pad_index} fading old voice={old_voice_id}")
-                    self._begin_voice_fade(old_voice, fade_samples)
-
-            voice_id = self._next_voice_id
-            self._next_voice_id += 1
-            new_voice = _StreamingVoice(
-                voice_id=voice_id,
-                pad_index=pad_index,
-                stream=stream,
-                clip_start=start_frame,
-                clip_end=stop_frame,
-                loop=loop,
-                volume=volume,
-            )
-            new_voice.pos = pos_frame
-            new_voice.max_buffer_frames = max(16384, int(stream_sr * 6.0))
-            new_voice.start_buffer_frames = max(4096, int(stream_sr * 0.35))
-            self._voices[voice_id] = new_voice
-            if pad_index >= 0:
-                self._pad_to_voice[pad_index] = voice_id
-            _poly_log(
-                f"[{self._name}] voice START (streaming/sf) id={voice_id} pad={pad_index} "
-                f"active_voices={len(self._voices)} device={self._stream_device!r}"
-            )
+        new_voice = _StreamingVoice(
+            voice_id=-1,
+            pad_index=pad_index,
+            stream=stream,
+            clip_start=start_frame,
+            clip_end=stop_frame,
+            loop=loop,
+            volume=volume,
+        )
+        new_voice.pos = pos_frame
+        new_voice.max_buffer_frames = max(16384, int(stream_sr * 6.0))
+        new_voice.start_buffer_frames = max(4096, int(stream_sr * 0.35))
+        self._register_voice(new_voice, stream_sr, "streaming/sf")
 
         worker = threading.Thread(
             target=self._streaming_worker,
@@ -1216,7 +1171,7 @@ class SamplePadAudioEngine:
             info = sf.info(str(path))
             duration = float(info.frames) / float(info.samplerate or 1)
         except Exception:
-            probed = _probe_duration_seconds(path)
+            probed = probe_duration_seconds(path)
             if probed is None:
                 return False
             duration = probed
@@ -1243,7 +1198,7 @@ class SamplePadAudioEngine:
                 old_proc.terminate()
             except Exception:
                 pass
-        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        creation_flags = NO_WINDOW_FLAGS
         try:
             voice.ffmpeg_process = subprocess.Popen(
                 args,
@@ -1306,7 +1261,7 @@ class SamplePadAudioEngine:
         if info is None:
             # libsndfile can't read this container (e.g. m4a/AAC); use ffprobe for
             # duration and go straight to ffmpeg pipe streaming below.
-            probed = _probe_duration_seconds(path)
+            probed = probe_duration_seconds(path)
             if probed is None or probed < self._streaming_min_seconds:
                 return False
             return self._try_start_ffmpeg_streaming_voice(
@@ -1374,7 +1329,7 @@ class SamplePadAudioEngine:
         pad_index: int,
         start_position_seconds: float | None = None,
     ) -> bool:
-        ffmpeg = _get_ffmpeg_path()
+        ffmpeg = ffmpeg_path()
         if not ffmpeg:
             return False
 
@@ -1424,7 +1379,7 @@ class SamplePadAudioEngine:
 
         ffmpeg_args = _build_ffmpeg_args(start_position, start_duration)
         loop_restart_args = _build_ffmpeg_args(clip_start, clip_duration)
-        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        creation_flags = NO_WINDOW_FLAGS
         try:
             proc = subprocess.Popen(
                 ffmpeg_args,
@@ -1437,37 +1392,20 @@ class SamplePadAudioEngine:
             return False
 
         clip_frames = max(1, int(round(clip_duration * float(stream_sr))))
-        with self._lock:
-            fade_samples = max(1, int(stream_sr * 0.002))
-            if pad_index >= 0:
-                old_voice_id = self._pad_to_voice.get(pad_index)
-                old_voice = self._voices.get(old_voice_id) if old_voice_id is not None else None
-                if old_voice is not None:
-                    _poly_log(f"[{self._name}] retrigger pad={pad_index} fading old voice={old_voice_id}")
-                    self._begin_voice_fade(old_voice, fade_samples)
-
-            voice_id = self._next_voice_id
-            self._next_voice_id += 1
-            voice = _StreamingVoice(
-                voice_id=voice_id,
-                pad_index=pad_index,
-                stream=None,
-                clip_start=0,
-                clip_end=clip_frames,
-                loop=loop,
-                volume=volume,
-            )
-            voice.ffmpeg_process = proc
-            voice.ffmpeg_args = loop_restart_args
-            voice.max_buffer_frames = max(16384, int(stream_sr * 6.0))
-            voice.start_buffer_frames = max(4096, int(stream_sr * 0.35))
-            self._voices[voice_id] = voice
-            if pad_index >= 0:
-                self._pad_to_voice[pad_index] = voice_id
-            _poly_log(
-                f"[{self._name}] voice START (streaming/ffmpeg) id={voice_id} pad={pad_index} "
-                f"active_voices={len(self._voices)} device={self._stream_device!r}"
-            )
+        voice = _StreamingVoice(
+            voice_id=-1,
+            pad_index=pad_index,
+            stream=None,
+            clip_start=0,
+            clip_end=clip_frames,
+            loop=loop,
+            volume=volume,
+        )
+        voice.ffmpeg_process = proc
+        voice.ffmpeg_args = loop_restart_args
+        voice.max_buffer_frames = max(16384, int(stream_sr * 6.0))
+        voice.start_buffer_frames = max(4096, int(stream_sr * 0.35))
+        self._register_voice(voice, stream_sr, "streaming/ffmpeg")
 
         worker = threading.Thread(
             target=self._streaming_worker,

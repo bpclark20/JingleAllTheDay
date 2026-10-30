@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-import shutil
-import sys
 from typing import Any
 
 from app_helpers import _has_qt_multimedia, QMediaDevices
-from dialogs import (
-    AudioDiagnosticsDialog,
+from broadcast_routing import (
+    broadcast_route_warnings,
     format_audio_device_label as _format_audio_device_label,
     is_virtual_audio_device_name as _is_virtual_audio_device_name,
+    virtual_device_guide,
 )
+from dialogs import AudioDiagnosticsDialog
 import sample_pad_audio_engine as _sp_engine_mod
 
 
@@ -93,7 +93,7 @@ class MainWindowAudioDiagnosticsMixin:
             "portaudio_input_devices": portaudio_inputs,
             "virtual_candidates": virtual_candidates,
             "warnings": self._broadcast_route_warnings(),
-            "linux_assistant": self._linux_virtual_sink_assistant(),
+            **self._virtual_device_assistant_snapshot(),
         }
 
     def _on_help_audio_diagnostics(self) -> None:
@@ -108,56 +108,28 @@ class MainWindowAudioDiagnosticsMixin:
         self._audio_diagnostics_dialog.activateWindow()
 
     def _broadcast_route_warnings(self) -> list[str]:
-        warnings: list[str] = []
-        live_device = self._output_device.strip()
-        broadcast_device = self._broadcast_output_device.strip()
-        if not self._mixer_enabled:
-            warnings.append(
-                "Mixer mode is off, so microphone audio will not be sent to the Broadcast Device until mixer mode is enabled."
-            )
-        if not broadcast_device:
-            if live_device and not _is_virtual_audio_device_name(live_device):
-                warnings.append(
-                    "No Broadcast Device is selected. Microphone broadcast and mirrored main-window playback will follow the Live Device, which may not be suitable for Discord/OBS style capture unless it is a virtual sink."
-                )
-        else:
-            if not _is_virtual_audio_device_name(broadcast_device):
-                warnings.append(
-                    "Broadcast Device does not look like a virtual or loopback device. Physical playback devices usually do not behave like isolated broadcast feeds."
-                )
-            if self._normalize_device_key(broadcast_device) == self._normalize_device_key(live_device):
-                warnings.append(
-                    "Broadcast Device matches the Live Device, so local monitoring and broadcast routing are not isolated from each other."
-                )
-        warnings.append(
-            "Main library jingles are mirrored to the Broadcast Device. Sample-pad jingles continue to follow the current Live/Preview monitor route, and live-mode sample pads are also duplicated to the Broadcast Device when it differs from the monitor route."
+        return broadcast_route_warnings(
+            self._output_device, self._broadcast_output_device, self._mixer_enabled
         )
-        return warnings
 
-    def _linux_virtual_sink_assistant(self) -> list[str]:
-        if not sys.platform.startswith("linux"):
-            return ["Linux assistant is only available on Linux systems."]
-        lines: list[str] = []
-        if shutil.which("pactl"):
-            lines.extend(
-                [
-                    "Create both the broadcast sink and a Discord-friendly source:",
-                    'pactl load-module module-null-sink sink_name=JingleBroadcast sink_properties=device.description="Jingle Broadcast"',
-                    'pactl load-module module-remap-source master=JingleBroadcast.monitor source_name=JingleMic source_properties=device.description="Jingle Mic"',
-                    "List sinks and sources after creating them:",
-                    "pactl list short sinks",
-                    "pactl list short sources",
-                    "In Discord, select Jingle Mic as the input device. In Audacity, Jingle Mic or JingleBroadcast.monitor should work.",
-                    "If Discord was already open, fully quit and reopen it after creating the new source so it refreshes its device list.",
-                    "Delete the devices later with the Copy Delete Broadcast Devices button in Audio Diagnostics.",
-                ]
-            )
-        else:
-            lines.append("`pactl` was not found. Install PulseAudio/PipeWire user tools to create and inspect null sinks.")
-        virtual_candidates = self._audio_diagnostics_virtual_candidates()
-        if virtual_candidates:
+    def _virtual_device_assistant_snapshot(self) -> dict[str, Any]:
+        guide = virtual_device_guide()
+        if guide is None:
+            return {
+                "virtual_device_assistant_title": "Virtual Device Assistant",
+                "virtual_device_assistant": [
+                    "No virtual device setup assistant is available for this platform yet."
+                ],
+                "virtual_device_workflow_notes": [],
+            }
+        lines = list(guide.assistant_lines)
+        if self._audio_diagnostics_virtual_candidates():
             lines.append("Existing virtual-looking devices are already visible below in the diagnostics report.")
-        return lines
+        return {
+            "virtual_device_assistant_title": guide.title,
+            "virtual_device_assistant": lines,
+            "virtual_device_workflow_notes": list(guide.workflow_notes),
+        }
 
     def _audio_diagnostics_virtual_candidates(self) -> list[str]:
         qt_outputs = self._collect_qt_audio_device_names(inputs=False)

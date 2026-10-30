@@ -20,6 +20,7 @@ reuse the same `MainWindow.remote_*` surface (`remote_play`,
 
 from __future__ import annotations
 
+import asyncio
 import collections
 import json
 import mimetypes
@@ -216,6 +217,11 @@ def cache_relpath_for_path(path: str) -> str:
     return "live_" + hashlib.sha256(path.encode("utf-8")).hexdigest() + suffix
 
 
+# How long to wait for jingleserver's `going_offline_ack` before closing anyway
+# (an older jingleserver never sends one).
+GOING_OFFLINE_ACK_TIMEOUT = 2.0
+
+
 def test_connection(address: str, device_token: str, timeout: float = 6.0) -> tuple[bool, str]:
     """Synchronous one-shot connectivity check used by the Options dialog's Test Connection button."""
     if websockets is None:
@@ -237,11 +243,17 @@ def test_connection(address: str, device_token: str, timeout: float = 6.0) -> tu
             message = json.loads(raw)
             if not message.get("ok"):
                 return False, "Server rejected the connection."
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+            # Say goodbye so jingleserver doesn't report this test as a lost connection.
+            ws.send(json.dumps({"type": "going_offline", "reason": "connection_test"}))
+            try:
+                ws.recv(timeout=GOING_OFFLINE_ACK_TIMEOUT)
+            except Exception:  # an older jingleserver never acknowledges; close anyway
+                pass
     except TimeoutError:
         return False, "Timed out waiting for the server to respond."
     except Exception as exc:  # noqa: BLE001 - surface any failure to the user
         return False, f"Connection failed: {exc}"
-    elapsed_ms = int((time.monotonic() - start) * 1000)
     return True, f"Connected in {elapsed_ms} ms."
 
 
@@ -250,6 +262,7 @@ class RemoteRelayClient:
 
     _MIN_RECONNECT_DELAY = 1.0
     _MAX_RECONNECT_DELAY = 30.0
+    _CLOSE_HANDSHAKE_TIMEOUT = 2.0
     _STATUS_PUSH_INTERVAL = 0.25
     _AUDIO_CHUNK_SIZE = 64 * 1024
     _AUDIO_HEADER = struct.Struct(">I")
@@ -273,6 +286,13 @@ class RemoteRelayClient:
         self._audio_path_provider = audio_path_provider
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        # Owned by the relay thread's event loop; only touched from that loop
+        # (stop() hands work to it via run_coroutine_threadsafe).
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._main_task: asyncio.Task[None] | None = None
+        self._ws: Any = None
+        self._send_lock: asyncio.Lock | None = None
+        self._offline_ack: asyncio.Event | None = None
 
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
@@ -291,25 +311,65 @@ class RemoteRelayClient:
         self._thread.start()
         return True
 
-    def stop(self, timeout: float = 5.0) -> None:
+    def stop(self, timeout: float = 5.0, reason: str = "disconnect") -> None:
+        """Go offline cleanly and stop the relay thread.
+
+        If connected, tells jingleserver why we are leaving (`going_offline`),
+        waits for its `going_offline_ack`, then performs the WebSocket close
+        handshake, so the server can tell an intentional shutdown from a lost
+        connection. `timeout` caps the whole sequence in case the server never
+        answers. `reason` is "shutdown", "disconnect" or "restart".
+        """
+        deadline = time.monotonic() + timeout
         self._stop_event.set()
+        loop = self._loop
+        if loop is not None and self.is_running():
+            try:
+                farewell = asyncio.run_coroutine_threadsafe(self._go_offline(reason), loop)
+                farewell.result(timeout)
+            except Exception:  # loop already closed, or the server never answered
+                pass
         if self._thread is not None:
-            self._thread.join(timeout)
+            self._thread.join(max(0.0, deadline - time.monotonic()))
         self._thread = None
         self._diagnostics.set_connected(False)
 
     def restart(self) -> bool:
-        self.stop()
+        self.stop(reason="restart")
         return self.start()
 
     def _run(self) -> None:
-        import asyncio
+        try:
+            asyncio.run(self._main())
+        except asyncio.CancelledError:  # stop() cancels the loop's main task
+            pass
+        finally:
+            self._loop = None
 
-        asyncio.run(self._connect_forever())
+    async def _main(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._main_task = asyncio.current_task()
+        await self._connect_forever()
+
+    async def _go_offline(self, reason: str) -> None:
+        """Runs on the relay loop: send the goodbye, wait for the ack, close, then end the loop."""
+        ws = self._ws
+        if ws is not None and self._send_lock is not None and self._offline_ack is not None:
+            try:
+                async with self._send_lock:
+                    await ws.send(json.dumps({"type": "going_offline", "reason": reason}))
+                await asyncio.wait_for(self._offline_ack.wait(), GOING_OFFLINE_ACK_TIMEOUT)
+            except Exception:  # an older jingleserver never acknowledges; close anyway
+                pass
+            try:
+                await asyncio.wait_for(ws.close(), self._CLOSE_HANDSHAKE_TIMEOUT)
+            except Exception:
+                pass
+        # Also interrupts a reconnect back-off sleep or an in-progress connect attempt.
+        if self._main_task is not None:
+            self._main_task.cancel()
 
     async def _connect_forever(self) -> None:
-        import asyncio
-
         delay = self._MIN_RECONNECT_DELAY
         while not self._stop_event.is_set():
             try:
@@ -333,7 +393,13 @@ class RemoteRelayClient:
                     # (status pushes, command replies, and audio-chunk streaming all share it),
                     # so every send() call funnels through this one lock for this connection's lifetime.
                     send_lock = asyncio.Lock()
-                    await asyncio.gather(self._recv_loop(ws, send_lock), self._status_push_loop(ws, send_lock))
+                    self._send_lock = send_lock
+                    self._offline_ack = asyncio.Event()
+                    self._ws = ws
+                    try:
+                        await asyncio.gather(self._recv_loop(ws, send_lock), self._status_push_loop(ws, send_lock))
+                    finally:
+                        self._ws = None
             except Exception as exc:  # noqa: BLE001 - any failure just triggers a reconnect
                 self._diagnostics.set_connected(False, error=str(exc))
             if self._stop_event.is_set():
@@ -342,14 +408,18 @@ class RemoteRelayClient:
             delay = min(delay * 2, self._MAX_RECONNECT_DELAY)
 
     async def _recv_loop(self, ws: Any, send_lock: Any) -> None:
-        import asyncio
-
         async for raw in ws:
-            if self._stop_event.is_set():
-                return
             try:
                 message = json.loads(raw)
             except json.JSONDecodeError:
+                continue
+            if message.get("type") == "going_offline_ack":
+                if self._offline_ack is not None:
+                    self._offline_ack.set()
+                continue
+            if self._stop_event.is_set():
+                # Going offline: accept no new commands, but keep reading so the
+                # ack and the server's close frame still arrive.
                 continue
             if message.get("type") != "command":
                 continue
@@ -394,8 +464,6 @@ class RemoteRelayClient:
                 pass
 
     async def _status_push_loop(self, ws: Any, send_lock: Any) -> None:
-        import asyncio
-
         while not self._stop_event.is_set():
             async with send_lock:
                 await ws.send(json.dumps({"type": "status", "data": self._state.get()}))

@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import math
-import subprocess
-import wave
 from pathlib import Path
 from typing import Any, Callable
 
@@ -27,8 +24,6 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-
-_WAVEFORM_CACHE: dict[tuple[str, int, int, int], list[float]] = {}
 
 _has_qt_multimedia = False
 try:
@@ -1236,149 +1231,6 @@ class JingleEditDialog(QDialog):
         if self._player is not None:
             self._player.stop()
         super().reject()
-
-
-def _load_waveform_peaks(path: Path, bucket_count: int = 900) -> list[float]:
-    if bucket_count <= 0:
-        return []
-
-    try:
-        stat = path.stat()
-        cache_key = (str(path), int(stat.st_mtime_ns), int(stat.st_size), int(bucket_count))
-    except OSError:
-        cache_key = None
-
-    if cache_key is not None:
-        cached = _WAVEFORM_CACHE.get(cache_key)
-        if cached is not None:
-            return list(cached)
-
-    peaks: list[float] = []
-    suffix = path.suffix.lower()
-    if suffix in {".wav", ".wave"}:
-        peaks = _load_wav_waveform_peaks(path, bucket_count)
-
-    if not peaks:
-        peaks = _load_ffmpeg_waveform_peaks(path, bucket_count)
-
-    if cache_key is not None:
-        # Keep cache bounded to avoid unbounded growth for large libraries.
-        if len(_WAVEFORM_CACHE) >= 96:
-            _WAVEFORM_CACHE.pop(next(iter(_WAVEFORM_CACHE)))
-        _WAVEFORM_CACHE[cache_key] = list(peaks)
-
-    return peaks
-
-
-def _load_wav_waveform_peaks(path: Path, bucket_count: int) -> list[float]:
-    try:
-        with wave.open(str(path), "rb") as wav_file:
-            frame_count = wav_file.getnframes()
-            channel_count = max(1, wav_file.getnchannels())
-            sample_width = wav_file.getsampwidth()
-            raw = wav_file.readframes(frame_count)
-    except (wave.Error, OSError):
-        return []
-
-    if frame_count <= 0 or sample_width not in {1, 2, 4}:
-        return []
-
-    # Convert first channel samples to float amplitudes in [0, 1].
-    amplitudes: list[float] = []
-    step = sample_width * channel_count
-    max_value = float((1 << (8 * sample_width - 1)) - 1)
-    for frame_idx in range(frame_count):
-        offset = frame_idx * step
-        sample_bytes = raw[offset : offset + sample_width]
-        if len(sample_bytes) != sample_width:
-            break
-        if sample_width == 1:
-            sample = int.from_bytes(sample_bytes, byteorder="little", signed=False) - 128
-        else:
-            sample = int.from_bytes(sample_bytes, byteorder="little", signed=True)
-        amplitudes.append(min(1.0, abs(sample) / max_value if max_value else 0.0))
-
-    return _reduce_to_peaks(amplitudes, bucket_count)
-
-
-def _load_ffmpeg_waveform_peaks(path: Path, bucket_count: int) -> list[float]:
-    ffmpeg = shutil_which("ffmpeg")
-    if not ffmpeg:
-        return []
-
-    cmd = [
-        ffmpeg,
-        "-v",
-        "error",
-        "-i",
-        str(path),
-        "-ac",
-        "1",
-        "-ar",
-        "3000",
-        "-f",
-        "s16le",
-        "-",
-    ]
-    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, timeout=8.0, check=False, creationflags=creation_flags
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return []
-
-    if result.returncode != 0 or not result.stdout:
-        return []
-
-    return _reduce_pcm16_bytes_to_peaks(result.stdout, bucket_count)
-
-
-def _reduce_pcm16_bytes_to_peaks(raw_pcm: bytes, bucket_count: int) -> list[float]:
-    sample_count = len(raw_pcm) // 2
-    if sample_count <= 0 or bucket_count <= 0:
-        return []
-
-    if sample_count <= bucket_count:
-        out: list[float] = []
-        for i in range(sample_count):
-            value = int.from_bytes(raw_pcm[i * 2 : i * 2 + 2], byteorder="little", signed=True)
-            out.append(min(1.0, abs(value) / 32767.0))
-        return out
-
-    peaks = [0.0] * bucket_count
-    for i in range(sample_count):
-        bucket = min(bucket_count - 1, int(i * bucket_count / sample_count))
-        value = int.from_bytes(raw_pcm[i * 2 : i * 2 + 2], byteorder="little", signed=True)
-        amplitude = min(1.0, abs(value) / 32767.0)
-        if amplitude > peaks[bucket]:
-            peaks[bucket] = amplitude
-    return peaks
-
-
-def _reduce_to_peaks(amplitudes: list[float], bucket_count: int) -> list[float]:
-    if not amplitudes:
-        return []
-
-    count = len(amplitudes)
-    if count <= bucket_count:
-        return amplitudes
-
-    peaks: list[float] = []
-    for bucket in range(bucket_count):
-        start = int(math.floor(bucket * count / bucket_count))
-        end = int(math.floor((bucket + 1) * count / bucket_count))
-        if end <= start:
-            end = min(count, start + 1)
-        window = amplitudes[start:end]
-        peaks.append(max(window) if window else 0.0)
-    return peaks
-
-
-def shutil_which(name: str) -> str | None:
-    from shutil import which
-
-    return which(name)
 
 
 if __name__ == "__main__":

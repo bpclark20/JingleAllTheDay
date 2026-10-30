@@ -8,6 +8,15 @@ from typing import Callable
 from PyQt6 import QtCore, QtWidgets
 
 
+CHANNEL_STYLESHEET = (
+    "#mixerChannel {"
+    " border: 1px solid #3a464d;"
+    " border-radius: 4px;"
+    " background: #161c21;"
+    "}"
+)
+
+
 @dataclass
 class ChannelStripWidgets:
     """Widget references for a created mixer strip."""

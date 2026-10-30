@@ -188,69 +188,27 @@ class MainWindowPlaybackMixin:
 
     def _skip_to_previous(self) -> None:
         """Skip to the previous jingle in the visible list."""
-        if not self._visible_indices:
-            self._status.showMessage("No jingles available to skip.")
-            return
-
-        current_index = self._selected_record_index()
-        if current_index is None:
-            # No selection, skip to last visible jingle
-            next_visible_index = self._visible_indices[-1]
-        else:
-            # Find current in visible list and go to previous
-            try:
-                visible_pos = self._visible_indices.index(current_index)
-                if visible_pos > 0:
-                    next_visible_index = self._visible_indices[visible_pos - 1]
-                else:
-                    # At the beginning, wrap to the end
-                    next_visible_index = self._visible_indices[-1]
-            except ValueError:
-                # Current index not in visible list, go to last visible
-                next_visible_index = self._visible_indices[-1]
-
-        record = self._records[next_visible_index]
-        if not record.path.exists():
-            self._status.showMessage("Selected file no longer exists.")
-            return
-
-        # Select the row in the table
-        visible_row = self._visible_row_for_record_index(next_visible_index)
-        if visible_row >= 0:
-            self._table.selectRow(visible_row)
-
-        # In continuous mode, continue from the manually selected jingle.
-        if self._playback_mode == "continuous":
-            try:
-                self._continuous_queue_position = self._continuous_queue.index(next_visible_index)
-            except ValueError:
-                pass
-
-        self._play_record(next_visible_index)
-        self._status.showMessage(f"Skipped to: {record.name}")
+        self._skip_visible(-1)
 
     def _skip_to_next(self) -> None:
         """Skip to the next jingle in the visible list."""
+        self._skip_visible(1)
+
+    def _skip_visible(self, step: int) -> None:
+        """Play the visible jingle `step` rows from the selection, wrapping at either end."""
         if not self._visible_indices:
             self._status.showMessage("No jingles available to skip.")
             return
 
+        # With no usable selection, start from the end we are moving away from:
+        # forward picks the first visible jingle, backward picks the last.
+        fallback_index = self._visible_indices[0] if step > 0 else self._visible_indices[-1]
         current_index = self._selected_record_index()
-        if current_index is None:
-            # No selection, skip to first visible jingle
-            next_visible_index = self._visible_indices[0]
+        if current_index is None or current_index not in self._visible_indices:
+            next_visible_index = fallback_index
         else:
-            # Find current in visible list and go to next
-            try:
-                visible_pos = self._visible_indices.index(current_index)
-                if visible_pos < len(self._visible_indices) - 1:
-                    next_visible_index = self._visible_indices[visible_pos + 1]
-                else:
-                    # At the end, wrap to the beginning
-                    next_visible_index = self._visible_indices[0]
-            except ValueError:
-                # Current index not in visible list, go to first visible
-                next_visible_index = self._visible_indices[0]
+            visible_pos = self._visible_indices.index(current_index)
+            next_visible_index = self._visible_indices[(visible_pos + step) % len(self._visible_indices)]
 
         record = self._records[next_visible_index]
         if not record.path.exists():

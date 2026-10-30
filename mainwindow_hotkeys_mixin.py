@@ -18,6 +18,7 @@ from app_helpers import (
     _pynput_keyboard,
     _WM_HOTKEY,
 )
+from app_settings import write_bool
 
 
 def _is_wayland_session() -> bool:
@@ -65,10 +66,7 @@ class MainWindowHotkeysMixin:
 
     def _on_sample_pads_alt_modifier_toggled(self, enabled: bool) -> None:
         self._sample_pad_alt_modifier = enabled
-        self._settings.setValue(
-            "samplePads/globalHotkeysAltModifier",
-            "true" if enabled else "false",
-        )
+        write_bool(self._settings, "samplePads/globalHotkeysAltModifier", enabled)
         # Restart the active listener so it picks up the new modifier
         if self._sample_pad_hotkey_backend != "none":
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
@@ -80,10 +78,7 @@ class MainWindowHotkeysMixin:
 
     def _on_sample_pads_board_switch_ctrl_modifier_toggled(self, enabled: bool) -> None:
         self._sample_pad_board_switch_requires_ctrl = enabled
-        self._settings.setValue(
-            "samplePads/boardSwitchRequiresCtrl",
-            "true" if enabled else "false",
-        )
+        write_bool(self._settings, "samplePads/boardSwitchRequiresCtrl", enabled)
         if self._sample_pad_hotkey_backend != "none":
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             try:
@@ -108,10 +103,7 @@ class MainWindowHotkeysMixin:
             self._stop_sample_pad_global_hotkeys()
 
         self._sample_pad_global_hotkeys_enabled = target_enabled
-        self._settings.setValue(
-            "samplePads/globalHotkeysEnabled",
-            "true" if target_enabled else "false",
-        )
+        write_bool(self._settings, "samplePads/globalHotkeysEnabled", target_enabled)
 
         if self._sample_pads_window is not None:
             self._sample_pads_window.set_global_hotkeys_enabled(target_enabled)
@@ -134,7 +126,7 @@ class MainWindowHotkeysMixin:
             return
 
         self._sample_pad_global_hotkeys_enabled = False
-        self._settings.setValue("samplePads/globalHotkeysEnabled", "false")
+        write_bool(self._settings, "samplePads/globalHotkeysEnabled", False)
         if self._sample_pads_window is not None:
             self._sample_pads_window.set_global_hotkeys_enabled(False)
         message = "Could not start global hotkeys listener."
